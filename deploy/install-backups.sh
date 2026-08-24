@@ -4,7 +4,16 @@
 #   bash deploy/install-backups.sh
 set -euo pipefail
 
-HOST="${HOST:-root@134.209.146.74}"
+# Target lives in deploy/.target.env (gitignored) so a published repo does not
+# advertise the address of a live portal. Copy deploy/target.example.env.
+TARGET_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.target.env"
+# shellcheck disable=SC1090
+[ -f "$TARGET_FILE" ] && . "$TARGET_FILE"
+HOST="${HOST:-${DEPLOY_HOST:-}}"
+if [ -z "$HOST" ]; then
+  echo "No ssh target. Set HOST=root@your-server or create deploy/.target.env" >&2
+  exit 1
+fi
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SSH="ssh -o StrictHostKeyChecking=no -i $SSH_KEY $HOST"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

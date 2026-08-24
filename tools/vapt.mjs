@@ -1,3 +1,4 @@
+import { portalBase } from '../deploy/target.mjs'
 // Security assessment against a running deployment.
 //
 // Authorisation: run only against your own instance. Every probe is read-only
@@ -9,7 +10,7 @@
 // so a second run inside the same hour will be locked out and every later check
 // will report 401. Clear it between runs:
 //   delete from rate_counters where key like 'login-ip:%';
-const BASE = process.env.BASE ?? 'https://134-209-146-74.sslip.io'
+const BASE = portalBase()
 const PW = process.env.ADMIN_PW
 
 const results = []

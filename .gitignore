@@ -4,6 +4,8 @@
 # field in the database, so it must never enter version control.
 deploy/.secrets*.env
 !deploy/.secrets.example.env
+# The address of the live deployment is not source. See deploy/target.mjs.
+deploy/.target.env
 server/.env
 server/.env.*
 !server/.env.example

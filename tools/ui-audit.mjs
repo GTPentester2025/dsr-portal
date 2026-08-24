@@ -7,8 +7,9 @@
 //
 //   BASE=https://host ADMIN_PW=... node tools/ui-audit.mjs
 import { chromium } from 'playwright'
+import { portalBase } from '../deploy/target.mjs'
 
-const BASE = process.env.BASE ?? 'https://134-209-146-74.sslip.io'
+const BASE = portalBase()
 const PW = process.env.ADMIN_PW
 const findings = []
 

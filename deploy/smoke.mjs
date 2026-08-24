@@ -1,3 +1,4 @@
+import { portalBase } from './target.mjs'
 // Read-only production smoke test.
 //
 // Every check here must be non-mutating. The e2e-* suites in server/scripts are
@@ -6,7 +7,7 @@
 // credentials. Run those against a local stack only.
 // Production smoke test: hits the deployed portal over nginx and checks the
 // public surface, auth, RBAC and the settings API. Creates no test data.
-const BASE = process.env.BASE ?? 'https://134-209-146-74.sslip.io'
+const BASE = portalBase()
 const PW = process.env.ADMIN_PW
 let fail = 0
 const check = (n, c, x = '') => { console.log(`${c ? 'ok  ' : 'FAIL'} ${n}${c ? '' : ' ' + x}`); if (!c) fail++ }
