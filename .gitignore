@@ -1,0 +1,39 @@
+# --- secrets -----------------------------------------------------------------
+# These hold the production database passwords, CRYPTO_MASTER_KEY and the admin
+# password. CRYPTO_MASTER_KEY decrypts every requester name, email and identity
+# field in the database, so it must never enter version control.
+deploy/.secrets*.env
+!deploy/.secrets.example.env
+server/.env
+server/.env.*
+!server/.env.example
+*.pem
+*.key
+key2*
+
+# --- build output ------------------------------------------------------------
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# --- local runtime state -----------------------------------------------------
+# Embedded Postgres data directory and the console email adapter's output.
+server/.pgdata/
+server/.email-out.jsonl
+.playwright-mcp/
+
+# --- generated documentation --------------------------------------------------
+# Rebuilt from source by docs/build_*.py; the screenshots are captured by
+# tools/doc-shots.mjs. Kept out so a regenerated binary does not churn history.
+tools/docshots/
+docs/__pycache__/
+docs/_inventory.json
+docs/_routes.json
+
+# --- editor / OS ---------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

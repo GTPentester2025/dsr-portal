@@ -1,0 +1,178 @@
+{
+ "zones": {
+  "EUR": [
+   {
+    "key": "eur-1",
+    "name": "Europe — External",
+    "country": null,
+    "languages": [
+     "de",
+     "en",
+     "es",
+     "fr",
+     "it",
+     "nl",
+     "pt-pt"
+    ],
+    "fieldCount": 15,
+    "sourceVersion": 27
+   },
+   {
+    "key": "eur-2",
+    "name": "Europe — PerfectDraft",
+    "country": null,
+    "languages": [
+     "de",
+     "en",
+     "es",
+     "fr",
+     "it",
+     "nl",
+     "pt-pt"
+    ],
+    "fieldCount": 15,
+    "sourceVersion": 2
+   }
+  ],
+  "SAZ": [
+   {
+    "key": "saz-brazil",
+    "name": "Brazil (LGPD)",
+    "country": "BR",
+    "languages": [
+     "en",
+     "es",
+     "pt-br"
+    ],
+    "fieldCount": 25,
+    "sourceVersion": 32
+   },
+   {
+    "key": "saz-bolivia",
+    "name": "Bolivia",
+    "country": "BO",
+    "languages": [
+     "en",
+     "es",
+     "pt-br"
+    ],
+    "fieldCount": 25,
+    "sourceVersion": 4
+   },
+   {
+    "key": "saz-paraguay",
+    "name": "Paraguay",
+    "country": "PY",
+    "languages": [
+     "en",
+     "es",
+     "pt-br"
+    ],
+    "fieldCount": 25,
+    "sourceVersion": 6
+   },
+   {
+    "key": "saz-uruguay",
+    "name": "Uruguay",
+    "country": "UY",
+    "languages": [
+     "en",
+     "es",
+     "pt-br"
+    ],
+    "fieldCount": 25,
+    "sourceVersion": 5
+   },
+   {
+    "key": "saz-argentina",
+    "name": "Argentina",
+    "country": "AR",
+    "languages": [
+     "en",
+     "es",
+     "pt-br"
+    ],
+    "fieldCount": 25,
+    "sourceVersion": 6
+   },
+   {
+    "key": "saz-chile",
+    "name": "Chile",
+    "country": "CL",
+    "languages": [
+     "en",
+     "es",
+     "pt-br"
+    ],
+    "fieldCount": 25,
+    "sourceVersion": 5
+   }
+  ],
+  "MAZ": [
+   {
+    "key": "maz-colombia",
+    "name": "Colombia",
+    "country": "CO",
+    "languages": [
+     "ar",
+     "de",
+     "en",
+     "es",
+     "fr",
+     "it",
+     "pt-br"
+    ],
+    "fieldCount": 16,
+    "sourceVersion": 28
+   },
+   {
+    "key": "maz-mexico",
+    "name": "Mexico",
+    "country": "MX",
+    "languages": [
+     "ar",
+     "de",
+     "en",
+     "es",
+     "fr",
+     "it",
+     "pt-br"
+    ],
+    "fieldCount": 21,
+    "sourceVersion": 23
+   },
+   {
+    "key": "maz-peru",
+    "name": "Peru",
+    "country": "PE",
+    "languages": [
+     "ar",
+     "de",
+     "en",
+     "es",
+     "fr",
+     "it",
+     "pt-br"
+    ],
+    "fieldCount": 16,
+    "sourceVersion": 3
+   },
+   {
+    "key": "maz-elsalvador",
+    "name": "El Salvador",
+    "country": "SV",
+    "languages": [
+     "ar",
+     "de",
+     "en",
+     "es",
+     "fr",
+     "it",
+     "pt-br"
+    ],
+    "fieldCount": 16,
+    "sourceVersion": 10
+   }
+  ]
+ }
+}

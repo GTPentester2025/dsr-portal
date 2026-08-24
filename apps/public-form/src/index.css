@@ -1,0 +1,151 @@
+/* Tailwind is used ONLY by the form-picker page and the verify-email add-on.
+   The public form page renders against the vendored form stylesheets;
+   `important: false` + class-scoped styles keep them from fighting. */
+@import "tailwindcss";
+
+/* Corporate palette, shared by the picker page and the verify-email add-on.
+   The yellow is a fill colour only: `brand-ink` is what labels and hairlines
+   use, since #d3a238 is 1.2:1 against white. */
+@theme {
+  --color-brand: #d3a238;
+  --color-brand-hover: #e2ce00;
+  --color-brand-soft: rgb(211 162 56 / 0.28);
+  --color-brand-ink: #6f5900;
+  --color-gold: #d3a238;
+  --color-on-brand: #0a0a0a;
+  --color-ink: #0a0a0a;
+  --font-sans: "Archivo", "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+/* Preflight neutralization inside the replica page: the vendored bootstrap/
+   vuetify styles must win exactly as they do on the live page. */
+.c-dsp-form-page h1, .c-dsp-form-page h2, .c-dsp-form-page h3, .c-dsp-form-page p {
+  margin: revert;
+  font-size: revert;
+  font-weight: revert;
+}
+.c-dsp-form-page button { background-color: revert; }
+.c-dsp-form-page input, .c-dsp-form-page select, .c-dsp-form-page textarea {
+  border: revert;
+  background-color: revert;
+}
+.c-dsp-form-page ul, .c-dsp-form-page ol { list-style: revert; padding: revert; }
+/* Links: reverting to the UA default would paint them #0000ee, so the brand
+   treatment is stated here — this rule loads after the vendored sheets. */
+.c-dsp-form-page a {
+  color: #0a0a0a;
+  text-decoration: underline;
+  text-decoration-color: #d3a238;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+.c-dsp-form-page a:hover { color: #6f5900; text-decoration-color: #d3a238; }
+
+/* Tailwind's .flex (display:flex) collides with Vuetify's .flex grid item
+   class used by the vendored form layout — restore grid-item behavior. */
+.c-dsp-form-page .flex { display: block; }
+
+/* ---------------------------------------------------------------------------
+   Form picker.
+
+   The vendored form stylesheets are linked globally from index.html and are
+   *unlayered*, so they outrank every Tailwind utility (layered CSS always
+   loses to unlayered CSS, regardless of specificity). The picker therefore
+   states its own rules rather than composing utilities that bootstrap would
+   silently override.
+--------------------------------------------------------------------------- */
+.dsr-picker-page {
+  min-height: 100vh;
+  background: #f4f4f2;
+  font-family: 'Archivo', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  color: #0a0a0a;
+}
+
+.dsr-picker {
+  margin: 0 auto;
+  max-width: 48rem;
+  padding: 40px 16px;
+}
+
+/* The short yellow marker the corporate site sets above a section title. */
+.dsr-picker-rule {
+  display: block;
+  width: 44px;
+  height: 5px;
+  margin-bottom: 16px;
+  background: #d3a238;
+}
+
+.dsr-picker-title {
+  margin: 0 0 4px;
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  line-height: 1.15;
+  color: #0a0a0a;
+}
+
+.dsr-picker-sub {
+  margin: 0 0 32px;
+  font-size: 14px;
+  color: #555;
+}
+
+.dsr-picker-zone { margin-bottom: 32px; }
+
+.dsr-picker-zone-title {
+  margin: 0 0 12px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6f5900;
+}
+
+.dsr-picker-grid {
+  display: grid;
+  gap: 12px;
+}
+
+@media (min-width: 640px) {
+  .dsr-picker-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.dsr-picker-card {
+  display: block;
+  padding: 16px;
+  background: #fff;
+  border: 1px solid rgb(10 10 10 / 0.1);
+  border-left: 4px solid #d3a238;
+  border-radius: 2px;
+  text-decoration: none;
+  color: inherit;
+  box-shadow: 0 1px 2px rgb(10 10 10 / 0.06);
+  transition: border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+}
+
+.dsr-picker-card:hover {
+  border-color: #0a0a0a;
+  border-left-color: #0a0a0a;
+  box-shadow: 0 8px 20px -10px rgb(10 10 10 / 0.35);
+  transform: translateY(-1px);
+}
+
+.dsr-picker-card:focus-visible {
+  outline: 2px solid #0a0a0a;
+  outline-offset: 2px;
+}
+
+.dsr-picker-card-name {
+  display: block;
+  font-size: 15px;
+  font-weight: 600;
+  color: #0a0a0a;
+}
+
+.dsr-picker-card-meta {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: #6b6b6b;
+}

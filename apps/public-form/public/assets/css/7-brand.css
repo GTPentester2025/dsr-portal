@@ -1,0 +1,326 @@
+/* ---------------------------------------------------------------------------
+   Corporate palette for the public request form.
+
+   Loaded last, after the vendored bootstrap/vuetify layers, which ship a blue
+   accent (#007bff / #1976d2). Those layers use !important on their colour
+   utilities, so the overrides here restate it at equal or higher specificity.
+
+   Rule of the palette: the yellow is a FILL colour. Against white it is a
+   1.2:1 contrast, so it never carries a label, a hairline or a focus ring —
+   those take black, or the dark gold (--abi-gold-ink) when they must read as
+   branded. This mirrors how the corporate site uses it: large yellow blocks
+   with black type on top.
+--------------------------------------------------------------------------- */
+:root {
+  --abi-yellow: #d3a238;
+  --abi-yellow-dark: #bd8f2c;
+  --abi-yellow-soft: rgb(211 162 56 / 0.28);
+  --abi-gold: #d3a238;
+  --abi-gold-ink: #6f5900;
+  --abi-black: #0a0a0a;
+  --abi-ink: #1f2229;
+  --abi-grey: #555555;
+  --abi-canvas: #f4f4f2;
+  --abi-gold-sweep: linear-gradient(
+    90deg,
+    #c08f2b 0%,
+    #d3a238 22%,
+    #dcae44 50%,
+    #d3a238 78%,
+    #c08f2b 100%
+  );
+}
+
+/* ------------------------------ typography ------------------------------- */
+/* Avantt, the corporate face, is not licensed for redistribution; Archivo is
+   the closest freely available grotesque (same tall x-height, tight aperture). */
+.c-dsp-form-page,
+.c-dsp-form-page .form-control,
+.c-dsp-form-page .btn,
+.c-dsp-form-page input,
+.c-dsp-form-page select,
+.c-dsp-form-page textarea {
+  font-family: 'Archivo', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+}
+
+.c-dsp-form-page h1,
+.c-dsp-form-page h2,
+.c-dsp-form-page h3,
+.c-dsp-form-page .f-text-heading,
+.c-dsp-form-page .f-text-title {
+  font-family: 'Archivo', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  letter-spacing: -0.015em;
+  color: var(--abi-black);
+}
+
+/* -------------------------------- chrome --------------------------------- */
+/* The corporate yellow block, reduced to a rule across the top of the page. */
+.c-dsp-form-page::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 6px;
+  background: var(--abi-gold-sweep);
+  z-index: 5;
+}
+
+.c-dsp-form-page .f-dsr-form-header-b {
+  border-bottom: 1px solid rgb(10 10 10 / 0.12);
+}
+
+/* The short yellow marker the site sets above a section title. */
+.c-dsp-form-page .f-dsr-form-header-b .f-request-header::before {
+  content: '';
+  display: block;
+  width: 44px;
+  height: 5px;
+  margin-bottom: 16px;
+  background: var(--abi-yellow);
+}
+
+.c-dsp-form-page ::selection {
+  background: var(--abi-yellow);
+  color: var(--abi-black);
+}
+
+/* --------------------------------- links --------------------------------- */
+/* Scoped to the form page: the picker route is plain Tailwind and styles its
+   own anchors, which are whole cards rather than inline links. */
+.c-dsp-form-page a {
+  color: var(--abi-black);
+  text-decoration: underline;
+  text-decoration-color: var(--abi-yellow);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+.c-dsp-form-page a:hover {
+  color: var(--abi-gold-ink);
+  text-decoration-color: var(--abi-gold);
+}
+
+/* ------------------------------- vuetify --------------------------------- */
+.primary {
+  background-color: var(--abi-yellow) !important;
+  border-color: var(--abi-yellow) !important;
+  color: var(--abi-black) !important;
+}
+
+.primary--text {
+  color: var(--abi-gold-ink) !important;
+  caret-color: var(--abi-gold-ink) !important;
+}
+
+.f-color-branding-color,
+.theme--light.f-color-branding-color,
+.theme--light.v-icon.f-color-branding-color {
+  color: var(--abi-black);
+  fill: currentColor;
+}
+
+/* -------------------------------- buttons -------------------------------- */
+/* Square-ish, uppercase, black-on-yellow — the site's CTA. */
+.c-dsp-form-page .btn {
+  border-radius: 2px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.c-dsp-form-page .btn-primary,
+.c-dsp-form-page .btn-primary:not(:disabled):not(.disabled) {
+  color: var(--abi-black);
+  background-color: var(--abi-yellow);
+  border-color: var(--abi-black);
+}
+
+.c-dsp-form-page .btn-primary:hover,
+.c-dsp-form-page .btn-primary:focus,
+.c-dsp-form-page .btn-primary.focus,
+.c-dsp-form-page .btn-primary:not(:disabled):not(.disabled):active {
+  color: var(--abi-black);
+  background-color: var(--abi-yellow-dark);
+  border-color: var(--abi-black);
+}
+
+.c-dsp-form-page .btn-primary:focus,
+.c-dsp-form-page .btn-primary.focus {
+  box-shadow: 0 0 0 0.2rem rgb(10 10 10 / 0.25);
+}
+
+.c-dsp-form-page .btn-primary:disabled,
+.c-dsp-form-page .btn-primary.disabled {
+  color: var(--abi-black);
+  background-color: var(--abi-yellow);
+  border-color: var(--abi-black);
+  opacity: 0.45;
+}
+
+/* Secondary / row controls: outlined black, as on the site's ghost buttons. */
+.c-dsp-form-page .btn-secondary,
+.c-dsp-form-page .btn-default {
+  color: var(--abi-black);
+  background-color: #fff;
+  border-color: var(--abi-black);
+}
+
+.c-dsp-form-page .btn-secondary:hover,
+.c-dsp-form-page .btn-default:hover {
+  color: var(--abi-black);
+  background-color: var(--abi-yellow);
+  border-color: var(--abi-black);
+}
+
+/* --------------------------------- inputs -------------------------------- */
+.c-dsp-form-page .form-control:focus,
+.c-dsp-form-page .custom-select:focus {
+  border-color: var(--abi-black);
+  box-shadow: 0 0 0 0.2rem var(--abi-yellow-soft);
+}
+
+/* Native checkbox/radio: the browser picks a contrasting glyph for the
+   accent colour, so the tick lands black on yellow. */
+.c-dsp-form-page .form-check-input,
+.c-dsp-form-page input[type='checkbox'],
+.c-dsp-form-page input[type='radio'] {
+  accent-color: var(--abi-yellow);
+}
+
+.c-dsp-form-page .form-check-input:focus-visible,
+.c-dsp-form-page input[type='checkbox']:focus-visible,
+.c-dsp-form-page input[type='radio']:focus-visible {
+  outline: 2px solid var(--abi-black);
+  outline-offset: 2px;
+}
+
+/* Bootstrap's styled controls draw their own box, with a white tick glyph
+   that would vanish on yellow — the glyph is restated in black. */
+.c-dsp-form-page .custom-control-input:checked ~ .custom-control-label::before,
+.c-dsp-form-page .custom-checkbox .custom-control-input:indeterminate ~ .custom-control-label::before {
+  color: var(--abi-black);
+  border-color: var(--abi-black);
+  background-color: var(--abi-yellow);
+}
+
+.c-dsp-form-page .custom-checkbox .custom-control-input:checked ~ .custom-control-label::after {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath fill='%230a0a0a' d='M6.564.75l-3.59 3.612-1.538-1.55L0 4.26l2.974 2.99L8 2.193z'/%3E%3C/svg%3E");
+}
+
+.c-dsp-form-page .custom-radio .custom-control-input:checked ~ .custom-control-label::after {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='-4 -4 8 8'%3E%3Ccircle r='3' fill='%230a0a0a'/%3E%3C/svg%3E");
+}
+
+.c-dsp-form-page .custom-control-input:focus ~ .custom-control-label::before {
+  box-shadow: 0 0 0 0.2rem var(--abi-yellow-soft);
+}
+
+/* ------------------------------ dropdowns -------------------------------- */
+.c-dsp-form-page .choices__list--dropdown .choices__item--selectable.is-highlighted,
+.c-dsp-form-page .choices__list--dropdown .choices__item--selectable:hover {
+  background-color: var(--abi-yellow-soft);
+  color: var(--abi-black);
+}
+
+.c-dsp-form-page .choices.is-focused .choices__inner,
+.c-dsp-form-page .choices.is-open .choices__inner {
+  border-color: var(--abi-black);
+}
+
+.c-dsp-form-page .choices__list--multiple .choices__item {
+  background-color: var(--abi-yellow);
+  border-color: var(--abi-black);
+  color: var(--abi-black);
+}
+
+/* --------------------------------- focus --------------------------------- */
+.c-dsp-form-page *:focus-visible {
+  outline: 2px solid var(--abi-black);
+  outline-offset: 2px;
+}
+
+/* ------------------------- legacy palette retint -------------------------- */
+/* The vendored stylesheet ships its own identity: a purple text ramp
+   (#180f33), a cyan "branding" accent and a salmon destructive. Those are the
+   colours that read as someone else's brand, so they are retinted here. The
+   neutral grey ramps are left alone — they carry no identity. */
+.c-dsp-form-page .f-color-text-primary,
+.c-dsp-form-page .theme--light.f-color-text-primary {
+  color: rgb(10 10 10 / 0.72);
+}
+
+.c-dsp-form-page .f-color-text-primary-85,
+.c-dsp-form-page .theme--light.f-color-text-primary-85 {
+  color: rgb(10 10 10 / 0.85);
+}
+
+.c-dsp-form-page .f-color-text-primary-05,
+.c-dsp-form-page .theme--light.f-color-text-primary-05 {
+  color: rgb(10 10 10 / 0.55);
+}
+
+.c-dsp-form-page .f-color-default-base,
+.c-dsp-form-page .f-color-dark-gray-title {
+  color: var(--abi-black);
+}
+
+.c-dsp-form-page .f-color-gray-subtitle {
+  color: #6b6b6b;
+}
+
+.c-dsp-form-page .f-color-subtle-heading-gray {
+  color: var(--abi-grey);
+}
+
+.c-dsp-form-page .f-color-selected-product {
+  color: var(--abi-gold-ink);
+}
+
+.c-dsp-form-page .f-color-danger,
+.c-dsp-form-page .f-color-destructive {
+  color: #b3261e;
+}
+
+.c-dsp-form-page .f-color-brand-yellow {
+  color: var(--abi-yellow);
+}
+
+.c-dsp-form-page .f-color-base-gold,
+.c-dsp-form-page .f-color-active-gold {
+  color: var(--abi-gold);
+}
+
+/* ------------------------------- data grid ------------------------------- */
+/* Repeating-row controls: the vendored rules are deeply specific, so the
+   selectors below match their depth rather than reaching for !important. */
+.c-dsp-form-page .f-dsp-form-wrapper .formio-component-rectification_details
+  table.datagrid-table .formio-button-add-row {
+  color: var(--abi-black);
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-color: var(--abi-yellow);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+.c-dsp-form-page .f-dsp-form-wrapper .formio-component-rectification_details
+  table.datagrid-table .formio-remove-column .formio-button-remove-row {
+  background-color: #b3261e;
+}
+
+/* The rectification data-grid hard-codes the legacy purple on its own labels,
+   required markers and table headers rather than going through a utility
+   class, so those three selectors are restated at the same depth. */
+.c-dsp-form-page .f-dsp-form-wrapper .formio-component-rectification_details .control-label,
+.c-dsp-form-page .f-dsp-form-wrapper .formio-component-rectification_details .field-required,
+.c-dsp-form-page .f-dsp-form-wrapper .formio-component-rectification_details
+  table.datagrid-table th {
+  color: rgb(10 10 10 / 0.72);
+}
+
+.c-data-grid .f-data-table .v-table__overflow .v-datatable.v-table tbody td .v-input.v-input--checkbox .v-label,
+.c-data-grid .f-data-table .v-table__overflow .v-datatable.v-table thead th .v-input.v-input--checkbox .v-label {
+  color: rgb(10 10 10 / 0.72);
+}

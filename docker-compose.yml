@@ -1,0 +1,53 @@
+# Production-shaped deployment (spec §12): public form and internal app are
+# separate bundles; put them in separate network zones behind your proxy.
+# The API listens only on the internal network; expose /public/* routes to
+# the internet via the edge proxy (with rate limiting + bot protection there).
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: dsr
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: dsr
+    command: ["postgres", "-c", "ssl=off"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dsr"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: ./server
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgres://dsr:${POSTGRES_PASSWORD}@db:5432/dsr
+      DATABASE_URL_APP: postgres://dsr_app:${DSR_APP_PASSWORD:?set in .env}@db:5432/dsr
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-graph}
+      PRIVACY_MAILBOX: ${PRIVACY_MAILBOX}
+      GRAPH_TENANT_ID: ${GRAPH_TENANT_ID}
+      GRAPH_CLIENT_ID: ${GRAPH_CLIENT_ID}
+      GRAPH_CLIENT_SECRET: ${GRAPH_CLIENT_SECRET}
+      CRYPTO_MASTER_KEY: ${CRYPTO_MASTER_KEY:?32-byte base64}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:?long random}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      TURNSTILE_SECRET: ${TURNSTILE_SECRET}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [internal, edge]
+
+  # Static bundles: serve apps/public-form/dist on the public vhost and
+  # apps/admin/dist on the internal vhost. Point /public/* (public vhost)
+  # and /internal/* (internal vhost only) at api:3000.
+  # Bring your own nginx/caddy config — see README "Deployment".
+
+networks:
+  internal:
+    internal: true
+  edge: {}
+
+volumes:
+  pgdata:

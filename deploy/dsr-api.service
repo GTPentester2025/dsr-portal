@@ -1,0 +1,39 @@
+[Unit]
+Description=DSR Portal API
+Documentation=https://github.com/  # internal
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=dsr
+Group=dsr
+WorkingDirectory=/opt/dsr/server
+EnvironmentFile=/opt/dsr/server/.env
+ExecStart=/usr/bin/node dist/main.js
+Restart=always
+RestartSec=3
+
+# Bounded memory on a 2 GB host; the sweep and mail sends are all async I/O.
+Environment=NODE_OPTIONS=--max-old-space-size=384
+
+# Hardening: the service only needs to read its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/opt/dsr
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsr-api
+
+[Install]
+WantedBy=multi-user.target

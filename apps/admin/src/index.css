@@ -1,0 +1,296 @@
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=Inter:wght@400;450;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+/* Dark mode is driven by data-theme on <html>, set by the ThemeProvider. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Touch pointers get 44px targets; mouse users keep the denser layout. */
+@custom-variant pointer-coarse (@media (pointer: coarse));
+
+/* ---------------------------------------------------------------------------
+   Semantic tokens. Each --color-* below points at a raw token that is
+   redefined per theme, so every Tailwind utility (bg-surface, text-muted, …)
+   follows the active theme with no dark: variant needed.
+--------------------------------------------------------------------------- */
+@theme {
+  --color-canvas: var(--t-canvas);
+  --color-surface: var(--t-surface);
+  --color-raised: var(--t-raised);
+  --color-sunken: var(--t-sunken);
+  --color-line: var(--t-line);
+  --color-line-strong: var(--t-line-strong);
+
+  --color-ink: var(--t-ink);
+  --color-muted: var(--t-muted);
+  --color-faint: var(--t-faint);
+
+  --color-brand: var(--t-brand);
+  --color-brand-hover: var(--t-brand-hover);
+  --color-brand-soft: var(--t-brand-soft);
+  --color-on-brand: var(--t-on-brand);
+  /* Readable stand-in for the brand yellow: yellow is a fill colour, never a
+     line or a label colour on light ground (1.2:1 against white). */
+  --color-brand-ink: var(--t-brand-ink);
+  --color-focus: var(--t-focus);
+
+  --color-gold-1: var(--t-gold-1);
+  --color-gold-2: var(--t-gold-2);
+  --color-gold-3: var(--t-gold-3);
+
+  --color-positive: var(--t-positive);
+  --color-warning: var(--t-warning);
+  --color-danger: var(--t-danger);
+  --color-info: var(--t-info);
+
+  --font-sans: "Archivo", "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Archivo", "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ------------------------------- light ---------------------------------- */
+:root {
+  --t-canvas: #f4f4f2;
+  --t-surface: #ffffff;
+  --t-raised: #ffffff;
+  --t-sunken: #ecebe6;
+  --t-line: rgb(10 10 10 / 0.10);
+  --t-line-strong: rgb(10 10 10 / 0.20);
+
+  --t-ink: #0a0a0a;
+  --t-muted: #555555;
+  --t-faint: #696969;
+  /* Label colour on a brand-filled surface: black on yellow, as on the
+     corporate site's yellow blocks. */
+  --t-on-brand: #0a0a0a;
+
+  --t-brand: #d3a238;
+  --t-brand-hover: #bd8f2c;
+  --t-brand-soft: rgb(211 162 56 / 0.28);
+  --t-brand-ink: #6f5900;
+  --t-focus: #0a0a0a;
+  --t-ambient: rgb(211 162 56 / 0.13);
+  --t-ambient-2: rgb(211 162 56 / 0.08);
+
+  --t-gold-1: #d3a238;
+  --t-gold-2: #cfa42f;
+  --t-gold-3: #e0b551;
+
+  --t-positive: #0c6538;
+  --t-warning: #8a6100;
+  --t-danger: #b3261e;
+  --t-info: #2f56ad;
+
+  --st-new: #2f56ad;
+  --st-open: #0c6538;
+  --st-pending: #8a6100;
+  --st-approver: #6d4bc7;
+  --st-extended: #8f420c;
+  --st-overdue: #b3261e;
+  --st-closed: #555555;
+
+  --shadow-sm: 0 1px 2px rgb(10 10 10 / 0.06);
+  --shadow-md: 0 1px 3px rgb(10 10 10 / 0.08), 0 8px 24px -12px rgb(10 10 10 / 0.20);
+  --shadow-lg: 0 12px 32px -8px rgb(10 10 10 / 0.20), 0 4px 8px -4px rgb(10 10 10 / 0.12);
+  --glass: rgb(255 255 255 / 0.74);
+  color-scheme: light;
+}
+
+/* -------------------------------- dark ---------------------------------- */
+[data-theme='dark'] {
+  --t-canvas: #000000;
+  --t-surface: #0d0d0d;
+  --t-raised: #161615;
+  --t-sunken: #080808;
+  --t-line: rgb(255 255 255 / 0.10);
+  --t-line-strong: rgb(255 255 255 / 0.20);
+
+  --t-ink: #f2f1ec;
+  --t-muted: #a3a29c;
+  --t-faint: #8b8a84;
+
+  --t-on-brand: #0a0a0a;
+
+  --t-brand: #d3a238;
+  --t-brand-hover: #e0b551;
+  --t-brand-soft: rgb(211 162 56 / 0.18);
+  /* On near-black the yellow is legible on its own, so ink == brand. */
+  --t-brand-ink: #d3a238;
+  --t-focus: #d3a238;
+  --t-ambient: rgb(211 162 56 / 0.08);
+  --t-ambient-2: rgb(211 162 56 / 0.06);
+
+  --t-gold-1: #d3a238;
+  --t-gold-2: #cfa42f;
+  --t-gold-3: #e0b551;
+
+  --t-positive: #3fcf7f;
+  --t-warning: #e4c11c;
+  --t-danger: #f2726b;
+  --t-info: #6aa9f0;
+
+  --st-new: #7ba2f0;
+  --st-open: #3fcf7f;
+  --st-pending: #e4c11c;
+  --st-approver: #a691f0;
+  --st-extended: #f0955e;
+  --st-overdue: #f2726b;
+  --st-closed: #8b8a84;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.5);
+  --shadow-md: 0 1px 3px rgb(0 0 0 / 0.6), 0 8px 24px -12px rgb(0 0 0 / 0.8);
+  --shadow-lg: 0 16px 40px -12px rgb(0 0 0 / 0.85), 0 4px 8px -4px rgb(0 0 0 / 0.6);
+  --glass: rgb(13 13 13 / 0.74);
+  color-scheme: dark;
+}
+
+/* -------------------------------- base ---------------------------------- */
+html {
+  background: var(--t-canvas);
+}
+
+body {
+  margin: 0;
+  background: var(--t-canvas);
+  color: var(--t-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+/* Theme flips instantly on the first paint, then animate afterwards. */
+body.theme-ready,
+body.theme-ready * {
+  transition-property: background-color, border-color, color, fill, stroke;
+  transition-duration: 180ms;
+  transition-timing-function: var(--ease-out-expo);
+}
+
+*:focus-visible {
+  outline: 2px solid var(--t-focus);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+::selection {
+  background: var(--t-brand);
+  color: var(--t-on-brand);
+}
+
+/* Headings carry the grotesque display face and the tight, slightly
+   negative tracking used on the corporate site. */
+h1, h2, h3, h4, .display {
+  font-family: var(--font-display);
+  letter-spacing: -0.015em;
+}
+
+/* Slim, theme-aware scrollbars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--t-line-strong) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--t-line-strong);
+  border-radius: 8px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+.tabular { font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+/* ------------------------------ motion ---------------------------------- */
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pop { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes slide-in-right { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: none; } }
+@keyframes shimmer { 100% { transform: translateX(100%); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.anim-rise { animation: rise 260ms var(--ease-out-expo) both; }
+.anim-fade { animation: fade 180ms var(--ease-out-expo) both; }
+.anim-pop { animation: pop 220ms var(--ease-out-expo) both; }
+.anim-toast { animation: slide-in-right 240ms var(--ease-out-expo) both; }
+.anim-spin { animation: spin 700ms linear infinite; }
+
+/* Staggered list entrance — capped so long lists never feel slow. */
+.stagger > * { animation: rise 260ms var(--ease-out-expo) both; }
+.stagger > *:nth-child(1) { animation-delay: 0ms; }
+.stagger > *:nth-child(2) { animation-delay: 35ms; }
+.stagger > *:nth-child(3) { animation-delay: 70ms; }
+.stagger > *:nth-child(4) { animation-delay: 105ms; }
+.stagger > *:nth-child(5) { animation-delay: 140ms; }
+.stagger > *:nth-child(n + 6) { animation-delay: 170ms; }
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--t-sunken);
+  border-radius: 8px;
+}
+.skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, var(--t-line), transparent);
+  animation: shimmer 1.6s infinite;
+}
+
+/* Ambient brand glow behind the app frame — decorative, very low contrast. */
+.ambient {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(52rem 24rem at 10% -10%, var(--t-ambient), transparent 62%),
+    radial-gradient(42rem 22rem at 94% 2%, var(--t-ambient-2), transparent 58%);
+  opacity: 1;
+}
+
+/* The corporate gold sweep, for accent rules and progress fills. */
+.gold-sweep {
+  background: linear-gradient(
+    90deg,
+    var(--t-gold-1) 0%,
+    #d7aa31 18%,
+    var(--t-gold-2) 46%,
+    #d9ae3c 72%,
+    var(--t-gold-3) 100%
+  );
+}
+
+/* Short yellow rule above a section title — the site's section marker. */
+.rule-brand::before {
+  content: '';
+  display: block;
+  width: 44px;
+  height: 5px;
+  margin-bottom: 12px;
+  background: var(--t-brand);
+}
+
+.glass {
+  background: var(--glass);
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .skeleton::after { animation: none; }
+}

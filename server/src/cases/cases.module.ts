@@ -1,0 +1,37 @@
+import { Module } from '@nestjs/common';
+import { AuthModule } from '../auth/auth.module';
+import { ReportService } from './report.service';
+import { ReportPdfService } from './report-pdf.service';
+import { StorageService } from './storage.service';
+import { CasePdfService } from './case-pdf.service';
+import { AttachmentsController } from './attachments.controller';
+import { ReportController } from './report.controller';
+import { EmailModule } from '../email/email.module';
+import { CasesController } from './cases.controller';
+import { CasesService } from './cases.service';
+import { CasesActionsController } from './cases-actions.controller';
+import { WorkflowService } from './workflow.service';
+import { AssignmentService } from './assignment.service';
+import { HousekeepingService } from './housekeeping.service';
+import { SlaService } from './sla.service';
+import { OutboundService } from './outbound.service';
+import { DashboardService } from './dashboard.service';
+import { AdminUsersController } from '../admin/admin-users.controller';
+import { CryptoService } from '../crypto/crypto.service';
+
+@Module({
+  imports: [AuthModule, EmailModule],
+  controllers: [ReportController, AttachmentsController, CasesController, CasesActionsController, AdminUsersController],
+  providers: [ReportService, ReportPdfService, StorageService, CasePdfService, 
+    CasesService,
+    WorkflowService,
+    AssignmentService,
+    HousekeepingService,
+    SlaService,
+    OutboundService,
+    DashboardService,
+    CryptoService,
+  ],
+  exports: [CasesService, AssignmentService, SlaService],
+})
+export class CasesModule {}
