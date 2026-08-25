@@ -1,8 +1,9 @@
 // Capture every screen the documentation references, at a consistent size.
 import { chromium } from 'playwright'
 import { mkdirSync } from 'node:fs'
+import { portalBase } from '../deploy/target.mjs'
 
-const BASE = process.env.BASE ?? 'http://203.0.113.10'
+const BASE = portalBase()
 const PW = process.env.ADMIN_PW
 mkdirSync('docshots', { recursive: true })
 

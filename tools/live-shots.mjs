@@ -1,8 +1,9 @@
 import { chromium } from 'playwright'
 import { mkdirSync } from 'node:fs'
+import { portalBase } from '../deploy/target.mjs'
 mkdirSync('capture', { recursive: true })
 
-const BASE = 'http://203.0.113.10'
+const BASE = portalBase()
 const PW = process.env.ADMIN_PW
 
 const browser = await chromium.launch()

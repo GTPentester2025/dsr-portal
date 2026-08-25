@@ -6,7 +6,17 @@
 # itself. That yields a genuinely trusted certificate with no browser warning.
 set -euo pipefail
 
-IP="${IP:-203.0.113.10}"
+# Target lives in deploy/.target.env (gitignored) so a published repo does not
+# advertise the address of a live portal. Copy deploy/target.example.env.
+TARGET_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.target.env"
+# shellcheck disable=SC1090
+[ -f "$TARGET_FILE" ] && . "$TARGET_FILE"
+IP="${IP:-${DEPLOY_HOST:-}}"
+IP="${IP##*@}"
+if [ -z "$IP" ]; then
+  echo "No target. Set IP=203.0.113.10 or create deploy/.target.env" >&2
+  exit 1
+fi
 HOSTNAME="${HOSTNAME_OVERRIDE:-${IP//./-}.sslip.io}"
 EMAIL="${EMAIL:-admin@${HOSTNAME}}"
 SSH_KEY="${SSH_KEY:-/tmp/dsr_key}"

@@ -125,12 +125,12 @@ confirms (§14.3/.4), including business-day calendars and holiday lists.
 
 ---
 
-# Deployment (203.0.113.10)
+# Deployment
 
 | Surface | URL |
 |---|---|
-| Public intake portal | https://203-0-113-10.sslip.io/ |
-| Internal console | https://203-0-113-10.sslip.io/admin/ |
+| Public intake portal | `$PORTAL_BASE/` |
+| Internal console | `$PORTAL_BASE/admin/` |
 | API (loopback only) | 127.0.0.1:3000, proxied by nginx |
 
 Stack on the host: nginx 1.24 (TLS terminator + static host + reverse proxy),
@@ -150,8 +150,8 @@ re-imports the form schemas, then restarts the service.
 Useful one-liners:
 
 ```bash
-ssh -i <key> root@203.0.113.10 'systemctl status dsr-api'
-ssh -i <key> root@203.0.113.10 'journalctl -u dsr-api -f'
+ssh -i <key> "$DEPLOY_HOST" 'systemctl status dsr-api'
+ssh -i <key> "$DEPLOY_HOST" 'journalctl -u dsr-api -f'
 node deploy/smoke.mjs            # 24 production checks (ADMIN_PW required)
 ```
 
@@ -245,5 +245,5 @@ the background, so a blocked or slow provider never stalls the request and
 never leaks timing information. Delivery failures are logged with the reason:
 
 ```bash
-ssh -i <key> root@203.0.113.10 'journalctl -u dsr-api -f | grep -i verification'
+ssh -i <key> "$DEPLOY_HOST" 'journalctl -u dsr-api -f | grep -i verification'
 ```

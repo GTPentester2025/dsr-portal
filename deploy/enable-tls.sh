@@ -9,7 +9,16 @@ set -euo pipefail
 
 DOMAIN="${1:?usage: enable-tls.sh <domain> <email>}"
 EMAIL="${2:?usage: enable-tls.sh <domain> <email>}"
-HOST="${HOST:-root@203.0.113.10}"
+# Target lives in deploy/.target.env (gitignored) so a published repo does not
+# advertise the address of a live portal. Copy deploy/target.example.env.
+TARGET_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.target.env"
+# shellcheck disable=SC1090
+[ -f "$TARGET_FILE" ] && . "$TARGET_FILE"
+HOST="${HOST:-${DEPLOY_HOST:-}}"
+if [ -z "$HOST" ]; then
+  echo "No ssh target. Set HOST=root@your-server or create deploy/.target.env" >&2
+  exit 1
+fi
 SSH_KEY="${SSH_KEY:-/tmp/dsr_key}"
 SSH="ssh -o StrictHostKeyChecking=no -i $SSH_KEY $HOST"
 
