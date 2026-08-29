@@ -81,12 +81,10 @@ export const SETTINGS: SettingDef[] = [
     label: 'Active provider',
     group: 'email',
     type: 'select',
-    default: 'gmail',
-    help: 'Switching providers takes effect immediately, with no redeploy.',
+    default: 'graph',
+    help: 'Set in /etc/dsr/dsr-api.env. Changing it needs a service restart.',
     options: [
       { value: 'graph', label: 'Microsoft Graph (shared mailbox)' },
-      { value: 'resend', label: 'Resend (HTTPS API - works where SMTP is blocked)' },
-      { value: 'smtp', label: 'Custom SMTP server' },
       { value: 'console', label: 'Console (development only, writes to the log)' },
     ],
   },
@@ -105,68 +103,6 @@ export const SETTINGS: SettingDef[] = [
     type: 'email',
     placeholder: 'privacy@company.com',
     help: 'Address that case responses are sent from. Required for Microsoft Graph.',
-  },
-
-  // resend (https)
-  {
-    key: 'RESEND_API_KEY',
-    label: 'Resend API key',
-    group: 'email',
-    type: 'password',
-    secret: true,
-    placeholder: 're_xxxxxxxxxxxxxxxx',
-    help: 'From resend.com, API Keys. Sends over HTTPS, so it works on hosts that block SMTP. The privacy mailbox above must be on a domain you have verified in Resend.',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['resend'] }],
-  },
-
-  // generic smtp
-  {
-    key: 'SMTP_HOST',
-    label: 'SMTP host',
-    group: 'email',
-    type: 'text',
-    placeholder: 'smtp.office365.com',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['smtp'] }],
-  },
-  {
-    key: 'SMTP_PORT',
-    label: 'SMTP port',
-    group: 'email',
-    type: 'number',
-    default: '587',
-    min: 1,
-    max: 65535,
-    help: 'Common values: 587 with STARTTLS, 465 with implicit TLS. Many hosts block those but leave 2525 open, which SendGrid, Brevo and Mailgun all accept.',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['smtp'] }],
-  },
-  {
-    key: 'SMTP_SECURE',
-    label: 'Encryption',
-    group: 'email',
-    type: 'select',
-    default: 'false',
-    help: 'Implicit TLS wraps the whole connection (port 465). STARTTLS upgrades an open connection (ports 587 and 25).',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['smtp'] }],
-    options: [
-      { value: 'false', label: 'STARTTLS' },
-      { value: 'true', label: 'Implicit TLS' },
-    ],
-  },
-  {
-    key: 'SMTP_USER',
-    label: 'SMTP username',
-    group: 'email',
-    type: 'text',
-    placeholder: 'privacy@company.com',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['smtp'] }],
-  },
-  {
-    key: 'SMTP_PASSWORD',
-    label: 'SMTP password',
-    group: 'email',
-    type: 'password',
-    secret: true,
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['smtp'] }],
   },
 
   // microsoft graph

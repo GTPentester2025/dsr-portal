@@ -9,8 +9,6 @@ import type {
 } from './email-provider.interface';
 import { ConsoleProvider } from './console.provider';
 import { GraphProvider } from './graph.provider';
-import { SmtpProvider } from './smtp.provider';
-import { ResendProvider } from './resend.provider';
 import { SettingsService } from '../settings/settings.service';
 import { diagnoseHttpsEndpoint, type DiagnosticStep } from './net-diagnostics';
 import { SystemTemplateService } from './system-template.service';
@@ -27,30 +25,17 @@ export class EmailDispatcher implements EmailProvider {
   constructor(
     private readonly settings: SettingsService,
     private readonly graph: GraphProvider,
-    private readonly smtp: SmtpProvider,
-    private readonly resend: ResendProvider,
     private readonly consoleProvider: ConsoleProvider,
   ) {}
 
   /**
-   * Stage-by-stage connectivity report for the active adapter: the SMTP
-   * handshake for SMTP adapters, HTTPS reachability plus an authenticated
-   * call for the API-based ones.
+   * Stage-by-stage connectivity report for the active adapter: HTTPS
+   * reachability, then an authenticated call.
    */
   async diagnose(): Promise<DiagnosticStep[] | null> {
-    const which = this.activeName();
+    if (this.activeName() !== 'graph') return null;
 
-    if (which === 'smtp') return this.smtp.diagnose();
-
-    const httpsHost =
-      which === 'resend'
-        ? 'api.resend.com'
-        : which === 'graph'
-          ? 'graph.microsoft.com'
-          : null;
-    if (!httpsHost) return null;
-
-    const steps = await diagnoseHttpsEndpoint(httpsHost);
+    const steps = await diagnoseHttpsEndpoint('graph.microsoft.com');
     if (steps.every((s) => s.ok)) {
       const started = Date.now();
       const status = await this.verifyConnection();
@@ -58,7 +43,7 @@ export class EmailDispatcher implements EmailProvider {
         step: 'Authentication',
         ok: status.ok,
         detail: status.detail,
-        hint: status.ok ? undefined : 'Check the API credentials for this provider.',
+        hint: status.ok ? undefined : 'Check GRAPH_* credentials in /etc/dsr/dsr-api.env.',
         ms: Date.now() - started,
       });
     }
@@ -67,7 +52,7 @@ export class EmailDispatcher implements EmailProvider {
 
   /** Name of the adapter currently selected. */
   activeName(): string {
-    return this.settings.get<string>('EMAIL_PROVIDER', 'gmail');
+    return this.settings.get<string>('EMAIL_PROVIDER', 'graph');
   }
 
   private active(): EmailProvider {
@@ -75,10 +60,6 @@ export class EmailDispatcher implements EmailProvider {
     switch (which) {
       case 'graph':
         return this.graph;
-      case 'smtp':
-        return this.smtp;
-      case 'resend':
-        return this.resend;
       case 'console':
         if (process.env.NODE_ENV === 'production' && process.env.ALLOW_CONSOLE_EMAIL !== 'true') {
           throw new Error(
@@ -118,8 +99,6 @@ export class EmailDispatcher implements EmailProvider {
   controllers: [SystemTemplateController],
   providers: [
     GraphProvider,
-    SmtpProvider,
-    ResendProvider,
     ConsoleProvider,
     EmailDispatcher,
     SystemTemplateService,
