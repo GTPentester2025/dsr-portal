@@ -390,5 +390,67 @@ class TestFindings(unittest.TestCase):
         self.assertNotIn("fix:", text)
 
 
+class TestPlans(unittest.TestCase):
+    def test_provision_covers_every_step_the_spec_lists(self):
+        names = " ".join(s.name for s in dd.provision_steps()).lower()
+        for expected in (
+            "package", "node", "postgres", "initdb", "pg_hba", "role",
+            "user", "selinux", "nginx", "firewall", "journal", "zram",
+        ):
+            self.assertIn(expected, names, "provision has no %s step" % expected)
+
+    def test_provision_never_disables_selinux(self):
+        blob = " ".join(s.command for s in dd.provision_steps())
+        for forbidden in ("setenforce 0", "SELINUX=disabled", "--permissive"):
+            self.assertNotIn(forbidden, blob)
+
+    def test_provision_turns_the_proxy_boolean_on(self):
+        blob = " ".join(s.command for s in dd.provision_steps())
+        self.assertIn("httpd_can_network_connect", blob)
+        self.assertIn("setsebool -P", blob)
+
+    def test_no_step_anywhere_removes_uploads(self):
+        every = dd.provision_steps() + dd.deploy_steps({"EMAIL_PROVIDER": "console"})
+        for step in every:
+            self.assertNotIn("rm -rf %s" % dd.UPLOADS_DIR, step.command)
+            self.assertNotIn("rm -rf /opt/dsr/uploads", step.command)
+
+    def test_deploy_migrates_before_it_restarts(self):
+        names = [s.name for s in dd.deploy_steps({"EMAIL_PROVIDER": "console"})]
+        self.assertLess(
+            [i for i, n in enumerate(names) if "migrat" in n.lower()][0],
+            [i for i, n in enumerate(names) if "restart" in n.lower()][0],
+        )
+
+    def test_render_plan_numbers_the_steps_and_shows_commands(self):
+        text = dd.render_plan([dd.Step("do a thing", "echo hi")])
+        self.assertIn("do a thing", text)
+        self.assertIn("echo hi", text)
+        self.assertIn("1", text)
+
+
+class TestTarget(unittest.TestCase):
+    def test_reads_host_and_key(self):
+        target = dd.load_target('HOST=root@1.2.3.4\nSSH_KEY=~/.ssh/id_ed25519\n')
+        self.assertEqual(target["HOST"], "root@1.2.3.4")
+
+    def test_deploy_host_is_accepted_as_an_alias(self):
+        self.assertEqual(dd.load_target("DEPLOY_HOST=root@x\n")["HOST"], "root@x")
+
+
+class TestSsh(unittest.TestCase):
+    def test_builds_a_command_with_the_key_and_no_host_key_prompt(self):
+        argv = dd.Ssh("root@h", "/k/id").argv("uptime")
+        self.assertIn("-i", argv)
+        self.assertIn("/k/id", argv)
+        self.assertIn("root@h", argv)
+        self.assertIn("uptime", argv)
+
+    def test_the_remote_command_is_one_argv_element_not_shell_spliced(self):
+        # The whole point of pushing the tool to the box: no nested quoting.
+        argv = dd.Ssh("root@h", "/k/id").argv("echo 'a b'; rm -rf /")
+        self.assertIn("echo 'a b'; rm -rf /", argv)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,9 @@ import base64
 import binascii
 import collections
 import hashlib
+import pathlib
 import re
+import subprocess
 import sys
 
 INSTALL_PREFIX = "/opt/dsr"
@@ -34,6 +36,19 @@ REMOTE_SELF = "/root/dsr_deploy.py"
 STATE_PATH = "/var/lib/dsr-deploy/state.json"
 SERVICE = "dsr-api"
 APP_PORT = 3000
+
+# Files this tool ships alongside itself and pushes to the box verbatim.
+_DEPLOY_DIR = pathlib.Path(__file__).resolve().parent
+NGINX_CONF_LOCAL = _DEPLOY_DIR / "nginx.conf"
+UNIT_FILE_LOCAL = _DEPLOY_DIR / "dsr-api.service"
+
+# Where things live on a RHEL 9 box specifically -- these paths differ from
+# Debian's (which uses /etc/nginx/sites-available and a cluster-versioned
+# postgresql data directory).
+PG_HBA_REMOTE = "/var/lib/pgsql/data/pg_hba.conf"
+NGINX_MAIN_CONF_REMOTE = "/etc/nginx/nginx.conf"
+NGINX_SITE_CONF_REMOTE = "/etc/nginx/conf.d/dsr.conf"
+UNIT_REMOTE = "/etc/systemd/system/%s.service" % SERVICE
 
 MIN_PYTHON = (3, 9)
 
@@ -351,6 +366,411 @@ def render_findings(findings: list) -> str:
     return "\n".join(lines) + "\n"
 
 
+Step = collections.namedtuple("Step", "name command")
+
+
+def render_plan(steps: list) -> str:
+    """Number the steps and show each command, for `--dry-run` and for humans."""
+    lines = []
+    for i, step in enumerate(steps, 1):
+        lines.append("%d. %s" % (i, step.name))
+        for line in step.command.splitlines():
+            lines.append("     %s" % line)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def load_target(text: str) -> dict:
+    """Parse deploy/.target.env. DEPLOY_HOST is accepted as an alias for HOST,
+    matching what deploy.sh already does (`HOST="${HOST:-${DEPLOY_HOST:-}}"`).
+    """
+    env = parse_env_text(text)
+    if "HOST" not in env and "DEPLOY_HOST" in env:
+        env["HOST"] = env["DEPLOY_HOST"]
+    return env
+
+
+class Ssh:
+    """Runs a command on the target over ssh, or copies a file/directory to it.
+
+    The remote command is always a single argv element, never spliced into a
+    local shell string. That is the whole reason this tool copies itself to
+    the box: reading a file in Python beats a sed expression nested inside
+    three levels of shell quoting, and it means a command containing quotes,
+    semicolons or `$(...)` travels intact instead of being re-parsed twice.
+    """
+
+    def __init__(self, target: str, key: str):
+        self.target = target
+        self.key = key
+
+    def argv(self, command: str) -> list:
+        return ["ssh", "-o", "StrictHostKeyChecking=no", "-i", self.key, self.target, command]
+
+    def run(self, command: str, check: bool = True):
+        result = subprocess.run(self.argv(command), capture_output=True, text=True)
+        if check and result.returncode != 0:
+            raise RuntimeError(
+                "ssh command failed (exit %d): %s\n%s"
+                % (result.returncode, command, result.stderr)
+            )
+        return result
+
+    def push_file(self, local: str, remote: str) -> None:
+        """`cat > remote` fed from local's bytes -- matches deploy.sh's push_file."""
+        with open(local, "rb") as fh:
+            result = subprocess.run(
+                self.argv("cat > '%s'" % remote), stdin=fh, capture_output=True
+            )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "push_file failed for %s: %s"
+                % (remote, result.stderr.decode(errors="replace"))
+            )
+
+    def push_dir(self, local: str, remote: str) -> None:
+        """Mirror a directory: `tar -czf - -C local .` piped into a remote
+        `rm -rf dest && mkdir -p dest && tar -xzf - -C dest`, exactly what
+        deploy.sh does today so it keeps working from Git Bash on Windows.
+        """
+        tar = subprocess.Popen(["tar", "-czf", "-", "-C", local, "."], stdout=subprocess.PIPE)
+        ssh_proc = subprocess.Popen(
+            self.argv(
+                "rm -rf '%s' && mkdir -p '%s' && tar -xzf - -C '%s'" % (remote, remote, remote)
+            ),
+            stdin=tar.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if tar.stdout is not None:
+            tar.stdout.close()
+        _out, err = ssh_proc.communicate()
+        tar.wait()
+        if tar.returncode != 0:
+            raise RuntimeError("tar failed for %s (exit %d)" % (local, tar.returncode))
+        if ssh_proc.returncode != 0:
+            raise RuntimeError(
+                "push_dir failed for %s: %s" % (remote, (err or b"").decode(errors="replace"))
+            )
+
+
+def _cat_heredoc_command(remote_path: str, content: str, marker: str = "DSR_EOF") -> str:
+    """A `cat > remote_path <<'MARKER'` fragment carrying literal file content.
+
+    The heredoc delimiter is quoted, so the remote shell does not expand
+    anything inside -- the content lands byte-for-byte without a second SSH
+    round trip for what push_file would otherwise do.
+    """
+    if not content.endswith("\n"):
+        content += "\n"
+    return "cat > %s <<'%s'\n%s%s" % (remote_path, marker, content, marker)
+
+
+def _remote_text_fix(path: str, func_name: str) -> str:
+    """Apply one of Task 4's pure text transforms to a file already on the box.
+
+    Runs the copy of this tool already at REMOTE_SELF, so the same
+    idempotent, comment-aware guard exercised by the unit tests decides
+    whether anything changes -- never a shell sed re-deriving that logic on
+    the box, where a wrong regex leaves an unbalanced config file.
+    """
+    remote_dir = REMOTE_SELF.rsplit("/", 1)[0]
+    return (
+        "python3 -c \""
+        "import sys; sys.path.insert(0, '%s'); import dsr_deploy as d, pathlib; "
+        "p = pathlib.Path('%s'); t = p.read_text(); "
+        "new, changed = d.%s(t); "
+        "p.write_text(new) if changed else None\""
+    ) % (remote_dir, path, func_name)
+
+
+def provision_steps() -> list:
+    """The RHEL 9 provisioning sequence, in order.
+
+    Each command is a shell fragment executed on the box, and every one is
+    safe to run twice: `dnf install -y` is already idempotent, directory
+    creation uses `mkdir -p` / `install -d`, `setsebool -P` is idempotent,
+    and the two file rewrites go through Task 4's guarded, no-op-on-replay
+    functions rather than an unconditional sed.
+    """
+    return [
+        Step(
+            "preflight: confirm RHEL 9 and disk headroom",
+            "grep -q 'platform:el9' /etc/os-release "
+            "&& echo 'RHEL 9 detected' || echo 'WARNING: does not look like RHEL 9'; "
+            "df -h / /var",
+        ),
+        Step(
+            "install base packages",
+            "dnf install -y curl ca-certificates policycoreutils-python-utils "
+            "firewalld nginx && dnf clean all",
+        ),
+        Step(
+            "install Node.js 22",
+            "(command -v node >/dev/null 2>&1 && [ \"$(node -v | cut -c2-3)\" -ge 22 ]) || "
+            "(dnf module reset -y nodejs >/dev/null 2>&1; "
+            "dnf module enable -y nodejs:22 && dnf install -y nodejs && dnf clean all)",
+        ),
+        Step(
+            "install PostgreSQL 16",
+            "rpm -q postgresql-server >/dev/null 2>&1 || "
+            "(dnf module reset -y postgresql >/dev/null 2>&1; "
+            "dnf module enable -y postgresql:16 && "
+            "dnf install -y postgresql-server postgresql-contrib && dnf clean all)",
+        ),
+        Step(
+            "initialize the data directory (postgresql-setup --initdb)",
+            "test -f /var/lib/pgsql/data/PG_VERSION || postgresql-setup --initdb; "
+            "systemctl enable --now postgresql",
+        ),
+        Step(
+            "pg_hba: require scram-sha-256 on loopback (Task 4's rewrite_pg_hba)",
+            _remote_text_fix(PG_HBA_REMOTE, "rewrite_pg_hba")
+            + "; systemctl reload postgresql",
+        ),
+        Step(
+            "create the dsr and dsr_app roles and database",
+            "sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL\n"
+            "DO \\$\\$\n"
+            "BEGIN\n"
+            "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'dsr') THEN\n"
+            "    CREATE ROLE dsr LOGIN PASSWORD '${DB_PASS:?DB_PASS required}';\n"
+            "  ELSE\n"
+            "    ALTER ROLE dsr PASSWORD '${DB_PASS:?DB_PASS required}';\n"
+            "  END IF;\n"
+            "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'dsr_app') THEN\n"
+            "    CREATE ROLE dsr_app LOGIN PASSWORD '${APP_PASS:?APP_PASS required}';\n"
+            "  ELSE\n"
+            "    ALTER ROLE dsr_app PASSWORD '${APP_PASS:?APP_PASS required}';\n"
+            "  END IF;\n"
+            "END\n"
+            "\\$\\$;\n"
+            "SQL\n"
+            "sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname = 'dsr'\" "
+            "| grep -q 1 || sudo -u postgres createdb -O dsr -E UTF8 -T template0 dsr\n"
+            "sudo -u postgres psql -d dsr -v ON_ERROR_STOP=1 "
+            "-c \"GRANT ALL ON SCHEMA public TO dsr; ALTER SCHEMA public OWNER TO dsr;\"",
+        ),
+        Step(
+            "create the dsr service user and directories",
+            "id -u dsr >/dev/null 2>&1 || "
+            "useradd --system --no-create-home --home-dir %s --shell /sbin/nologin dsr; "
+            "mkdir -p %s/server %s/public-form %s/admin; "
+            "install -d -o dsr -g dsr -m 750 %s; "
+            "chown -R dsr:dsr %s; "
+            "chown -R nginx:nginx %s"
+            % (
+                INSTALL_PREFIX,
+                INSTALL_PREFIX,
+                WEB_ROOT,
+                WEB_ROOT,
+                UPLOADS_DIR,
+                INSTALL_PREFIX,
+                WEB_ROOT,
+            ),
+        ),
+        Step(
+            "SELinux: allow nginx to proxy to the app (httpd_can_network_connect)",
+            "setsebool -P httpd_can_network_connect on",
+        ),
+        Step(
+            "nginx: remove RHEL's stock default_server (Task 4's neutralise_default_server)",
+            _remote_text_fix(NGINX_MAIN_CONF_REMOTE, "neutralise_default_server")
+            + " && systemctl enable --now nginx",
+        ),
+        Step(
+            "firewalld: open ssh, http, https",
+            "systemctl enable --now firewalld && "
+            "firewall-cmd --permanent --add-service={ssh,http,https} && "
+            "firewall-cmd --reload",
+        ),
+        Step(
+            "journald: cap disk usage at 200M",
+            "mkdir -p /etc/systemd/journald.conf.d && "
+            "printf '[Journal]\\nSystemMaxUse=200M\\n' "
+            "> /etc/systemd/journald.conf.d/dsr.conf && "
+            "systemctl restart systemd-journald",
+        ),
+        Step(
+            "zram: swap-on-compressed-RAM instead of a swapfile",
+            "dnf install -y zram-generator && dnf clean all; "
+            "printf '[zram0]\\nzram-size = min(ram / 2, 2048)\\n' "
+            "> /etc/systemd/zram-generator.conf; "
+            "systemctl daemon-reload; "
+            "systemctl start systemd-zram-setup@zram0.service",
+        ),
+    ]
+
+
+def _env_file_content(env: dict) -> str:
+    """The service .env, in the same shape deploy.sh writes -- see its
+    comments on why EMAIL_PROVIDER and COOKIE_SECURE live here rather than
+    in app_settings.
+    """
+    lines = [
+        "NODE_ENV=production",
+        "PORT=%d" % APP_PORT,
+        "DATABASE_URL=postgres://dsr:%s@127.0.0.1:5432/dsr" % env.get("DB_PASS", ""),
+        "DATABASE_URL_APP=postgres://dsr_app:%s@127.0.0.1:5432/dsr" % env.get("APP_PASS", ""),
+        "CRYPTO_MASTER_KEY=%s" % env.get("CRYPTO_MASTER_KEY", ""),
+        "COOKIE_SECURE=%s" % env.get("COOKIE_SECURE", "true"),
+        "EMAIL_PROVIDER=%s" % env.get("EMAIL_PROVIDER", "graph"),
+        "PRIVACY_MAILBOX=%s" % env.get("PRIVACY_MAILBOX", ""),
+        "GRAPH_TENANT_ID=%s" % env.get("GRAPH_TENANT_ID", ""),
+        "GRAPH_CLIENT_ID=%s" % env.get("GRAPH_CLIENT_ID", ""),
+        "GRAPH_CLIENT_SECRET=%s" % env.get("GRAPH_CLIENT_SECRET", ""),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+# Re-applies a Let's Encrypt certificate onto the freshly-pushed, HTTP-only
+# nginx conf, and skips cleanly when no certificate has been issued yet.
+# CERT_NAME is discovered on the box, inside this fragment, at run time --
+# not by the operator's machine beforehand -- so this one Step stays static
+# while still doing nothing on a box with no domain pointed at it yet.
+_TLS_REAPPLY_COMMAND = (
+    "CERT_NAME=$(ls /etc/letsencrypt/live 2>/dev/null | grep -v README | head -1)\n"
+    "if [ -n \"$CERT_NAME\" ]; then\n"
+    "  sed -i \"s/server_name _;/server_name $CERT_NAME;/\" %s\n"
+    "  certbot install --nginx --cert-name \"$CERT_NAME\" --redirect --non-interactive "
+    ">/dev/null 2>&1\n"
+    "fi"
+) % NGINX_SITE_CONF_REMOTE
+
+# Restores PUBLIC_BASE_URL / INTERNAL_BASE_URL in app_settings from the
+# certificate's hostname, but only when a row is missing or empty -- an
+# unconditional overwrite would clobber an operator's deliberate override.
+# Without these, the mailer falls back to a loopback address and every link
+# it sends is dead.
+_ENSURE_URLS_JS = """const pg = require('pg');
+(async () => {
+  const host = process.argv[2];
+  const c = new pg.Client(process.env.DATABASE_URL);
+  await c.connect();
+  const rows = [
+    ['PUBLIC_BASE_URL', `https://${host}`],
+    ['INTERNAL_BASE_URL', `https://${host}/admin`],
+  ];
+  for (const [key, value] of rows) {
+    const existing = await c.query('SELECT value FROM app_settings WHERE key = $1', [key]);
+    if (!existing.rows[0] || !existing.rows[0].value) {
+      await c.query(
+        'INSERT INTO app_settings (key, value, secret) VALUES ($1, $2, false) ' +
+        'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+        [key, value],
+      );
+      console.log(`   restored ${key} = ${value}`);
+    }
+  }
+  await c.end();
+})();
+"""
+
+# Every reference to `$1`/argv here is inside a *single* argv element handed
+# straight to ssh -- never spliced into a local shell string first. That
+# nested-quoting bug is exactly how this broke once in deploy.sh.
+#
+# The heredoc body and its closing delimiter are left flush against the left
+# margin, not indented under the `if`, because `<<'NODE'` (unlike `<<-`) only
+# recognises the terminator when it starts in column one -- an indented
+# "  NODE" would not match, and the shell would read past `fi` looking for it.
+_ENSURE_URLS_COMMAND = (
+    "CERT_NAME=$(ls /etc/letsencrypt/live 2>/dev/null | grep -v README | head -1)\n"
+    "if [ -n \"$CERT_NAME\" ]; then\n"
+    + _cat_heredoc_command("%s/server/ensure-urls.cjs" % INSTALL_PREFIX, _ENSURE_URLS_JS, "NODE")
+    + "\n"
+    "  cd %s/server && set -a && . ./.env && set +a && "
+    "node ensure-urls.cjs \"$CERT_NAME\" && rm -f ensure-urls.cjs\n"
+    "fi"
+) % INSTALL_PREFIX
+
+
+def deploy_steps(env: dict) -> list:
+    """The deployment sequence, in order.
+
+    Building/syncing the compiled bundles is the operator's runner's job
+    (Ssh.push_file / push_dir move bytes; they are not steps here). This is
+    everything that happens once those bytes are already on the box.
+    Migration must precede the restart -- an old process serving a schema
+    it does not understand is worse than a few extra seconds of downtime.
+    """
+    return [
+        Step(
+            "write /opt/dsr/server/.env (keep .env.bak first)",
+            ("test -f %s && cp %s %s.bak || true\n" % (ENV_PATH, ENV_PATH, ENV_PATH))
+            + _cat_heredoc_command(ENV_PATH, _env_file_content(env), "ENV")
+            + ("\nchmod 600 %s" % ENV_PATH),
+        ),
+        Step(
+            "npm ci --omit=dev",
+            "cd %s/server && "
+            "(npm ci --omit=dev --no-audit --no-fund || "
+            "npm install --omit=dev --no-audit --no-fund)" % INSTALL_PREFIX,
+        ),
+        Step(
+            "npm cache clean --force",
+            "npm cache clean --force",
+        ),
+        Step(
+            "run database migrations (node scripts/migrate.mjs)",
+            "cd %s/server && set -a && . ./.env && set +a && node scripts/migrate.mjs"
+            % INSTALL_PREFIX,
+        ),
+        Step(
+            "import form schemas (node scripts/import-forms.mjs)",
+            "cd %s/server && set -a && . ./.env && set +a && "
+            "node scripts/import-forms.mjs | tail -1" % INSTALL_PREFIX,
+        ),
+        Step(
+            "fix ownership and SELinux context (restorecon)",
+            "chown -R dsr:dsr %s; chown -R nginx:nginx %s; "
+            "mkdir -p %s && chown dsr:dsr %s && chmod 750 %s; "
+            "restorecon -R %s %s"
+            % (
+                INSTALL_PREFIX,
+                WEB_ROOT,
+                UPLOADS_DIR,
+                UPLOADS_DIR,
+                UPLOADS_DIR,
+                INSTALL_PREFIX,
+                WEB_ROOT,
+            ),
+        ),
+        Step(
+            "install the dsr-api unit and nginx conf.d/dsr.conf",
+            _cat_heredoc_command(UNIT_REMOTE, UNIT_FILE_LOCAL.read_text(), "DSR_UNIT_EOF")
+            + "\n"
+            + _cat_heredoc_command(
+                NGINX_SITE_CONF_REMOTE, NGINX_CONF_LOCAL.read_text(), "DSR_NGINX_EOF"
+            ),
+        ),
+        Step(
+            "re-apply TLS certificate if one is already installed",
+            _TLS_REAPPLY_COMMAND,
+        ),
+        Step(
+            "ensure portal URLs are set (ensure-urls)",
+            _ENSURE_URLS_COMMAND,
+        ),
+        Step(
+            "validate nginx config (nginx -t)",
+            "nginx -t",
+        ),
+        Step(
+            "systemctl daemon-reload",
+            "systemctl daemon-reload",
+        ),
+        Step(
+            "restart dsr-api",
+            "systemctl enable --now %s >/dev/null 2>&1; systemctl restart %s"
+            % (SERVICE, SERVICE),
+        ),
+        Step(
+            "reload nginx",
+            "systemctl reload nginx",
+        ),
+    ]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dsr_deploy.py",
@@ -394,7 +814,22 @@ def main(argv: list) -> int:
             % (MIN_PYTHON[0], MIN_PYTHON[1], sys.version.split()[0])
         )
         return 2
-    build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
+
+    # Executing steps for real -- picking a target, pushing this file to the
+    # box, running Ssh.run over each Step -- is the next task's job. What is
+    # already true is that the plan is data, so a dry run can print it now
+    # without touching a host.
+    if args.command in ("provision", "deploy"):
+        steps = provision_steps() if args.command == "provision" else deploy_steps({})
+        if args.dry_run:
+            sys.stdout.write(render_plan(steps))
+            return 0
+        sys.stderr.write(
+            "%s does not run against a live host yet in this build; "
+            "use --dry-run to see the plan.\n" % args.command
+        )
+        return 1
     return 0
 
 
