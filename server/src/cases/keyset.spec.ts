@@ -22,7 +22,7 @@ describe('cursorClause', () => {
       'a.created_at',
       'a.id',
     ]);
-    expect(sql).toContain('(a.created_at, a.id) < ($3, $4)');
+    expect(sql).toContain('(a.created_at, a.id) < ($3::timestamptz, $4)');
   });
 });
 
@@ -47,6 +47,17 @@ describe('nextCursor', () => {
     // Same instant, different id: the cursor must carry the id or the next
     // batch re-reads 'b' or skips past 'a'.
     expect(nextCursor(batch)).toEqual({ createdAt: '2026-01-01T00:00:00Z', id: 'a' });
+  });
+
+  it('leaves a microsecond timestamp exactly as it arrived', () => {
+    // created_at is timestamptz, which Postgres stores to the microsecond, and
+    // the query selects it as text for this reason. Anything that rounded
+    // .123456 down to .123 would drop every row in between at the boundary.
+    const batch = [{ createdAt: '2026-01-01 00:00:00.123456+00', id: 'a' }];
+    expect(nextCursor(batch)).toEqual({
+      createdAt: '2026-01-01 00:00:00.123456+00',
+      id: 'a',
+    });
   });
 
   it('normalises a Date to an ISO string', () => {

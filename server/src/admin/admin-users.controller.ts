@@ -308,6 +308,10 @@ export class AdminUsersController {
     // out and nothing about it can be revised.
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${csvFilename('audit-log')}"`);
+    // nginx buffers proxied responses by default, which would swallow the
+    // backpressure this streams on. Set here rather than in the site config so
+    // the two cannot drift; nginx strips the header before the client sees it.
+    res.setHeader('X-Accel-Buffering', 'no');
 
     const outcome = await streamCsv(res, columns, this.streamAuditRows(entityType, entityId));
     if (outcome.error) {
@@ -323,15 +327,24 @@ export class AdminUsersController {
   /**
    * The audit trail newest first, a batch at a time.
    *
-   * a.id joins the SELECT only so the cursor has something unique to carry; it
-   * is deliberately not one of the CSV columns above, which stay exactly what
-   * they were. The cursor is the (created_at, id) pair and not the bigserial
-   * id alone, because created_at defaults to the transaction start time: a
-   * long transaction can write a row with a higher id and an earlier timestamp
-   * than a short one that began after it, and under ORDER BY created_at an
-   * id-only predicate would step straight over that row.
+   * a.id and a.created_at::text join the SELECT only so the cursor has
+   * something unique and unrounded to carry; neither is a CSV column, and the
+   * columns above stay exactly what they were. The timestamp has to leave
+   * Postgres as text because timestamptz keeps microseconds and a JS Date does
+   * not: a cursor built from the parsed value rounds down and the next batch
+   * skips every row inside the millisecond the boundary landed in.
+   *
+   * The cursor is the (created_at, id) pair and not the bigserial id alone,
+   * because created_at defaults to the transaction start time: a transaction
+   * that begins early and writes late takes a higher id than a shorter one
+   * that began after it, while carrying the earlier timestamp. Under ORDER BY
+   * created_at that row sorts second, and an id-only predicate steps over it.
    */
   private async *streamAuditRows(entityType?: string, entityId?: string, batchSize = 1000) {
+    // Interpolated into the SQL, so it is bounded and made whole here rather
+    // than bound as a parameter: a parameterised LIMIT costs the planner the
+    // row estimate that makes it walk the index instead of sorting the table.
+    const size = Math.min(5_000, Math.max(1, Math.trunc(batchSize) || 1));
     let cursor: Cursor | null = null;
     for (;;) {
       const params = [entityType ?? null, entityId ?? null];
@@ -341,7 +354,8 @@ export class AdminUsersController {
       const batch = await this.db.system(
         async (_db, client) => {
           const q = await client.query(
-            `SELECT a.id, a.created_at, a.action, a.entity_type, a.entity_id, a.zone_id,
+            `SELECT a.id, a.created_at, a.created_at::text AS created_at_iso,
+                    a.action, a.entity_type, a.entity_id, a.zone_id,
                     a.actor_type, a.source_ip, a.before, a.after,
                     u.name AS actor_name, u.email AS actor_email
                FROM audit_log a
@@ -349,19 +363,23 @@ export class AdminUsersController {
               WHERE ($1::text IS NULL OR a.entity_type = $1)
                 AND ($2::text IS NULL OR a.entity_id = $2)${keyset.sql}
               ORDER BY a.created_at DESC, a.id DESC
-              LIMIT ${batchSize}`,
+              LIMIT ${size}`,
             [...params, ...keyset.params],
           );
           return q.rows as Record<string, unknown>[];
         },
-        // An export legitimately outlives an interactive query. Each batch is
-        // its own transaction, so this is a per-batch budget, not a total.
-        { statementTimeoutMs: 60_000 },
+        // An export legitimately outlives an interactive query, but it must
+        // still lose the race with nginx's proxy_read_timeout of 60s: a batch
+        // cancelled by Postgres reaches the abort path and marks the file,
+        // where a connection cut by nginx just stops. Per batch, not a total.
+        { statementTimeoutMs: 45_000 },
       );
       if (batch.length === 0) return;
       yield batch;
-      cursor = nextCursor(batch.map((r) => ({ createdAt: r.created_at, id: String(r.id) })));
-      if (batch.length < batchSize) return;
+      cursor = nextCursor(
+        batch.map((r) => ({ createdAt: r.created_at_iso as string, id: String(r.id) })),
+      );
+      if (batch.length < size) return;
     }
   }
 

@@ -85,6 +85,12 @@ const LIST_SELECT = `
   SELECT c.id, c.case_ref, c.zone_id, c.form_key, c.request_types, c.status,
          c.assignee_id, c.due_at, c.created_at, c.requester_email_enc,
          c.pending_party, c.pending_on,
+         -- The export's keyset cursor, and only that: it is not shaped into a
+         -- row and never reaches the CSV. timestamptz is stored to the
+         -- microsecond and a JS Date holds milliseconds, so the key has to
+         -- leave Postgres as text or a batch boundary rounds down and skips
+         -- every row inside the millisecond it landed in.
+         c.created_at::text AS created_at_iso,
          cf.value_json #>> '{}' AS country,
          COALESCE(app.names, '') AS approvers,
          COALESCE(app.emails, ARRAY[]::text[]) AS approver_emails
@@ -165,9 +171,13 @@ export class CasesService {
    * open for the length of a large download.
    */
   async *streamExportRows(ctx: ZoneContext, q: CaseListQuery, batchSize = 1000) {
+    // Interpolated into the SQL, so it is bounded and made whole here rather
+    // than bound as a parameter: a parameterised LIMIT costs the planner the
+    // row estimate that makes it walk the index instead of sorting the table.
+    const size = Math.min(5_000, Math.max(1, Math.trunc(batchSize) || 1));
     let cursor: Cursor | null = null;
     for (;;) {
-      const batch: ReturnType<typeof this.shapeListRow>[] = await this.db.withContext(
+      const batch: Record<string, unknown>[] = await this.db.withContext(
         ctx,
         async (_db, client) => {
           const { sql: filterSql, params } = listFilters(q);
@@ -175,19 +185,25 @@ export class CasesService {
           const rows = await client.query(
             `${LIST_SELECT} ${filterSql}${keyset.sql}
               ORDER BY c.created_at DESC, c.id DESC
-              LIMIT ${batchSize}`,
+              LIMIT ${size}`,
             [...params, ...keyset.params],
           );
-          return rows.rows.map((r) => this.shapeListRow(r));
+          return rows.rows as Record<string, unknown>[];
         },
-        // An export legitimately outlives an interactive query. Each batch is
-        // its own transaction, so this is a per-batch budget, not a total.
-        { statementTimeoutMs: 60_000 },
+        // An export legitimately outlives an interactive query, but it must
+        // still lose the race with nginx's proxy_read_timeout of 60s: a batch
+        // cancelled by Postgres reaches the abort path and marks the file,
+        // where a connection cut by nginx just stops. Per batch, not a total.
+        { statementTimeoutMs: 45_000 },
       );
       if (batch.length === 0) return;
-      yield batch;
-      cursor = nextCursor(batch as { createdAt: unknown; id: string }[]);
-      if (batch.length < batchSize) return;
+      yield batch.map((r) => this.shapeListRow(r));
+      // From the text column, never from the shaped row: shapeListRow hands
+      // back whatever pg parsed created_at into, which is a Date.
+      cursor = nextCursor(
+        batch.map((r) => ({ createdAt: r.created_at_iso as string, id: r.id as string })),
+      );
+      if (batch.length < size) return;
     }
   }
 
