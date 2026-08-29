@@ -111,4 +111,8 @@ export class SmtpProvider implements EmailProvider {
   diagnose() {
     return diagnoseSmtp(this.config());
   }
+
+  activeName(): string {
+    return 'smtp';
+  }
 }

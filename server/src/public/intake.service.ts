@@ -291,7 +291,7 @@ export class IntakeService {
     await this.db.system((db) =>
       db.insert(emailLog).values({
         caseId,
-        provider: 'gmail',
+        provider: this.email.activeName(),
         fromAddr: 'transactional',
         toAddrs: [to],
         subject: sent?.subject ?? `Your privacy request ${caseRef} has been received`,

@@ -299,7 +299,7 @@ export class OutboundService {
     await this.db.system((db) =>
       db.insert(emailLog).values({
         caseId: args.caseId,
-        provider: 'active',
+        provider: this.email.activeName(),
         fromAddr: fromMailbox,
         toAddrs: args.to,
         ccAddrs: args.cc ?? null,

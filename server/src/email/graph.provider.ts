@@ -147,4 +147,8 @@ export class GraphProvider implements EmailProvider {
       return { ok: false, provider: 'graph', detail: (err as Error).message };
     }
   }
+
+  activeName(): string {
+    return 'graph';
+  }
 }

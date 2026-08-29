@@ -51,4 +51,8 @@ export class ConsoleProvider implements EmailProvider {
   async verifyConnection(): Promise<ConnectionStatus> {
     return { ok: true, provider: 'console', detail: 'console adapter (dev only)' };
   }
+
+  activeName(): string {
+    return 'console';
+  }
 }

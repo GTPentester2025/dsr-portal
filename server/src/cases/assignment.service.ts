@@ -286,7 +286,7 @@ export class AssignmentService {
         await this.db.system((sdb) =>
           sdb.insert(emailLog).values({
             caseId,
-            provider: 'active',
+            provider: this.email.activeName(),
             fromAddr: 'transactional',
             toAddrs: [person.email],
             subject: result.subject ?? `[${row.zone_id}] New privacy request ${row.case_ref}`,
@@ -301,7 +301,7 @@ export class AssignmentService {
         await this.db.system((sdb) =>
           sdb.insert(emailLog).values({
             caseId,
-            provider: 'active',
+            provider: this.email.activeName(),
             fromAddr: 'transactional',
             toAddrs: [person.email],
             subject: `[${row.zone_id}] New privacy request ${row.case_ref}`,
@@ -338,7 +338,7 @@ export class AssignmentService {
       await this.db.system((sdb) =>
         sdb.insert(emailLog).values({
           caseId,
-          provider: 'active',
+          provider: this.email.activeName(),
           fromAddr: 'transactional',
           toAddrs: [target.email],
           subject: result.subject ?? `[${zone}] Case ${caseRef} assigned to you`,
@@ -353,7 +353,7 @@ export class AssignmentService {
       await this.db.system((sdb) =>
         sdb.insert(emailLog).values({
           caseId,
-          provider: 'active',
+          provider: this.email.activeName(),
           fromAddr: 'transactional',
           toAddrs: [target.email],
           subject: `[${zone}] Case ${caseRef} assigned to you`,

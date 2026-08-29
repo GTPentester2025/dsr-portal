@@ -112,4 +112,8 @@ export class ResendProvider implements EmailProvider {
       return { ok: false, provider: 'resend', detail: (err as Error).message };
     }
   }
+
+  activeName(): string {
+    return 'resend';
+  }
 }

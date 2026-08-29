@@ -52,6 +52,9 @@ export interface EmailProvider {
   sendAsUser(args: SendAsUserArgs): Promise<SendResult>;
 
   verifyConnection(): Promise<ConnectionStatus>;
+
+  /** Name of the adapter that will handle the next send, for `email_log`. */
+  activeName(): string;
 }
 
 export const EMAIL_PROVIDER = Symbol('EMAIL_PROVIDER');

@@ -179,6 +179,10 @@ export class GmailProvider implements EmailProvider {
     oauth2.setCredentials({ refresh_token: refreshToken });
     return google.gmail({ version: 'v1', auth: oauth2 });
   }
+
+  activeName(): string {
+    return 'gmail';
+  }
 }
 
 /**
