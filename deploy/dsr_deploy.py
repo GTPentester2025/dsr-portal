@@ -316,6 +316,41 @@ def version_at_least(actual: str, minimum: str) -> bool:
     return got >= want
 
 
+OK = "ok"
+WARN = "warn"
+FAIL = "fail"
+
+_SEVERITY_RANK = {OK: 0, WARN: 1, FAIL: 2}
+_SEVERITY_LABEL = {OK: "ok  ", WARN: "WARN", FAIL: "FAIL"}
+
+Finding = collections.namedtuple("Finding", "group severity title detail fix")
+
+
+def exit_code_for(findings: list) -> int:
+    """0 clean, 1 warnings, 2 failures -- so cron and monitoring can use this."""
+    if not findings:
+        return 0
+    return max(_SEVERITY_RANK.get(f.severity, 0) for f in findings)
+
+
+def render_findings(findings: list) -> str:
+    if not findings:
+        return "No checks ran.\n"
+    lines = []
+    for group in sorted({f.group for f in findings}):
+        lines.append("[%s]" % group)
+        for f in [x for x in findings if x.group == group]:
+            lines.append("  %s %s" % (_SEVERITY_LABEL.get(f.severity, "?   "), f.title))
+            if f.detail:
+                lines.append("       %s" % f.detail)
+            if f.fix:
+                lines.append("       fix: %s" % f.fix)
+        lines.append("")
+    worst = exit_code_for(findings)
+    lines.append(["All checks passed.", "Warnings above.", "Failures above."][worst])
+    return "\n".join(lines) + "\n"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dsr_deploy.py",

@@ -346,5 +346,43 @@ class TestVersionAtLeast(unittest.TestCase):
         self.assertFalse(dd.version_at_least("unknown", "22"))
 
 
+class TestFindings(unittest.TestCase):
+    def make(self, severity, fix=""):
+        return dd.Finding("selinux", severity, "a title", "a detail", fix)
+
+    def test_exit_codes_are_zero_one_two(self):
+        self.assertEqual(dd.exit_code_for([]), 0)
+        self.assertEqual(dd.exit_code_for([self.make(dd.OK)]), 0)
+        self.assertEqual(dd.exit_code_for([self.make(dd.WARN)]), 1)
+        self.assertEqual(dd.exit_code_for([self.make(dd.FAIL)]), 2)
+
+    def test_worst_severity_decides(self):
+        self.assertEqual(
+            dd.exit_code_for([self.make(dd.OK), self.make(dd.FAIL), self.make(dd.WARN)]), 2
+        )
+
+    def test_render_shows_title_detail_and_fix(self):
+        text = dd.render_findings([self.make(dd.FAIL, fix="setsebool -P x on")])
+        self.assertIn("a title", text)
+        self.assertIn("a detail", text)
+        self.assertIn("setsebool -P x on", text)
+
+    def test_render_groups_and_marks_severity(self):
+        text = dd.render_findings([
+            dd.Finding("disk", dd.OK, "space", "", ""),
+            dd.Finding("selinux", dd.FAIL, "boolean off", "", "setsebool"),
+        ])
+        self.assertIn("disk", text)
+        self.assertIn("selinux", text)
+        self.assertLess(text.index("disk"), text.index("selinux"))
+
+    def test_render_of_nothing_is_not_an_empty_string(self):
+        self.assertTrue(dd.render_findings([]).strip())
+
+    def test_a_finding_without_a_fix_renders_without_a_dangling_label(self):
+        text = dd.render_findings([dd.Finding("disk", dd.OK, "fine", "", "")])
+        self.assertNotIn("fix:", text)
+
+
 if __name__ == "__main__":
     unittest.main()
