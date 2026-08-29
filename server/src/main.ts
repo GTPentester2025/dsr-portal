@@ -1,7 +1,10 @@
+import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
+import { SettingsService } from './settings/settings.service';
+import { assertEmailConfig } from './email/email-config';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
@@ -32,6 +35,19 @@ async function bootstrap() {
 
   // Body size cap for public JSON payloads.
   app.useBodyParser('json', { limit: '256kb' });
+
+  // Read through SettingsService so the envOnly resolution used at runtime is
+  // the same one validated here.
+  const settings = app.get(SettingsService);
+  const log = new Logger('EmailConfig');
+  try {
+    assertEmailConfig((key) => settings.get<string | undefined>(key, undefined), {
+      error: (m) => log.error(m),
+    });
+  } catch {
+    await app.close();
+    process.exit(1);
+  }
 
   await app.listen(process.env.PORT ?? 3000, '127.0.0.1');
 }
