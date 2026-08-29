@@ -8,7 +8,7 @@ import * as schema from './schema';
 export type Db = NodePgDatabase<typeof schema>;
 
 export type ZoneContext = {
-  role: 'admin' | 'zone_manager' | 'approver' | 'auditor' | 'system' | 'public';
+  role: 'super_admin' | 'admin' | 'zone_manager' | 'approver' | 'auditor' | 'system';
   zone: string; // 'EUR' | 'SAZ' | 'MAZ' | '*'
 };
 

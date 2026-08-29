@@ -20,8 +20,12 @@ export interface SessionUser {
 
 export function zoneContextFor(user: SessionUser): ZoneContext {
   // Super admins, admins and auditors see every zone; the rest are pinned.
+  // The role itself is passed through unchanged: collapsing super_admin into
+  // admin here would make an instance-administration policy inexpressible in
+  // the database, because the two would be indistinguishable by the time a
+  // query ran.
   if (user.role === 'super_admin' || user.role === 'admin' || user.role === 'auditor') {
-    return { role: user.role === 'super_admin' ? 'admin' : user.role, zone: '*' };
+    return { role: user.role, zone: '*' };
   }
   return { role: user.role, zone: user.zoneId ?? '__none__' };
 }
