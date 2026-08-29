@@ -1,9 +1,20 @@
+import { UnauthorizedException } from '@nestjs/common';
 import type { Role } from './permissions';
 
 export interface PasswordCandidate {
   role: Role;
   isBreakGlass: boolean;
 }
+
+/**
+ * Thrown when `canUsePassword` refuses a login that authenticated correctly.
+ *
+ * A subclass of `UnauthorizedException` (not a new status) so the SPA's 401
+ * handling on the login screen is unaffected; the controller distinguishes
+ * this case only to skip charging it against the failed-login rate budget —
+ * see the comment at that call site for why.
+ */
+export class PasswordDisabledException extends UnauthorizedException {}
 
 /**
  * Who may still authenticate with a password once an identity provider is live.

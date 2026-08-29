@@ -13,6 +13,7 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { AuthService } from './auth.service';
+import { PasswordDisabledException } from './break-glass';
 import { AuthGuard, INTERNAL_SESSION_COOKIE } from './auth.guard';
 import type { AuthedRequest } from './auth.guard';
 import { RateLimitService } from '../public/rate-limit.service';
@@ -54,7 +55,16 @@ export class AuthController {
     try {
       ({ sessionId, user } = await this.auth.login(body.email, body.password, ip));
     } catch (err) {
-      await this.rate.record(`login-ip:${ip}`);
+      // PasswordDisabledException means the credentials were CORRECT and a
+      // policy (break-glass/SSO) refused the sign-in afterwards — it does not
+      // count as a guess and must not consume the budget. Charging it would
+      // let policy refusals for legitimate users exhaust the shared-IP limit
+      // and lock out the break-glass account that budget exists to protect.
+      // Every other failure here (unknown user, wrong password, inactive
+      // account) must keep consuming budget exactly as before.
+      if (!(err instanceof PasswordDisabledException)) {
+        await this.rate.record(`login-ip:${ip}`);
+      }
       throw err;
     }
     res.cookie(INTERNAL_SESSION_COOKIE, sessionId, {

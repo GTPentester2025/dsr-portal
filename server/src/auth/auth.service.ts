@@ -6,7 +6,7 @@ import { AuditService } from '../audit/audit.service';
 import { SettingsService } from '../settings/settings.service';
 import { seesEveryZone } from './permissions';
 import { PasswordStrategy, type AuthenticatedIdentity } from './password.strategy';
-import { canUsePassword } from './break-glass';
+import { canUsePassword, PasswordDisabledException } from './break-glass';
 
 const DEFAULT_IDLE_TIMEOUT_MIN = 30;
 const DEFAULT_ABSOLUTE_LIFETIME_H = 8;
@@ -124,7 +124,7 @@ export class AuthService {
         entityId: identity.id,
         sourceIp: ip,
       });
-      throw new UnauthorizedException(refusal);
+      throw new PasswordDisabledException(refusal);
     }
 
     return this.startSession(identity, ip, 'password');
