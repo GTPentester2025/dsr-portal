@@ -6,6 +6,8 @@ import { AuthService } from '../auth/auth.service';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { DbService } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
+import { canAssignRole } from '../auth/admin-policy';
+import type { Role } from '../auth/permissions';
 
 const ROLES = new Set(['super_admin', 'admin', 'zone_manager', 'approver', 'auditor']);
 const ZONES = new Set(['EUR', 'SAZ', 'MAZ']);
@@ -53,14 +55,12 @@ export class AdminUsersController {
       throw new BadRequestException('email, name and a valid role are required');
     }
     if (body.zoneId && !ZONES.has(body.zoneId)) throw new BadRequestException('bad zone');
-    if (body.role === 'super_admin' && req.user.role !== 'super_admin') {
-      throw new BadRequestException('Only a super admin can create another super admin');
-    }
-    if (req.user.role === 'zone_manager') {
-      if (body.role === 'admin' || body.role === 'super_admin' || body.zoneId !== req.user.zoneId) {
-        throw new BadRequestException('Zone managers can only manage their own zone');
-      }
-    }
+    const refusal = canAssignRole(
+      { role: req.user.role, zoneId: req.user.zoneId },
+      body.role as Role,
+      body.zoneId ?? null,
+    );
+    if (refusal) throw new BadRequestException(refusal);
     const row = await this.db.system(async (_db, client) => {
       const res = await client.query(
         `INSERT INTO users (email, name, role, zone_id, capacity_weight)
@@ -96,9 +96,6 @@ export class AdminUsersController {
     },
   ) {
     if (body?.role && !ROLES.has(body.role)) throw new BadRequestException('bad role');
-    if (body?.role === 'super_admin' && req.user.role !== 'super_admin') {
-      throw new BadRequestException('Only a super admin can grant the super admin role');
-    }
     const before = await this.db.system(async (_db, client) => {
       const res = await client.query(`SELECT * FROM users WHERE id = $1`, [id]);
       return res.rows[0];
@@ -107,6 +104,14 @@ export class AdminUsersController {
     if (req.user.role === 'zone_manager' && before.zone_id !== req.user.zoneId) {
       throw new BadRequestException('Zone managers can only manage their own zone');
     }
+    // The resulting role and zone, not just the current ones: a zone manager
+    // must not be able to move a user they administer into another zone.
+    const refusal = canAssignRole(
+      { role: req.user.role, zoneId: req.user.zoneId },
+      (body.role ?? before.role) as Role,
+      body.zoneId !== undefined ? body.zoneId : before.zone_id,
+    );
+    if (refusal) throw new BadRequestException(refusal);
     await this.db.system(async (_db, client) => {
       await client.query(
         `UPDATE users SET
