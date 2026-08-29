@@ -25,8 +25,10 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 INSTALL_PREFIX = "/opt/dsr"
@@ -473,6 +475,61 @@ def _cat_heredoc_command(remote_path: str, content: str, marker: str = "DSR_EOF"
     return "cat > %s <<'%s'\n%s%s" % (remote_path, marker, content, marker)
 
 
+def atomic_write(path: str, text: str) -> None:
+    """Replace a file's contents without ever leaving it truncated.
+
+    `pathlib.Path.write_text` opens with O_TRUNC: from that instant until the
+    write completes the file is empty on disk. If the process dies in that
+    window -- a dropped SSH connection, an OOM kill on a 1-vCPU box -- the
+    file stays empty. For `pg_hba.conf` that means a host whose only
+    authentication file has been destroyed, and every database connection
+    the portal makes fails from then on.
+
+    Writing a sibling temporary file and calling `os.replace` removes the
+    window rather than making it recoverable: `os.replace` is atomic on
+    POSIX, so a reader sees either the whole old file or the whole new one,
+    and an interruption leaves the original wholly intact.
+
+    Mode and ownership are copied from the original first. `os.replace`
+    swaps inodes, and a `pg_hba.conf` that arrives owned by root instead of
+    postgres is a second outage in place of the first.
+    """
+    target = pathlib.Path(path)
+    try:
+        original = os.stat(str(target))
+    except OSError:
+        original = None
+
+    handle_fd, temp_path = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + ".", suffix=".dsrtmp"
+    )
+    try:
+        with os.fdopen(handle_fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if original is not None:
+            os.chmod(temp_path, stat.S_IMODE(original.st_mode))
+            if hasattr(os, "chown"):
+                try:
+                    os.chown(temp_path, original.st_uid, original.st_gid)
+                except OSError:
+                    # Not root, or a filesystem without ownership. The mode
+                    # is already right; refusing the whole write over this
+                    # would be worse than proceeding.
+                    pass
+        os.replace(temp_path, str(target))
+    except BaseException:
+        # The rename never happened, so the original is untouched. Take the
+        # half-written temporary file with us rather than leaving litter
+        # next to a config file an operator will later read.
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _remote_text_fix(path: str, func_name: str) -> str:
     """Apply one of Task 4's pure text transforms to a file already on the box.
 
@@ -480,6 +537,10 @@ def _remote_text_fix(path: str, func_name: str) -> str:
     idempotent, comment-aware guard exercised by the unit tests decides
     whether anything changes -- never a shell sed re-deriving that logic on
     the box, where a wrong regex leaves an unbalanced config file.
+
+    The write goes through atomic_write, not p.write_text: see that
+    function for what truncation costs on a file postgres will not start
+    without.
     """
     remote_dir = REMOTE_SELF.rsplit("/", 1)[0]
     return (
@@ -487,8 +548,8 @@ def _remote_text_fix(path: str, func_name: str) -> str:
         "import sys; sys.path.insert(0, '%s'); import dsr_deploy as d, pathlib; "
         "p = pathlib.Path('%s'); t = p.read_text(); "
         "new, changed = d.%s(t); "
-        "p.write_text(new) if changed else None\""
-    ) % (remote_dir, path, func_name)
+        "d.atomic_write('%s', new) if changed else None\""
+    ) % (remote_dir, path, func_name, path)
 
 
 def provision_steps() -> list:
@@ -499,10 +560,19 @@ def provision_steps() -> list:
     creation uses `mkdir -p` / `install -d`, `setsebool -P` is idempotent,
     and the two file rewrites go through Task 4's guarded, no-op-on-replay
     functions rather than an unconditional sed.
+
+    Commands within a step are joined with `&&`, not `;`. `A; B` reports
+    B's exit code: if A truncated a config file and then died, a `systemctl
+    reload` that succeeds afterwards makes the whole step look fine. The
+    three places a `;` survives are marked, and in each of them the earlier
+    command is one whose failure is the expected case.
     """
     return [
         Step(
             "preflight: confirm RHEL 9 and disk headroom",
+            # Deliberate `;`: this step reports, it does not gate. The grep
+            # branch warns rather than aborting -- CentOS Stream and Alma
+            # are fine targets -- and df must print either way.
             "grep -q 'platform:el9' /etc/os-release "
             "&& echo 'RHEL 9 detected' || echo 'WARNING: does not look like RHEL 9'; "
             "df -h / /var",
@@ -514,12 +584,17 @@ def provision_steps() -> list:
         ),
         Step(
             "install Node.js 22",
+            # Deliberate `;` after `module reset`: it exits non-zero when no
+            # nodejs stream is enabled, which is the common case on a bare
+            # box and not a reason to skip the install that follows.
             "(command -v node >/dev/null 2>&1 && [ \"$(node -v | cut -c2-3)\" -ge 22 ]) || "
             "(dnf module reset -y nodejs >/dev/null 2>&1; "
             "dnf module enable -y nodejs:22 && dnf install -y nodejs && dnf clean all)",
         ),
         Step(
             "install PostgreSQL 16",
+            # Deliberate `;` after `module reset`, for the same reason as
+            # the Node step above.
             "rpm -q postgresql-server >/dev/null 2>&1 || "
             "(dnf module reset -y postgresql >/dev/null 2>&1; "
             "dnf module enable -y postgresql:16 && "
@@ -527,16 +602,30 @@ def provision_steps() -> list:
         ),
         Step(
             "initialize the data directory (postgresql-setup --initdb)",
-            "test -f /var/lib/pgsql/data/PG_VERSION || postgresql-setup --initdb; "
-            "systemctl enable --now postgresql",
+            # `&&`, not `;`: an initdb that fails leaves an empty data
+            # directory, and `systemctl enable --now postgresql` would then
+            # be the command whose exit code the step reports.
+            "( test -f /var/lib/pgsql/data/PG_VERSION || postgresql-setup --initdb ) "
+            "&& systemctl enable --now postgresql",
         ),
         Step(
             "pg_hba: require scram-sha-256 on loopback (Task 4's rewrite_pg_hba)",
+            # `&&` is load-bearing here above everywhere else. With `;`, a
+            # rewrite that died mid-write left pg_hba.conf empty, `reload`
+            # succeeded, and the step reported success on a box that could
+            # no longer authenticate anything. atomic_write removes the
+            # truncation; `&&` removes the silence.
             _remote_text_fix(PG_HBA_REMOTE, "rewrite_pg_hba")
-            + "; systemctl reload postgresql",
+            + " && systemctl reload postgresql",
         ),
         Step(
             "create the dsr and dsr_app roles and database",
+            # `set -e` rather than `&&` between these: a heredoc terminator
+            # cannot be followed by `&&` without hiding the operator that
+            # matters at the end of the line above it. `set -e` gives the
+            # same guarantee -- the first failure stops the step -- across
+            # all four statements.
+            "set -e\n"
             "sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL\n"
             "DO \\$\\$\n"
             "BEGIN\n"
@@ -560,12 +649,15 @@ def provision_steps() -> list:
         ),
         Step(
             "create the dsr service user and directories",
-            "id -u dsr >/dev/null 2>&1 || "
-            "useradd --system --no-create-home --home-dir %s --shell /sbin/nologin dsr; "
-            "mkdir -p %s/server %s/public-form %s/admin; "
-            "install -d -o dsr -g dsr -m 750 %s; "
-            "chown -R dsr:dsr %s; "
-            "chown -R nginx:nginx %s"
+            # `&&` throughout: with `;`, a useradd that failed left every
+            # chown running against a user that does not exist, and the last
+            # chown's exit code was all the operator saw.
+            "( id -u dsr >/dev/null 2>&1 || "
+            "useradd --system --no-create-home --home-dir %s --shell /sbin/nologin dsr ) "
+            "&& mkdir -p %s/server %s/public-form %s/admin "
+            "&& install -d -o dsr -g dsr -m 750 %s "
+            "&& chown -R dsr:dsr %s "
+            "&& chown -R nginx:nginx %s"
             % (
                 INSTALL_PREFIX,
                 INSTALL_PREFIX,
@@ -600,11 +692,14 @@ def provision_steps() -> list:
         ),
         Step(
             "zram: swap-on-compressed-RAM instead of a swapfile",
-            "dnf install -y zram-generator && dnf clean all; "
-            "printf '[zram0]\\nzram-size = min(ram / 2, 2048)\\n' "
-            "> /etc/systemd/zram-generator.conf; "
-            "systemctl daemon-reload; "
-            "systemctl start systemd-zram-setup@zram0.service",
+            # `&&`: writing the config after a failed install, or starting
+            # the unit after a config that never landed, both end with a
+            # step that exits 0 and a box with no swap at all.
+            "dnf install -y zram-generator && dnf clean all "
+            "&& printf '[zram0]\\nzram-size = min(ram / 2, 2048)\\n' "
+            "> /etc/systemd/zram-generator.conf "
+            "&& systemctl daemon-reload "
+            "&& systemctl start systemd-zram-setup@zram0.service",
         ),
     ]
 
@@ -635,7 +730,14 @@ def _env_file_content(env: dict) -> str:
 # CERT_NAME is discovered on the box, inside this fragment, at run time --
 # not by the operator's machine beforehand -- so this one Step stays static
 # while still doing nothing on a box with no domain pointed at it yet.
+#
+# `set -e` so a sed that failed cannot be masked by the certbot line that
+# follows it -- the outcome there is an nginx config still saying
+# `server_name _;` while the step reports success. The CERT_NAME assignment
+# is safe under `set -e`: it is a pipeline ending in `head`, which exits 0
+# even when `ls` found no directory.
 _TLS_REAPPLY_COMMAND = (
+    "set -e\n"
     "CERT_NAME=$(ls /etc/letsencrypt/live 2>/dev/null | grep -v README | head -1)\n"
     "if [ -n \"$CERT_NAME\" ]; then\n"
     "  sed -i \"s/server_name _;/server_name $CERT_NAME;/\" %s\n"
@@ -681,7 +783,12 @@ _ENSURE_URLS_JS = """const pg = require('pg');
 # margin, not indented under the `if`, because `<<'NODE'` (unlike `<<-`) only
 # recognises the terminator when it starts in column one -- an indented
 # "  NODE" would not match, and the shell would read past `fi` looking for it.
+#
+# `set -e` again: the heredoc that writes ensure-urls.cjs is joined to the
+# `node` invocation by a newline, so without it a failed write is reported
+# as a successful step.
 _ENSURE_URLS_COMMAND = (
+    "set -e\n"
     "CERT_NAME=$(ls /etc/letsencrypt/live 2>/dev/null | grep -v README | head -1)\n"
     "if [ -n \"$CERT_NAME\" ]; then\n"
     + _cat_heredoc_command("%s/server/ensure-urls.cjs" % INSTALL_PREFIX, _ENSURE_URLS_JS, "NODE")
@@ -704,7 +811,11 @@ def deploy_steps(env: dict) -> list:
     return [
         Step(
             "write /opt/dsr/server/.env (keep .env.bak first)",
-            ("test -f %s && cp %s %s.bak || true\n" % (ENV_PATH, ENV_PATH, ENV_PATH))
+            # `set -e`: without it, a heredoc that ran out of disk halfway
+            # left a truncated .env, `chmod 600` succeeded, and the step
+            # reported success on a service that will not start.
+            "set -e\n"
+            + ("test -f %s && cp %s %s.bak || true\n" % (ENV_PATH, ENV_PATH, ENV_PATH))
             + _cat_heredoc_command(ENV_PATH, _env_file_content(env), "ENV")
             + ("\nchmod 600 %s" % ENV_PATH),
         ),
@@ -725,14 +836,20 @@ def deploy_steps(env: dict) -> list:
         ),
         Step(
             "import form schemas (node scripts/import-forms.mjs)",
-            "cd %s/server && set -a && . ./.env && set +a && "
+            # `set -o pipefail` before the pipe: a pipeline reports the exit
+            # code of its *last* command, so without it a failed import is
+            # masked by a `tail -1` that succeeded on empty input.
+            "cd %s/server && set -a && . ./.env && set +a && set -o pipefail && "
             "node scripts/import-forms.mjs | tail -1" % INSTALL_PREFIX,
         ),
         Step(
             "fix ownership and SELinux context (restorecon)",
-            "chown -R dsr:dsr %s; chown -R nginx:nginx %s; "
-            "mkdir -p %s && chown dsr:dsr %s && chmod 750 %s; "
-            "restorecon -R %s %s"
+            # `&&`: a restorecon that succeeds after a chown that failed is
+            # a step that reports success over the wrong ownership, which is
+            # a 403 on every page with nothing in the log naming the cause.
+            "chown -R dsr:dsr %s && chown -R nginx:nginx %s "
+            "&& mkdir -p %s && chown dsr:dsr %s && chmod 750 %s "
+            "&& restorecon -R %s %s"
             % (
                 INSTALL_PREFIX,
                 WEB_ROOT,
@@ -745,7 +862,11 @@ def deploy_steps(env: dict) -> list:
         ),
         Step(
             "install the dsr-api unit and nginx conf.d/dsr.conf",
-            _cat_heredoc_command(UNIT_REMOTE, UNIT_FILE_LOCAL.read_text(), "DSR_UNIT_EOF")
+            # `set -e`: two heredocs joined by a newline means the second
+            # one's exit code is the step's, and a unit file that never
+            # landed would be reported as installed.
+            "set -e\n"
+            + _cat_heredoc_command(UNIT_REMOTE, UNIT_FILE_LOCAL.read_text(), "DSR_UNIT_EOF")
             + "\n"
             + _cat_heredoc_command(
                 NGINX_SITE_CONF_REMOTE, NGINX_CONF_LOCAL.read_text(), "DSR_NGINX_EOF"
@@ -769,8 +890,11 @@ def deploy_steps(env: dict) -> list:
         ),
         Step(
             "restart dsr-api",
-            "systemctl enable --now %s >/dev/null 2>&1; systemctl restart %s"
-            % (SERVICE, SERVICE),
+            # The tolerance of a failing `enable` is made explicit with
+            # `|| true` rather than left implicit in a `;`. The restart is
+            # the command whose exit code this step is about.
+            "( systemctl enable --now %s >/dev/null 2>&1 || true ) "
+            "&& systemctl restart %s" % (SERVICE, SERVICE),
         ),
         Step(
             "reload nginx",

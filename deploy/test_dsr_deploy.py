@@ -3,9 +3,13 @@ from __future__ import annotations
 import base64
 import contextlib
 import io
+import os
 import pathlib
+import shutil
 import sys
+import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -438,11 +442,88 @@ class TestPlans(unittest.TestCase):
             [i for i, n in enumerate(names) if "restart" in n.lower()][0],
         )
 
+    def test_no_step_lets_a_semicolon_hide_a_failed_command(self):
+        # `A; B` reports B's exit code. The pg_hba step was
+        # `<rewrite>; systemctl reload postgresql`: a rewrite that died
+        # mid-write left the file empty, the reload succeeded, and
+        # Ssh.run(check=True) saw a healthy step on a box that could no
+        # longer authenticate a single connection.
+        for step in dd.provision_steps() + dd.deploy_steps({}):
+            for line in step.command.splitlines():
+                self.assertNotIn("; systemctl", line, step.name)
+                self.assertNotIn("; chown", line, step.name)
+                self.assertNotIn("; restorecon", line, step.name)
+
+    def test_the_pg_hba_step_joins_its_reload_with_and(self):
+        step = [s for s in dd.provision_steps() if "pg_hba" in s.name][0]
+        self.assertIn("&& systemctl reload postgresql", step.command)
+
+    def test_the_initdb_step_joins_its_enable_with_and(self):
+        step = [s for s in dd.provision_steps() if "initdb" in s.name][0]
+        self.assertIn("&& systemctl enable --now postgresql", step.command)
+
+    def test_every_config_rewrite_is_written_atomically(self):
+        # A truncating write is the failure atomic_write exists to remove;
+        # a step that reached for p.write_text again would reintroduce it.
+        rewrites = [s for s in dd.provision_steps() if "dsr_deploy as d" in s.command]
+        self.assertEqual(len(rewrites), 2)
+        for step in rewrites:
+            self.assertIn("atomic_write", step.command, step.name)
+            self.assertNotIn("write_text", step.command, step.name)
+
     def test_render_plan_numbers_the_steps_and_shows_commands(self):
         text = dd.render_plan([dd.Step("do a thing", "echo hi")])
         self.assertIn("do a thing", text)
         self.assertIn("echo hi", text)
         self.assertIn("1", text)
+
+
+class TestAtomicWrite(unittest.TestCase):
+    def setUp(self):
+        self.directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.directory), True)
+        self.target = self.directory / "pg_hba.conf"
+        self.target.write_text("original\n")
+
+    def test_it_replaces_the_content(self):
+        dd.atomic_write(str(self.target), "rewritten\n")
+        self.assertEqual(self.target.read_text(), "rewritten\n")
+
+    def test_it_creates_a_file_that_did_not_exist(self):
+        fresh = self.directory / "new.conf"
+        dd.atomic_write(str(fresh), "hello\n")
+        self.assertEqual(fresh.read_text(), "hello\n")
+
+    def test_an_interrupted_write_leaves_the_original_whole(self):
+        # The point of os.replace: the failure that used to empty
+        # pg_hba.conf now leaves it byte-for-byte as it was.
+        with unittest.mock.patch("os.replace", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                dd.atomic_write(str(self.target), "rewritten\n")
+        self.assertEqual(self.target.read_text(), "original\n")
+
+    def test_a_failed_write_leaves_no_temporary_file_beside_it(self):
+        with unittest.mock.patch("os.replace", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                dd.atomic_write(str(self.target), "rewritten\n")
+        self.assertEqual([p.name for p in self.directory.iterdir()], ["pg_hba.conf"])
+
+    def test_the_temporary_file_is_a_sibling_so_the_rename_stays_atomic(self):
+        # os.replace across filesystems is not atomic and can raise, so the
+        # temporary file has to live in the target's own directory.
+        seen = {}
+
+        real_replace = os.replace
+
+        def record(src, dst):
+            seen["src"] = src
+            return real_replace(src, dst)
+
+        with unittest.mock.patch("os.replace", side_effect=record):
+            dd.atomic_write(str(self.target), "rewritten\n")
+        self.assertEqual(
+            pathlib.Path(seen["src"]).parent.resolve(), self.directory.resolve()
+        )
 
 
 class TestTarget(unittest.TestCase):
