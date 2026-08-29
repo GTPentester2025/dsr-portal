@@ -40,21 +40,25 @@ for file in sorted((ROOT / "server" / "src").rglob("*.controller.ts")):
         sections.append((m.group(1), src[m.start():end]))
 
     for base, body in sections:
-        # A @Roles applied to the class covers every handler inside it.
+        # Routes are guarded by a named permission (@Requires('team.manage')),
+        # not by a list of roles -- reading for the old @Roles here would match
+        # nothing and publish every route as unguarded, which is worse than
+        # being out of date. A @Requires applied to the class covers every
+        # handler inside it.
         head = body[: body.find("{")] if "{" in body else body
-        cls = re.search(r"@Roles\(([^)]*)\)", head)
-        default_roles = cls.group(1).replace("'", "") if cls else ""
+        cls = re.search(r"@Requires\(([^)]*)\)", head)
+        default_permission = cls.group(1).replace("'", "") if cls else ""
 
         hits = list(HTTP.finditer(body))
         for i, m in enumerate(hits):
             # Look only between this decorator and the next one, so a later
-            # handler's @Roles can never be mistaken for this one's.
+            # handler's @Requires can never be mistaken for this one's.
             window = body[m.end(): hits[i + 1].start() if i + 1 < len(hits) else len(body)]
-            own = re.search(r"@Roles\(([^)]*)\)", window[:220])
+            own = re.search(r"@Requires\(([^)]*)\)", window[:220])
             routes.append({
                 "method": m.group(1).upper(),
                 "path": "/" + "/".join(x for x in [base, m.group(2)] if x),
-                "roles": (own.group(1).replace("'", "") if own else default_roles) or "any signed-in",
+                "requires": (own.group(1).replace("'", "") if own else default_permission) or "any signed-in",
                 "file": f"server/src/{file.relative_to(ROOT / 'server' / 'src').as_posix()}",
             })
 

@@ -208,6 +208,12 @@ REPLACE` errors on a changed or dropped input parameter name rather than
 applying, and the only way past that is `DROP FUNCTION ... CASCADE`, which
 takes all fourteen policies in this migration with it.
 
+Zone isolation survives the hatch completely: it replaces `app_role_may_write`
+only, and every zone predicate in the migration calls the separate
+`app_zone_allows`, so cross-zone reads and writes stay blocked while the hatch
+is open — there is never a reason to reach for something blunter, like turning
+RLS off on a table.
+
 Restore the real function from the migration once the predicate is fixed.
 
 ## Configuration is done in the GUI

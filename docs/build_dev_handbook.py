@@ -92,9 +92,11 @@ callout(doc, "warn",
 h3(doc, "server/src/auth")
 table(doc, ["File", "Responsibility"], [
     ["`auth.service.ts`", "Password verification with argon2id, session creation, idle and absolute expiry, and `zoneContextFor` which maps a user to their RLS context."],
-    ["`auth.guard.ts`", "`AuthGuard` resolves the session cookie and attaches `req.user` and `req.zoneCtx`. `satisfies()` implements the role ladder."],
+    ["`auth.guard.ts`", "`AuthGuard` resolves the session cookie, attaches `req.user` and `req.zoneCtx`, and checks the handler's `@Requires(...)` permission with `hasPermission()`."],
+    ["`permissions.ts`", "The permission table: the seven named permissions and the set each role holds. Also `ZONE_WIDE_ROLES`, the roles whose session sees every zone."],
+    ["`admin-policy.ts`", "`canAssignRole`: who may produce a user with a given role in a given zone. Both the create and the update path call it."],
     ["`auth.controller.ts`", "Sign in, sign out, and `me`. Also owns `cookieSecure()`, which decides whether session cookies carry the Secure flag."],
-    ["`auth.guard.spec.ts`", "Unit tests for the role ladder, including the auditor exclusion."],
+    ["`permissions.spec.ts`, `admin-policy.spec.ts`", "Unit tests for the permission table and for role assignment, including the auditor's read-only lane."],
 ], widths=[1.7, 4.7])
 
 h3(doc, "server/src/public")
@@ -264,13 +266,17 @@ code(doc, """
 request ─► AuthGuard
              ├─ read dsr_int cookie
              ├─ resolveSession()  ── idle + absolute expiry, user still active
-             ├─ satisfies(role, @Roles)      ← the ladder, auditor excluded
+             ├─ hasPermission(role, @Requires)  ← the permission table
              └─ attach req.user, req.zoneCtx ─► controller ─► DbService.withContext
                                                                  └─ SET LOCAL app.current_zone
 """)
-para(doc, "The ladder is `zone_agent < zone_manager < admin < super_admin`. `auditor` sits "
-          "outside it: it never inherits write access, and a route open to auditors does not "
-          "become open to every ladder role. That subtlety is unit-tested in `auth.guard.spec.ts`.")
+para(doc, "There is no ladder. `ROLE_PERMISSIONS` in `permissions.ts` grants each of the five "
+          "roles an explicit list drawn from seven permissions, and `@Requires('team.manage')` on "
+          "a handler asks for exactly one of them. Nothing is inherited by rank, which is what "
+          "keeps `auditor` read-only without a carve-out: it holds `audit.read` and nothing else. "
+          "The table is unit-tested in `permissions.spec.ts`, and who may create whom in "
+          "`admin-policy.spec.ts`. `0013_role-matrix.sql` enforces the same matrix in Postgres, "
+          "so an application bug cannot write past it.")
 
 h2(doc, "4.3 Email dispatch")
 code(doc, """
@@ -365,8 +371,8 @@ table(doc, ["Method", "Path", "Purpose"], [
 ], widths=[0.8, 2.8, 2.8])
 
 h2(doc, "5.2 Internal endpoints")
-table(doc, ["Method", "Path", "Roles"],
-      [[r["method"], f"`{r['path']}`", r["roles"]] for r in internal],
+table(doc, ["Method", "Path", "Requires"],
+      [[r["method"], f"`{r['path']}`", r["requires"]] for r in internal],
       widths=[0.8, 3.2, 2.4])
 
 page_break(doc)
@@ -431,7 +437,7 @@ table(doc, ["Command", "Covers"], [
     ["`node scripts/e2e-auth.mjs`", "Sign in, session revocation, RBAC, cross-zone IDOR through the API"],
     ["`node scripts/e2e-workflow.mjs`", "Transition matrix, system-only Overdue, extension and closure rules, SLA breach sweep"],
     ["`node scripts/e2e-settings.mjs`", "Settings round trip, secret masking, validation, provider hot-swap, diagnostics"],
-    ["`npx jest`", "Template rendering and the role ladder"],
+    ["`npx jest`", "Template rendering, the permission table, and role assignment"],
     ["`node deploy/smoke.mjs`", "Production smoke: headers, auth, settings, public surface"],
 ], widths=[2.3, 4.1])
 callout(doc, "note",
@@ -515,9 +521,10 @@ numbered(doc, [
 
 h3(doc, "Add a role")
 numbered(doc, [
-    "Add it to the `SessionUser` union and to `RANK` in `auth.guard.ts`, or leave it off the ladder if it should not inherit.",
-    "Extend `auth.guard.spec.ts` first; the ladder is security-critical and the tests are the specification.",
-    "Add it to `ROLES` in `admin-users.controller.ts` and to the console's nav guards.",
+    "Add it to the `Role` union and to `ROLE_PERMISSIONS` in `permissions.ts`, listing every permission it holds -- nothing is inherited by rank.",
+    "If its session should see every zone rather than one, add it to `ZONE_WIDE_ROLES` in the same file: `zoneContextFor` and `canAssignRole` both read that list, so a zone manager cannot mint the new role by accident.",
+    "Extend `permissions.spec.ts` first; the table is security-critical and the tests are the specification.",
+    "Add it to `ROLES` in `admin-users.controller.ts`, to the write arrays in `0013_role-matrix.sql`, and to the console's nav guards.",
 ])
 
 h2(doc, "8.4 Outstanding work")
