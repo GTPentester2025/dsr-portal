@@ -126,23 +126,19 @@ table(doc, ["File", "Responsibility"], [
 h3(doc, "server/src/email")
 table(doc, ["File", "Responsibility"], [
     ["`email-provider.interface.ts`", "The single seam every adapter implements."],
-    ["`email.module.ts`", "`EmailDispatcher`, which resolves the active adapter per call so providers can be switched at runtime."],
-    ["`smtp.ts`", "Shared SMTP transport with IPv4 pinning and timeouts, plus the staged diagnostic."],
-    ["`gmail.provider.ts`", "Gmail over SMTP app password or the Gmail API with OAuth2. Only the API path works on this host."],
-    ["`smtp.provider.ts`", "Any SMTP server."],
-    ["`resend.provider.ts`", "Resend over HTTPS."],
-    ["`graph.provider.ts`", "Microsoft Graph, sending as a shared mailbox."],
-    ["`console.provider.ts`", "Development adapter that writes to the log. Refused in production."],
+    ["`email.module.ts`", "`EmailDispatcher`, which resolves the active adapter per call. Provider choice itself is environment-only (see 4.3)."],
+    ["`net-diagnostics.ts`", "Shared HTTPS reachability probe (DNS, TCP) with IPv4 pinning and timeouts, plus the staged diagnostic."],
+    ["`graph.provider.ts`", "Microsoft Graph, sending as a shared mailbox. The only production adapter."],
+    ["`console.provider.ts`", "Development adapter that writes to the log. Refused in production unless `ALLOW_CONSOLE_EMAIL=true`."],
+    ["`email-config.ts`", "Pure `missingEmailKeys()`/`assertEmailConfig()` boot-time check: a missing Graph credential stops the service before `app.listen()`."],
     ["`templates.ts`", "System transactional templates with strict variable substitution."],
 ], widths=[1.7, 4.7])
 
 h3(doc, "server/src/settings and audit")
 table(doc, ["File", "Responsibility"], [
-    ["`settings/settings.catalog.ts`", "Declarative field catalog. Adding an entry here is all it takes to surface a new setting in the UI."],
-    ["`settings/settings.service.ts`", "Resolution order, in-memory cache, encryption of secrets, validation, audit."],
-    ["`settings/settings.controller.ts`", "Super-admin API, connection check, diagnostics, test send, and starting the Gmail authorisation."],
-    ["`settings/gmail-oauth.service.ts`", "The OAuth2 authorisation-code flow: builds the consent URL, holds the pending `state`, exchanges the code, stores the refresh token."],
-    ["`settings/gmail-callback.controller.ts`", "The unauthenticated redirect target Google returns to. Renders the success or failure page."],
+    ["`settings/settings.catalog.ts`", "Declarative field catalog. Adding an entry here is all it takes to surface a new setting in the UI. The `envOnly` flag locks the six email keys to the environment."],
+    ["`settings/settings.service.ts`", "Resolution order (`resolveValue()`), in-memory cache, encryption of secrets, validation, `envOnly` write rejection, audit."],
+    ["`settings/settings.controller.ts`", "Super-admin API: catalog + values, update, connection check, diagnostics, test send."],
     ["`audit/audit.service.ts`", "The single writer to the append-only audit log."],
 ], widths=[1.9, 4.5])
 
@@ -279,40 +275,29 @@ para(doc, "The ladder is `zone_agent < zone_manager < admin < super_admin`. `aud
 h2(doc, "4.3 Email dispatch")
 code(doc, """
 caller ─► EMAIL_PROVIDER (EmailDispatcher)
-             └─ settings.get('EMAIL_PROVIDER')   ← read per call, not at boot
-                  ├─ gmail   → SMTP app password (blocked here) | Gmail API over OAuth2
-                  ├─ smtp    → any SMTP server
-                  ├─ resend  → HTTPS API
+             └─ settings.get('EMAIL_PROVIDER')   ← envOnly: env or catalog default, never a DB row
                   ├─ graph   → Microsoft Graph over HTTPS
-                  └─ console → log only, refused in production
+                  └─ console → log only, refused in production unless ALLOW_CONSOLE_EMAIL=true
 """)
 bullets(doc, [
-    "Because the adapter is resolved per call, changing the provider in Settings takes effect immediately.",
-    "SMTP transports pin to IPv4 and set connection, greeting and socket timeouts. Both were real production faults: a host without an IPv6 route produced `ENETUNREACH`, and an untimed socket produced a gateway timeout.",
-    "`diagnoseSmtp` checks DNS, TCP, TLS and authentication separately and maps common errors to an operator-facing explanation.",
-    "This host blocks outbound 25, 465 and 587 but leaves **2525** open, so a relay such as SendGrid, Brevo or Mailgun works through the Custom SMTP provider on that port. Gmail publishes no alternative port, which is why Gmail must go over the API.",
+    "Graph and console are the only adapters. Provider choice and every Graph credential are `envOnly` catalog entries (§4.6): `EMAIL_PROVIDER`, `EMAIL_FROM_NAME`, `PRIVACY_MAILBOX`, `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`. A database row can never shadow the value in `/etc/dsr/dsr-api.env`, and `PUT /internal/admin/settings` returns `400` for any of the six.",
+    "`assertEmailConfig()` (`email-config.ts`) runs in `main.ts` before `app.listen()`. When `EMAIL_PROVIDER=graph`, all four required keys must be non-empty or the process exits non-zero, naming every missing key and the env file path in the log.",
+    "`net-diagnostics.ts` (`diagnoseHttpsEndpoint`) checks DNS then a TCP connect to `graph.microsoft.com:443`; `EmailDispatcher.diagnose()` appends an authenticated `verifyConnection()` call as a third stage, so a failure names DNS, transport or credentials rather than one opaque timeout.",
 ])
 
-h3(doc, "Gmail authorisation")
+h3(doc, "Confirming the mail path from the host")
 code(doc, """
-admin presses Connect
-  ├─ POST settings/email/gmail/authorize      ← super_admin only
-  │     └─ GmailOauthService.begin()
-  │           ├─ state = 32 random bytes, held in memory with the origin
-  │           └─ returns accounts.google.com/o/oauth2/v2/auth?...
-  │                 access_type=offline  prompt=consent  scope=gmail.send
-  ├─ user consents on Google
-  └─ GET internal/admin/settings/email/gmail/callback?code&state   ← unauthenticated
-        ├─ state looked up and consumed (single use)
-        ├─ code exchanged for a refresh token
-        ├─ GMAIL_OAUTH_REFRESH_TOKEN stored encrypted
-        ├─ GMAIL_AUTH=oauth2, EMAIL_PROVIDER=gmail
-        └─ GMAIL_USER filled from the Gmail profile API
+node server/scripts/verify-email.mjs [--send someone@company.com]
+  1. configuration present         ← same REQUIRED keys as the boot check
+  2. login.microsoftonline.com resolves
+  3. client-credentials token issued
+  4. mailbox reachable via Graph   ← proves Mail.Send consent + access policy
+  [5. sendMail accepted]           ← only with --send
 """)
 bullets(doc, [
-    "The callback route cannot require a session, because Google redirects the browser to it from a different origin. `state` is what ties the callback back to the administrator who started it, and it is consumed on first use.",
-    "The pending state lives in memory rather than in the session cookie, because that cookie is `SameSite=Strict` and is therefore not sent on Google's cross-site redirect.",
-    "The redirect URI is derived from `PORTAL_INTERNAL_URL` and shown on the Settings screen with a copy button, so it matches what is registered in Google Cloud byte for byte.",
+    "Dependency-free and untranspiled on purpose: it has to run on a box where the build is broken, which is exactly when it is needed.",
+    "Reads `process.env` directly, so it is run after sourcing the same env file systemd gives the service: `set -a; . /etc/dsr/dsr-api.env; set +a; node scripts/verify-email.mjs`.",
+    "Step 4 is the one that actually proves the Azure side is configured correctly — a valid token (step 3) only proves the app registration exists, not that `Mail.Send` was consented or that the application access policy scopes it to the right mailbox.",
 ])
 
 h2(doc, "4.4 The SLA engine")
@@ -501,7 +486,7 @@ node deploy/smoke.mjs                              # verify a release
 
 h2(doc, "8.2 Known constraints on the current host")
 bullets(doc, [
-    "**Outbound SMTP is blocked on 25, 465 and 587**, so Gmail app passwords can never work here. Port **2525** is open, so a relay works through the Custom SMTP provider. Resend, Gmail over OAuth2 and Microsoft Graph all send over HTTPS and are unaffected.",
+    "**Outbound SMTP is blocked on 25, 465 and 587**, DigitalOcean's default anti-spam policy on new accounts. Irrelevant to this portal: Microsoft Graph, the only production email adapter, sends over HTTPS (443) and never opens an SMTP connection.",
     "**TLS is in place** for `203-0-113-10.sslip.io`, issued by Let's Encrypt and renewed by `certbot.timer`. `COOKIE_SECURE` defaults to `true`. sslip.io resolves any dashed IP in its name back to that IP, which is how a certificate is possible without owning a domain. Moving to a real domain means re-running `deploy/enable-tls.sh` and updating `PORTAL_*_URL`.",
     "**One vCPU and 2 GB.** A 2 GB swap file is configured and the API is capped at a 384 MB heap.",
 ])
@@ -516,8 +501,8 @@ h3(doc, "Add an email provider")
 numbered(doc, [
     "Implement `EmailProvider` in a new file under `server/src/email/`.",
     "Register it in `email.module.ts` and add a case to `EmailDispatcher.active()`.",
-    "Add the provider option and its credential fields to the settings catalog.",
-    "If it speaks SMTP, reuse `createSmtpTransport` so it inherits the IPv4 pinning and timeouts.",
+    "Add the provider option to `EMAIL_PROVIDER`'s `options` and its credential fields to the settings catalog, marked `envOnly: true` if the value should live in `/etc/dsr/dsr-api.env` rather than be database-writable.",
+    "If it speaks HTTPS, reuse `diagnoseHttpsEndpoint` from `net-diagnostics.ts` so it inherits the staged DNS/TCP diagnostic.",
 ])
 
 h3(doc, "Add a form field type")

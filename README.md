@@ -30,18 +30,19 @@ node scripts/import-forms.mjs
 node scripts/create-user.mjs admin@you.com "Your Name" admin "" "SomePassw0rdLong!"
 
 # 3. API (console email adapter logs emails to .email-out.jsonl)
-EMAIL_PROVIDER=console EMAIL_CONSOLE_FILE=.email-out.jsonl \
-ADMIN_API_TOKEN=devtoken node dist/main.js   # after: npm run build
+EMAIL_PROVIDER=console EMAIL_CONSOLE_FILE=.email-out.jsonl node dist/main.js   # after: npm run build
 
 # 4. front-ends
 cd apps/public-form && npm run dev   # http://localhost:5180  (proxies /public)
 cd apps/admin && npm run dev         # http://localhost:5181  (proxies /internal)
 ```
 
-Gmail testing: set `EMAIL_PROVIDER=gmail`, `GMAIL_AUTH=app-password`,
-`GMAIL_USER`, `GMAIL_APP_PASSWORD` (Google account → App passwords). Admin
-panel → "Test connection" exercises the active provider, or:
-`curl -H "X-Admin-Token: $ADMIN_API_TOKEN" localhost:3000/admin/email/verify`.
+Microsoft Graph testing: set `EMAIL_PROVIDER=graph` plus `GRAPH_TENANT_ID`,
+`GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` and `PRIVACY_MAILBOX` (see "Email
+delivery" below). All six email keys are environment-only — there is no
+Gmail, SMTP or Resend adapter, and no in-app way to set any of them. Admin
+panel → "Test connection" exercises the active provider, or run
+`node server/scripts/verify-email.mjs` from the host.
 
 ## Test suites (all runnable now)
 
@@ -73,9 +74,13 @@ panel → "Test connection" exercises the active provider, or:
 - **Field-level encryption** (AES-256-GCM envelope, HKDF-derived keys, HMAC
   lookup column for email equality) with `CRYPTO_MASTER_KEY` in dev; the `v1:`
   ciphertext prefix reserves room for a KMS-wrapped `v2:` in production.
-- **Email adapters:** `gmail` (app-password SMTP or OAuth2 API), `graph`
-  (client credentials, send-as shared mailbox), `console` (dev/e2e; refused in
-  production). Selection is exactly one env var (§4).
+- **Email adapters:** `graph` (Microsoft Graph, client credentials, send-as a
+  shared mailbox) and `console` (dev/e2e; refused in production unless
+  `ALLOW_CONSOLE_EMAIL=true`). Selection and every Graph credential are
+  environment-only — `EMAIL_PROVIDER`, `EMAIL_FROM_NAME`, `PRIVACY_MAILBOX`,
+  `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` — so a database
+  row can never shadow the file on the server, and the settings API refuses
+  to write one (§4).
 
 ## Statuses & SLA defaults (need Legal sign-off — spec §14)
 
@@ -107,7 +112,9 @@ confirms (§14.3/.4), including business-day calendars and holiday lists.
 - Azure for Graph: app registration + `Mail.Send` **application** permission
   + admin consent + an application access policy restricting the app to the
   privacy shared mailbox. Config: `GRAPH_TENANT_ID/CLIENT_ID/CLIENT_SECRET`,
-  `PRIVACY_MAILBOX`, `EMAIL_PROVIDER=graph`.
+  `PRIVACY_MAILBOX`, `EMAIL_PROVIDER=graph`, all in `/etc/dsr/dsr-api.env` —
+  see "Email delivery" below. Confirm the whole path with
+  `node server/scripts/verify-email.mjs`.
 - `npm audit`: 4 moderate findings, all inside `drizzle-kit`'s dev-time
   esbuild toolchain — never deployed at runtime.
 
@@ -157,9 +164,8 @@ node deploy/smoke.mjs            # 24 production checks (ADMIN_PW required)
 
 ## Configuration is done in the GUI
 
-Sign in as an administrator and open **Settings**. Everything that used to be
-an environment variable is editable there: email provider and Gmail app
-password, Microsoft Graph credentials, portal URLs, Turnstile keys, session
+Sign in as an administrator and open **Settings**. Most of what used to be an
+environment variable is editable there: portal URLs, Turnstile keys, session
 lifetimes and rate limits, branding.
 
 - Values resolve **database → environment → catalog default**, so anything set
@@ -167,8 +173,16 @@ lifetimes and rate limits, branding.
 - Secrets are AES-256-GCM encrypted with the KMS-ready envelope format and are
   **never** returned to the browser — the UI only shows whether one is set.
 - Every change is written to the audit log with secret values redacted.
-- "Test connection" probes the active provider; "Send test" delivers a real
-  message through it.
+- "Test connection" probes the active provider; "Run diagnostics" checks it
+  stage by stage; "Send test" delivers a real message through it.
+
+**Email delivery is the one group that is not editable here.** `EMAIL_PROVIDER`,
+`EMAIL_FROM_NAME`, `PRIVACY_MAILBOX` and the three `GRAPH_*` credentials are
+**environment-only**: the Settings screen shows them read-only with "Set in
+`/etc/dsr/dsr-api.env`", and `PUT /internal/admin/settings` returns `400` for
+any of the six. A database row can never shadow the file on the server, and a
+missing Graph credential stops the service at boot rather than dropping the
+first data-subject email. See "Email delivery" below.
 
 ## HTTPS
 
@@ -194,48 +208,76 @@ Moving to a real domain later: point it at the server, run `enable-tls.sh`,
 then update the two `PORTAL_*_URL` values in Settings.
 
 
-## Email delivery on this host — important
+## Email delivery
 
-The droplet **blocks the standard outbound SMTP ports**. Verified from the
-server:
+Microsoft Graph is the only production email adapter. `console` exists for
+dev/e2e only and refuses to run in production unless
+`ALLOW_CONSOLE_EMAIL=true`. Six keys select and configure it, all
+**environment-only** — read from `/etc/dsr/dsr-api.env` (mode `0640`, owner
+`root:dsr`), ignored as an `app_settings` row, and rejected with `400` if
+anything tries to write one through the settings API:
 
 ```
-BLOCKED  smtp.gmail.com:25 / :465 / :587
-BLOCKED  smtp.sendgrid.net:587, smtp-relay.brevo.com:587
-OPEN     smtp.sendgrid.net:2525, smtp-relay.brevo.com:2525, smtp.mailgun.org:2525
-OPEN     email-smtp.us-east-1.amazonaws.com:2587
-OPEN     443 to every provider API
+EMAIL_PROVIDER=graph                    # graph | console
+EMAIL_FROM_NAME=Privacy Team
+PRIVACY_MAILBOX=privacy@company.com
+
+GRAPH_TENANT_ID=
+GRAPH_CLIENT_ID=
+GRAPH_CLIENT_SECRET=
 ```
 
-This is DigitalOcean's standard anti-spam policy on new accounts, not a portal
-bug. **Gmail app passwords can never work here** — Gmail offers no port other
-than the blocked ones. The submission ports 2525 and 2587 are open, so a relay
-does work.
+When `EMAIL_PROVIDER=graph`, `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`,
+`GRAPH_CLIENT_SECRET` and `PRIVACY_MAILBOX` must all be non-empty or the
+service **refuses to start** — `journalctl -u dsr-api` names every key that
+is missing, rather than the old failure mode of a healthy service silently
+dropping the first verification email a data subject is waiting on.
 
-Run **Settings, Email delivery, Run diagnostics** to see this live: it reports
-DNS, TCP, TLS and authentication separately, so the failing layer is explicit.
+### Azure app registration
 
-Four ways forward, all usable today:
+1. In Microsoft Entra ID, register an application. Under **API permissions**
+   add Microsoft Graph → **Application permissions** → `Mail.Send`, then
+   **grant admin consent** — an application permission does nothing until a
+   tenant admin consents to it.
+2. Under **Certificates & secrets**, create a client secret. You need three
+   values: the **directory (tenant) ID**, the **application (client) ID**,
+   and the secret's **value** (shown once, at creation).
+3. Restrict the app to a single mailbox with an **application access
+   policy**, from Exchange Online PowerShell:
+   ```powershell
+   New-ApplicationAccessPolicy -AppId <client-id> `
+     -PolicyScopeGroupId privacy@company.com -AccessRight RestrictAccess `
+     -Description "DSR portal: Mail.Send restricted to the privacy mailbox"
+   ```
+   Without this policy, `Mail.Send` lets the app send as **any** mailbox in
+   the tenant, not just the one the portal should use.
+4. Write the four `GRAPH_*`/`PRIVACY_MAILBOX` values, `EMAIL_PROVIDER=graph`
+   and `EMAIL_FROM_NAME` into `/etc/dsr/dsr-api.env` on the server, then
+   `systemctl restart dsr-api`.
 
-1. **Gmail over OAuth2 — two clicks, keeps Gmail as the sender.** Sends through
-   the Gmail API over HTTPS, so the SMTP block is irrelevant. In Google Cloud
-   enable the Gmail API, create a **Web application** OAuth client, and paste in
-   the redirect URI the Settings screen shows (copy button next to it):
-   `https://203-0-113-10.sslip.io/internal/admin/settings/email/gmail/callback`.
-   Then in Settings set provider **Gmail**, authentication **OAuth2**, paste the
-   client ID and secret, save, and press **Connect Google account**. The portal
-   completes the exchange, stores the refresh token encrypted and fills in the
-   Gmail address itself.
-2. **A relay on port 2525.** Choose **Custom SMTP** and press a preset —
-   SendGrid, Brevo or Mailgun — which fills host, port and encryption. Only the
-   username and password are left. 587 times out; 2525 does not. Verified from
-   the server: all three complete a TLSv1.3 STARTTLS handshake on 2525.
-3. **Resend.** Verify a sending domain, create an API key, choose provider
-   **Resend**. Pure HTTPS.
-4. **Microsoft Graph.** Also HTTPS-only; works here if you have a tenant.
+### Confirming it works
 
-Asking DigitalOcean to lift the block is still worth doing, but nothing waits
-on it.
+`server/scripts/verify-email.mjs` proves the whole path from the host,
+independent of whether the build or the service is currently healthy:
+
+```bash
+cd /opt/dsr/server
+set -a; . /etc/dsr/dsr-api.env; set +a
+node scripts/verify-email.mjs                          # 4 checks, sends nothing
+node scripts/verify-email.mjs --send you@company.com   # also sends a real message
+```
+
+In order: configuration present, `login.microsoftonline.com` resolves, a
+client-credentials token is issued, and the privacy mailbox is reachable
+through Graph — which is what actually proves `Mail.Send` consent and the
+access policy, not just a syntactically valid app registration. A failure
+names the stage and a remediation hint. The same checks back the Settings
+screen's **Test connection** and **Run diagnostics**.
+
+Graph sends over HTTPS (port 443) only. This host blocks the standard
+outbound SMTP ports (25, 465, 587) as DigitalOcean's default anti-spam
+policy, but that block is irrelevant here — nothing in this portal opens an
+SMTP connection.
 
 ### Behaviour when mail cannot be delivered
 

@@ -378,8 +378,8 @@ page_break(doc)
 h1(doc, "10. Settings")
 callout(doc, "note", "Settings is restricted to **super administrators**.")
 figure(doc, "settings", "Figure 20 — the Settings screen")
-para(doc, "Everything that used to be an environment variable is edited here and takes effect "
-          "immediately, with no restart.")
+para(doc, "Most of what used to be an environment variable is edited here and takes effect "
+          "immediately, with no restart. Email delivery is the exception — see 10.2.")
 
 h2(doc, "10.1 How values resolve")
 numbered(doc, [
@@ -394,81 +394,40 @@ callout(doc, "ok",
         "only shows whether one is set.")
 
 h2(doc, "10.2 Email delivery")
-table(doc, ["Provider", "When to use it"], [
-    ["Gmail, app password", "Gmail sending over SMTP. Needs 2-Step Verification and a 16-character app password. **Not usable on this server**, whose host blocks outbound SMTP."],
-    ["Gmail, OAuth2", "Gmail sending over HTTPS. Works where outbound SMTP is blocked."],
-    ["Microsoft Graph", "Sends from a shared mailbox in Microsoft 365. Over HTTPS."],
-    ["Resend", "An email API over HTTPS. The quickest option where SMTP is blocked."],
-    ["Custom SMTP", "Any other mail server: host, port, encryption, username and password."],
-    ["Console", "Development only. Writes messages to the log instead of sending."],
-], widths=[1.7, 4.7])
+para(doc, "Microsoft Graph is the portal's only production email adapter. The six fields in this "
+          "group are shown **read-only**, each marked \"Set in /etc/dsr/dsr-api.env\": saving "
+          "the screen never changes them, and the API refuses a write even if one is attempted "
+          "directly. They live in a file on the server rather than the database on purpose — an "
+          "email configuration that decides who a verification link appears to come from should "
+          "not be a setting a browser session can change.")
+table(doc, ["Field", "What it is"], [
+    ["Active provider", "`graph` in production. `console` is a development-only setting that writes messages to a log instead of sending."],
+    ["From display name", "The sender name shown on outgoing mail."],
+    ["Privacy mailbox", "The shared mailbox that case responses and verification links are sent from."],
+    ["Azure tenant ID, application ID, client secret", "The Microsoft Graph app registration authorised to send as the privacy mailbox."],
+], widths=[1.9, 4.5])
+callout(doc, "note",
+        "To change any of these, ask whoever administers the server to edit "
+        "/etc/dsr/dsr-api.env and restart the dsr-api service. If a required Graph credential "
+        "is left empty, the service refuses to start at all, rather than starting up healthy "
+        "and silently dropping the first email.")
 
 h2(doc, "10.3 Checking email works")
 figure(doc, "settings-diagnostics", "Figure 21 — connection diagnostics")
-para(doc, "Two tools sit in the right-hand column:")
+para(doc, "Three tools sit in the right-hand column, all working against whichever provider "
+          "the server's environment currently selects:")
 bullets(doc, [
-    "**Test connection** signs in to the provider without sending anything.",
-    "**Run diagnostics** checks each layer in turn — name lookup, the port, encryption, then the login — and names the layer that failed with what to do about it.",
+    "**Test connection** signs in to Microsoft Graph without sending anything.",
+    "**Run diagnostics** checks each layer in turn — name resolution, the HTTPS connection, then authentication — and names the layer that failed with what to do about it.",
     "**Send test** delivers a real message to an address you choose.",
 ])
-callout(doc, "danger",
-        "This server's hosting provider blocks the standard outbound SMTP ports, 25, 465 and 587. "
-        "Diagnostics will show the port check failing for Gmail and for any relay on those ports. "
-        "Use one of the working paths in 10.4 instead.")
-
-h2(doc, "10.4 Sending email from this server")
-para(doc, "Four routes work from this host. Three send over HTTPS and need no SMTP at all; "
-          "the fourth uses a relay on port 2525, which is open here.")
-table(doc, ["Route", "How to set it up"], [
-    ["**Gmail over OAuth2**", "Connect a Google account from the Settings screen. See 10.5."],
-    ["**Resend**", "Set the provider to Resend and paste an API key. Sends over HTTPS."],
-    ["**Microsoft Graph**", "Set the provider to Microsoft Graph, fill in the tenant, client ID and secret, and set the privacy mailbox."],
-    ["**A relay on port 2525**", "Choose Custom SMTP and press a relay preset. See 10.6."],
-], widths=[1.9, 4.5])
 callout(doc, "note",
-        "Port 2525 is the only SMTP port reachable from this server. If a relay is configured on "
-        "587 it will time out; change the port to 2525 and it will connect.")
+        "If the console itself will not load because the service failed to start, the same "
+        "four checks are available from a terminal on the server as "
+        "`node server/scripts/verify-email.mjs` — the first thing to run when diagnosing a "
+        "mail outage.")
 
-h2(doc, "10.5 Connecting a Google account")
-figure(doc, "settings-gmail-oauth", "Figure 22 — the Connect Gmail panel")
-para(doc, "This authorises the portal to send as a Gmail account over HTTPS, which works even "
-          "though SMTP is blocked. It is a one-time setup.")
-numbered(doc, [
-    "In Google Cloud, create a project and enable the **Gmail API**.",
-    "On the OAuth consent screen choose **External** and add the sending address as a test user.",
-    "Create an OAuth client of type **Web application** and paste in the redirect URI shown on the Settings screen. Copy it with the button next to it so it matches exactly.",
-    "Back in Settings, set the provider to **Gmail** and Gmail authentication to **OAuth2**, paste the client ID and secret, and press **Save**.",
-    "Press **Connect Google account**, sign in as the sending address and approve the request.",
-])
-para(doc, "The portal stores a refresh token and fills in the Gmail address for you. Press "
-          "**Send test** afterwards to confirm a real message arrives.")
-callout(doc, "ok",
-        "The refresh token is encrypted like every other secret and is never shown back to the "
-        "browser. To disconnect, clear the refresh token field and save.")
-
-h2(doc, "10.6 Using a mail relay")
-figure(doc, "settings-smtp-presets", "Figure 23 — relay presets for the Custom SMTP provider")
-para(doc, "A relay is a mail service that accepts your messages and delivers them onward. "
-          "Set the provider to **Custom SMTP** and a panel of presets appears on the right. "
-          "Pressing one fills the host, the port and the encryption for you, so only the "
-          "username and password are left to enter.")
-table(doc, ["Relay", "Username to use", "Password to use"], [
-    ["**SendGrid**", "The literal word `apikey`, filled in for you", "The API key"],
-    ["**Brevo**", "The login shown on Brevo's SMTP page, not your account email", "The SMTP key"],
-    ["**Mailgun**", "`postmaster@your-domain`, from the domain's SMTP credentials", "That credential's password"],
-], widths=[1.3, 3.2, 1.9])
-numbered(doc, [
-    "Create an account with one of the three and verify a sending domain.",
-    "Generate an API key or SMTP credential.",
-    "In Settings choose **Custom SMTP**, press the matching preset, and paste the username and password.",
-    "Set the **privacy mailbox** to an address on the verified domain.",
-    "Press **Save**, then **Send test**.",
-])
-callout(doc, "warn",
-        "Messages sent from an unverified domain are rejected by the relay or land in spam. "
-        "Verify the domain first; every relay walks you through the DNS records.")
-
-h2(doc, "10.7 Other settings")
+h2(doc, "10.4 Other settings")
 table(doc, ["Group", "Contains"], [
     ["Portal and URLs", "The public and internal addresses used in emails and magic links."],
     ["Security", "CAPTCHA keys, session idle and absolute lifetimes, and the sign-in and verification rate limits."],
@@ -511,7 +470,7 @@ para(doc, "Switch them to inactive on the **Team** screen. Auto-assignment skips
           "away, and their case history stays intact for the audit trail.")
 
 h2(doc, "11.3 Appearance")
-figure(doc, "dashboard-dark", "Figure 24 — the dashboard in dark appearance")
+figure(doc, "dashboard-dark", "Figure 22 — the dashboard in dark appearance")
 para(doc, "The console supports light and dark appearance, and can follow your operating system. "
           "The choice is per person and remembered on the device.")
 

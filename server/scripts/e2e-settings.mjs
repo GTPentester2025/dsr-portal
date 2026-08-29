@@ -1,5 +1,5 @@
 // Settings API e2e: catalog, round-trip, secret masking, encryption at rest,
-// validation, provider hot-swap and RBAC.
+// validation, the envOnly lock on the email group, and RBAC.
 import pg from 'pg';
 
 const BASE = process.env.BASE ?? 'http://127.0.0.1:3000';
@@ -39,139 +39,104 @@ const admin = await login(ADMIN_EMAIL, ADMIN_PASSWORD);
 const agent = await login(EUR_AGENT_EMAIL, AGENT_PASSWORD);
 
 // 1. catalog
+// Lower bound only: the catalog holds 18 fields today (6 email + 2 portal +
+// 8 security + 2 branding). Pin low enough to survive new settings, high
+// enough to catch a truncated or empty payload.
 let r = await call('GET', '/internal/admin/settings', admin);
 check('catalog returns groups + fields + values',
-  r.status === 200 && r.data.groups.length >= 4 && r.data.fields.length >= 29 && r.data.values.length === r.data.fields.length,
+  r.status === 200 && r.data.groups.length >= 4 && r.data.fields.length >= 15 && r.data.values.length === r.data.fields.length,
   JSON.stringify(r.data).slice(0, 120));
 
-const gmailPw = r.data.fields.find((f) => f.key === 'GMAIL_APP_PASSWORD');
-check('secret field flagged + AND-conditional',
-  gmailPw?.secret === true &&
-  Array.isArray(gmailPw?.visibleWhen) &&
-  gmailPw.visibleWhen.some((c) => c.key === 'EMAIL_PROVIDER') &&
-  gmailPw.visibleWhen.some((c) => c.key === 'GMAIL_AUTH'));
+const graphSecret = r.data.fields.find((f) => f.key === 'GRAPH_CLIENT_SECRET');
+check('secret field flagged + locked to the environment',
+  graphSecret?.secret === true && graphSecret?.envOnly === true);
 
 // 2. non-admin blocked
 r = await call('GET', '/internal/admin/settings', agent);
 check('zone agent cannot read settings (403)', r.status === 403);
-r = await call('PUT', '/internal/admin/settings', agent, { values: { EMAIL_FROM_NAME: 'hacked' } });
+r = await call('PUT', '/internal/admin/settings', agent, { values: { ORG_NAME: 'hacked' } });
 check('zone agent cannot write settings (403)', r.status === 403);
 
-// 3. write + read back (spaces stripped from app password)
+// 3. write + read back
 r = await call('PUT', '/internal/admin/settings', admin, {
   values: {
-    GMAIL_USER: 'ops@example.com',
-    GMAIL_APP_PASSWORD: 'abcd efgh ijkl mnop',
-    EMAIL_FROM_NAME: 'ABI Privacy',
+    ORG_NAME: 'ABI Privacy',
+    TURNSTILE_SECRET: 'sk_test_turnstile_9f8e7d6c5b4a',
   },
 });
-check('update accepted', r.status === 200 && r.data.updated.length === 3, JSON.stringify(r.data).slice(0, 160));
+check('update accepted', r.status === 200 && r.data.updated.length === 2, JSON.stringify(r.data).slice(0, 160));
 const byKey = Object.fromEntries((r.data.values ?? []).map((v) => [v.key, v]));
-check('plaintext value echoed back', byKey.EMAIL_FROM_NAME?.value === 'ABI Privacy' && byKey.EMAIL_FROM_NAME.source === 'database');
-check('secret never returned in plaintext', byKey.GMAIL_APP_PASSWORD?.value === '' && byKey.GMAIL_APP_PASSWORD?.isSet === true);
+check('plaintext value echoed back', byKey.ORG_NAME?.value === 'ABI Privacy' && byKey.ORG_NAME.source === 'database');
+check('secret never returned in plaintext', byKey.TURNSTILE_SECRET?.value === '' && byKey.TURNSTILE_SECRET?.isSet === true);
 
 // 4. encryption at rest + no plaintext column
 const db = new pg.Client(process.env.DATABASE_URL ?? 'postgres://dsr:dsr@127.0.0.1:5433/dsr');
 await db.connect();
-const row = (await db.query('SELECT * FROM app_settings WHERE key=$1', ['GMAIL_APP_PASSWORD'])).rows[0];
+const row = (await db.query('SELECT * FROM app_settings WHERE key=$1', ['TURNSTILE_SECRET'])).rows[0];
 check('secret stored encrypted', row?.secret === true && row.value === null && String(row.value_enc).startsWith('v1:'));
-check('secret ciphertext hides the value', !String(row.value_enc).includes('abcdefghijklmnop'));
+check('secret ciphertext hides the value', !String(row.value_enc).includes('sk_test_turnstile_9f8e7d6c5b4a'));
 
 // 5. audit records the key but redacts the value
 const audit = (await db.query(`SELECT after FROM audit_log WHERE action='settings.updated' ORDER BY id DESC LIMIT 1`)).rows[0];
 check('audit redacts secret values',
-  JSON.stringify(audit.after).includes('[redacted]') && !JSON.stringify(audit.after).includes('abcdefghijklmnop'),
+  JSON.stringify(audit.after).includes('[redacted]') && !JSON.stringify(audit.after).includes('sk_test_turnstile_9f8e7d6c5b4a'),
   JSON.stringify(audit.after));
 
 // 6. validation
 r = await call('PUT', '/internal/admin/settings', admin, { values: { SESSION_IDLE_MINUTES: '2' } });
 check('number below min rejected', r.status === 400, JSON.stringify(r.data));
-r = await call('PUT', '/internal/admin/settings', admin, { values: { PRIVACY_MAILBOX: 'not-an-email' } });
+r = await call('PUT', '/internal/admin/settings', admin, { values: { SUPPORT_EMAIL: 'not-an-email' } });
 check('bad email rejected', r.status === 400);
 r = await call('PUT', '/internal/admin/settings', admin, { values: { PUBLIC_BASE_URL: 'ftp://x' } });
 check('bad url rejected', r.status === 400);
-r = await call('PUT', '/internal/admin/settings', admin, { values: { EMAIL_PROVIDER: 'sendgrid' } });
+r = await call('PUT', '/internal/admin/settings', admin, { values: { DAILY_REPORT_ENABLED: 'sometimes' } });
 check('unknown select option rejected', r.status === 400);
 r = await call('PUT', '/internal/admin/settings', admin, { values: { NOT_A_SETTING: 'x' } });
 check('unknown key rejected', r.status === 400);
 
-// 7. provider hot-swap without restart
-r = await call('POST', '/internal/admin/settings/email/verify', admin);
-const before = r.data.provider;
-await call('PUT', '/internal/admin/settings', admin, { values: { EMAIL_PROVIDER: 'gmail' } });
-r = await call('POST', '/internal/admin/settings/email/verify', admin);
-check('provider switches at runtime', String(r.data.provider).startsWith('gmail'), `${before} -> ${r.data.provider}`);
-check('verify reports credential problems instead of throwing', r.data.ok === false && typeof r.data.detail === 'string');
+// 7. email settings are environment-only: the database can no longer shadow
+// the file on disk, and the API must refuse a write rather than accept and
+// ignore it.
+r = await call('PUT', '/internal/admin/settings', admin, { values: { PRIVACY_MAILBOX: 'attacker@example.com' } });
+check('envOnly key refused, not silently ignored', r.status === 400, JSON.stringify(r.data));
+r = await call('PUT', '/internal/admin/settings', admin, { values: { EMAIL_PROVIDER: 'graph' } });
+check('EMAIL_PROVIDER cannot be changed through the API even with a valid value', r.status === 400, JSON.stringify(r.data));
 
-// 8. back to console + real test send
-await call('PUT', '/internal/admin/settings', admin, { values: { EMAIL_PROVIDER: 'console' } });
+// 8. the active provider (whatever the environment selects) answers verify
+// and test-send without needing a database write to select it.
+r = await call('POST', '/internal/admin/settings/email/verify', admin);
+check('verify reports for the environment-selected provider', typeof r.data.provider === 'string' && r.data.provider.length > 0, JSON.stringify(r.data));
 r = await call('POST', '/internal/admin/settings/email/test-send', admin, { to: 'ops@example.com' });
-check('test send succeeds on console provider', r.data.ok === true, JSON.stringify(r.data));
+check('test send answers ok:boolean for the active provider', typeof r.data.ok === 'boolean', JSON.stringify(r.data));
 r = await call('POST', '/internal/admin/settings/email/test-send', admin, { to: 'nope' });
 check('test send rejects bad recipient', r.status === 400);
 
 // 9. clearing a value falls back to env/default
-await call('PUT', '/internal/admin/settings', admin, { values: { EMAIL_FROM_NAME: '' } });
+await call('PUT', '/internal/admin/settings', admin, { values: { ORG_NAME: '' } });
 r = await call('GET', '/internal/admin/settings', admin);
-const fromName = r.data.values.find((v) => v.key === 'EMAIL_FROM_NAME');
-check('cleared value falls back to default', fromName.value === 'Privacy Team' && fromName.source === 'default', JSON.stringify(fromName));
+const orgName = r.data.values.find((v) => v.key === 'ORG_NAME');
+check('cleared value falls back to default', orgName.value === 'ABInBev' && orgName.source === 'default', JSON.stringify(orgName));
 
 // 10. session lifetime setting actually reaches auth
 await call('PUT', '/internal/admin/settings', admin, { values: { SESSION_IDLE_MINUTES: '45' } });
 r = await call('GET', '/internal/auth/me', admin);
 check('session still valid after changing lifetimes', r.status === 200);
 
-
-// 11. SMTP settings + staged diagnostics
-r = await call('PUT', '/internal/admin/settings', admin, {
-  values: { EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp.example.invalid', SMTP_PORT: '587', SMTP_USER: 'a@b.com', SMTP_PASSWORD: 'secret' },
-});
-check('custom SMTP settings accepted', r.status === 200 && r.data.updated.length === 5, JSON.stringify(r.data).slice(0, 140));
-
+// 11. staged diagnostics for whichever provider the environment selected.
+// Provider choice is envOnly now, so this suite cannot force a provider to
+// exercise both branches — it only confirms the shape of whichever answer
+// comes back from the currently configured one.
 r = await call('POST', '/internal/admin/settings/email/diagnose', admin);
-check('diagnostics run for SMTP provider', r.data.applicable === true && Array.isArray(r.data.steps) && r.data.steps.length > 0);
-check('diagnostics report the failing stage', r.data.ok === false && r.data.steps[0].step === 'DNS lookup' && r.data.steps[0].ok === false,
-  JSON.stringify(r.data.steps));
-check('failing stage carries a remediation hint', typeof r.data.steps[0].hint === 'string');
-
-r = await call('PUT', '/internal/admin/settings', admin, { values: { SMTP_PORT: '99999' } });
-check('out-of-range SMTP port rejected', r.status === 400);
-
-// HTTPS-based providers get reachability diagnostics too
-await call('PUT', '/internal/admin/settings', admin, { values: { EMAIL_PROVIDER: 'resend' } });
-r = await call('POST', '/internal/admin/settings/email/diagnose', admin);
-check('diagnostics cover HTTPS providers',
-  r.data.applicable === true && r.data.steps.some((s) => s.step.includes('443')),
-  JSON.stringify(r.data.steps));
-
-// console provider has no connection to test
-await call('PUT', '/internal/admin/settings', admin, { values: { EMAIL_PROVIDER: 'console' } });
-r = await call('POST', '/internal/admin/settings/email/diagnose', admin);
-check('diagnostics skip providers with no transport', r.data.applicable === false && typeof r.data.reason === 'string');
-
-// 12. a blocked provider must not stall the public endpoint
-await call('PUT', '/internal/admin/settings', admin, {
-  values: { EMAIL_PROVIDER: 'smtp', SMTP_HOST: '10.255.255.1', SMTP_PORT: '587' },
-});
-const draftRes = await fetch(`${BASE}/public/drafts`, {
-  method: 'POST', headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ formKey: 'eur-1' }),
-});
-const cookieJar = draftRes.headers.get('set-cookie')?.split(';')[0] ?? '';
-const { draftId } = await draftRes.json();
-const t0 = Date.now();
-const vr = await fetch(`${BASE}/public/verification/send`, {
-  method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieJar },
-  body: JSON.stringify({ draftId, email: 'blocked@example.com' }),
-});
-const elapsed = Date.now() - t0;
-check('verification endpoint answers fast even when the mail host is unreachable',
-  vr.status === 201 && elapsed < 3000, `${vr.status} in ${elapsed}ms`);
-
-await call('PUT', '/internal/admin/settings', admin, { values: { EMAIL_PROVIDER: 'console' } });
+if (r.data.applicable) {
+  check('diagnostics run in stages for an HTTPS provider',
+    Array.isArray(r.data.steps) && r.data.steps.length > 0 && typeof r.data.ok === 'boolean',
+    JSON.stringify(r.data.steps));
+} else {
+  check('diagnostics explain why there is nothing to test', typeof r.data.reason === 'string', JSON.stringify(r.data));
+}
 
 // cleanup so repeat runs start clean
-await db.query(`DELETE FROM app_settings WHERE key <> 'EMAIL_PROVIDER'`);
+await db.query('DELETE FROM app_settings');
 await db.end();
 
 process.exit(failures ? 1 : 0);

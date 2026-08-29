@@ -94,7 +94,6 @@ CRYPTO_MASTER_KEY=${CRYPTO_MASTER_KEY}
 # TLS is in place, so session cookies carry the Secure flag. Only set this to
 # false for a deliberately plain-HTTP environment.
 COOKIE_SECURE=${COOKIE_SECURE:-true}
-ADMIN_API_TOKEN=${ADMIN_API_TOKEN}
 ENV
 $SSH "chmod 600 /opt/dsr/server/.env"
 

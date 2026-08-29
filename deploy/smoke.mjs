@@ -77,7 +77,10 @@ r = await get('/internal/auth/me')
 check('session resolves with an administrative role', r.status === 200 && ['admin', 'super_admin'].includes(r.data.role), r.data?.role)
 
 r = await get('/internal/admin/settings')
-check('settings catalog loads', r.status === 200 && r.data.fields.length >= 29, `${r.data?.fields?.length} fields`)
+// Lower bound only: the catalog holds 18 fields today (6 email + 2 portal +
+// 8 security + 2 branding). Pin low enough to survive new settings, high
+// enough to catch a truncated or empty payload.
+check('settings catalog loads', r.status === 200 && r.data.fields.length >= 15, `${r.data?.fields?.length} fields`)
 const baseUrl = r.data.values.find((v) => v.key === 'PUBLIC_BASE_URL')
 // Verification links are built from this. A loopback value mails out dead links.
 check('public base URL is externally reachable',
@@ -86,7 +89,10 @@ check('public base URL is externally reachable',
   baseUrl?.value ?? 'unset')
 
 const provider = r.data.values.find((v) => v.key === 'EMAIL_PROVIDER')
-check('email provider configured from database', provider.value === 'gmail' && provider.source === 'database')
+// EMAIL_PROVIDER is envOnly: a database row must never win. Proving source
+// is 'environment' here is what confirms the lock holds on the real server.
+check('email provider is Microsoft Graph, owned by the environment',
+  provider.value === 'graph' && provider.source === 'environment', JSON.stringify(provider))
 const secrets = r.data.values.filter((v) => v.secret)
 check('no secret leaves the server', secrets.every((v) => v.value === ''), JSON.stringify(secrets.filter((v) => v.value !== '')))
 
