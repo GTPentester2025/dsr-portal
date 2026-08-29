@@ -195,6 +195,8 @@ export interface SettingDef {
   min?: number
   max?: number
   default?: string
+  /** Resolved from the server's environment file; not editable here. */
+  envOnly?: boolean
 }
 
 export interface SettingGroup {

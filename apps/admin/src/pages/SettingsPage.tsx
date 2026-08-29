@@ -23,53 +23,6 @@ import {
 import { Icon } from '../components/Icon'
 import { useToast } from '../components/Toast'
 
-/**
- * Relay presets for the Custom SMTP provider.
- *
- * All three are reachable on port 2525 from hosts that block 25, 465 and 587,
- * which is the situation on this server. Only the password differs per account,
- * so a preset fills everything else.
- */
-const SMTP_PRESETS: {
-  id: string
-  name: string
-  host: string
-  port: string
-  secure: string
-  user?: string
-  userNote: string
-  keyUrl: string
-}[] = [
-  {
-    id: 'sendgrid',
-    name: 'SendGrid',
-    host: 'smtp.sendgrid.net',
-    port: '2525',
-    secure: 'false',
-    user: 'apikey',
-    userNote: 'Username is the literal word “apikey”. Paste the API key as the password.',
-    keyUrl: 'https://app.sendgrid.com/settings/api_keys',
-  },
-  {
-    id: 'brevo',
-    name: 'Brevo',
-    host: 'smtp-relay.brevo.com',
-    port: '2525',
-    secure: 'false',
-    userNote: 'Username is the login shown on the Brevo SMTP page, not your account email.',
-    keyUrl: 'https://app.brevo.com/settings/keys/smtp',
-  },
-  {
-    id: 'mailgun',
-    name: 'Mailgun',
-    host: 'smtp.mailgun.org',
-    port: '2525',
-    secure: 'false',
-    userNote: 'Username looks like postmaster@your-domain, from the domain’s SMTP credentials.',
-    keyUrl: 'https://app.mailgun.com/mg/sending/domains',
-  },
-]
-
 const SOURCE_LABEL: Record<SettingValue['source'], string> = {
   database: 'Saved here',
   environment: 'From environment',
@@ -90,8 +43,6 @@ export function SettingsPage() {
   const [sending, setSending] = useState(false)
   const [diag, setDiag] = useState<DiagnosticReport | null>(null)
   const [diagnosing, setDiagnosing] = useState(false)
-  const [redirectUri, setRedirectUri] = useState('')
-  const [connecting, setConnecting] = useState(false)
 
   const load = useCallback(() => {
     api
@@ -100,22 +51,6 @@ export function SettingsPage() {
       .catch((e) => setError((e as Error).message))
   }, [])
   useEffect(load, [load])
-
-  useEffect(() => {
-    api
-      .get<{ redirectUri: string }>('/internal/admin/settings/email/gmail/redirect-uri')
-      .then((r) => setRedirectUri(r.redirectUri))
-      .catch(() => setRedirectUri(''))
-  }, [])
-
-  // Google sends the operator back here after consent.
-  useEffect(() => {
-    if (window.location.hash.includes('gmail=connected')) {
-      toast.success('Gmail connected', 'The portal will now send through the Gmail API.')
-      window.location.hash = '#/settings'
-      load()
-    }
-  }, [load, toast])
 
   const values = useMemo(() => {
     const m: Record<string, SettingValue> = {}
@@ -182,18 +117,6 @@ export function SettingsPage() {
       toast.error('Diagnostics failed', (e as Error).message)
     } finally {
       setDiagnosing(false)
-    }
-  }
-
-  const connectGmail = async () => {
-    setConnecting(true)
-    try {
-      const r = await api.post<{ url: string }>('/internal/admin/settings/email/gmail/authorize')
-      // Full navigation rather than a popup, so blockers cannot swallow it.
-      window.location.href = r.url
-    } catch (e) {
-      toast.error('Could not start Gmail authorisation', (e as Error).message)
-      setConnecting(false)
     }
   }
 
@@ -288,7 +211,7 @@ export function SettingsPage() {
                     htmlFor={f.key}
                   >
                     {f.type === 'select' ? (
-                      <Select id={f.key} value={current(f.key)} onChange={(e) => set(e.target.value)}>
+                      <Select id={f.key} value={current(f.key)} onChange={(e) => set(e.target.value)} disabled={f.envOnly}>
                         {f.options?.map((o) => (
                           <option key={o.value} value={o.value}>{o.label}</option>
                         ))}
@@ -300,6 +223,7 @@ export function SettingsPage() {
                         value={draft[f.key] ?? ''}
                         placeholder={f.placeholder}
                         onChange={(e) => set(e.target.value)}
+                        disabled={f.envOnly}
                       />
                     ) : (
                       <TextInput
@@ -311,6 +235,7 @@ export function SettingsPage() {
                         value={current(f.key)}
                         placeholder={f.placeholder}
                         onChange={(e) => set(e.target.value)}
+                        disabled={f.envOnly}
                       />
                     )}
                   </Field>
@@ -323,6 +248,9 @@ export function SettingsPage() {
                       </Chip>
                     )}
                     {f.secret && v?.isSet && !edited && <Chip tone="positive" icon="key">Encrypted</Chip>}
+                    {f.envOnly && (
+                      <span className="text-faint">Set in /etc/dsr/dsr-api.env</span>
+                    )}
                   </div>
                 </div>
               )
@@ -439,177 +367,6 @@ export function SettingsPage() {
                 </div>
               </Card>
 
-              {current('EMAIL_PROVIDER') === 'smtp' && (
-                <Card title="Relay presets" subtitle="Fill the host, port and encryption in one click.">
-                  <div className="grid gap-2">
-                    {SMTP_PRESETS.map((preset) => {
-                      const applied =
-                        current('SMTP_HOST') === preset.host && current('SMTP_PORT') === preset.port
-                      return (
-                        <button
-                          key={preset.id}
-                          type="button"
-                          onClick={() =>
-                            setDraft((d) => ({
-                              ...d,
-                              SMTP_HOST: preset.host,
-                              SMTP_PORT: preset.port,
-                              SMTP_SECURE: preset.secure,
-                              ...(preset.user ? { SMTP_USER: preset.user } : {}),
-                            }))
-                          }
-                          className={`flex items-center justify-between rounded-lg border px-3 py-2 text-left transition ${
-                            applied
-                              ? 'border-brand-ink/40 bg-brand/5'
-                              : 'border-line hover:border-brand-ink/30 hover:bg-surface-2'
-                          }`}
-                        >
-                          <span>
-                            <span className="block text-[12px] font-medium">{preset.name}</span>
-                            <span className="mono block text-[10.5px] text-faint">
-                              {preset.host}:{preset.port}
-                            </span>
-                          </span>
-                          {applied ? (
-                            <Icon name="check" size={13} className="shrink-0 text-brand-ink" />
-                          ) : (
-                            <Icon name="arrowUpRight" size={12} className="shrink-0 text-faint" />
-                          )}
-                        </button>
-                      )
-                    })}
-                  </div>
-
-                  {(() => {
-                    const active = SMTP_PRESETS.find((x) => x.host === current('SMTP_HOST'))
-                    if (!active) return null
-                    return (
-                      <div className="mt-3 border-t border-line pt-3">
-                        <p className="text-[12px] leading-relaxed text-muted">{active.userNote}</p>
-                        <a
-                          href={active.keyUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="mt-2 inline-flex items-center gap-1 text-[12px] font-medium text-brand-ink hover:underline"
-                        >
-                          Get {active.name} credentials
-                          <Icon name="arrowUpRight" size={12} />
-                        </a>
-                      </div>
-                    )
-                  })()}
-
-                  <div className="mt-3">
-                    <Alert tone="info" title="Use port 2525 here">
-                      This server cannot reach ports 25, 465 or 587. Port 2525 is open and every
-                      preset above uses it. Press <strong>Save</strong>, then{' '}
-                      <strong>Send test</strong>.
-                    </Alert>
-                  </div>
-                </Card>
-              )}
-
-              {current('EMAIL_PROVIDER') === 'gmail' && current('GMAIL_AUTH') === 'oauth2' && (
-                <Card title="Connect Gmail" subtitle="Authorise once; the portal stores a refresh token.">
-                  {values.GMAIL_OAUTH_REFRESH_TOKEN?.isSet ? (
-                    <Alert tone="success" title="Connected">
-                      Sending as <strong>{values.GMAIL_USER?.value || 'the authorised account'}</strong>.
-                      Re-connect only if you revoke access in Google.
-                    </Alert>
-                  ) : (
-                    <p className="mb-3 text-[12px] leading-relaxed text-muted">
-                      Save the client ID and secret first, then authorise the Google account you want to send from.
-                    </p>
-                  )}
-                  <Button
-                    variant={values.GMAIL_OAUTH_REFRESH_TOKEN?.isSet ? 'secondary' : 'primary'}
-                    icon="arrowUpRight"
-                    loading={connecting}
-                    disabled={dirty || !values.GMAIL_OAUTH_CLIENT_ID?.isSet}
-                    onClick={connectGmail}
-                    className="mt-3 w-full"
-                  >
-                    {values.GMAIL_OAUTH_REFRESH_TOKEN?.isSet ? 'Re-connect Google account' : 'Connect Google account'}
-                  </Button>
-                  {dirty && (
-                    <p className="mt-2 text-[11px] text-warning">Save your changes first.</p>
-                  )}
-
-                  <div className="mt-4 border-t border-line pt-3">
-                    <p className="mb-1.5 text-[11px] font-medium text-muted">
-                      Authorised redirect URI — paste this into the Google OAuth client
-                    </p>
-                    <div className="flex items-center gap-1.5">
-                      <code className="mono min-w-0 flex-1 truncate rounded-md bg-sunken px-2 py-1.5 text-[10px] text-ink" title={redirectUri}>
-                        {redirectUri || 'Set the internal portal URL first'}
-                      </code>
-                      {redirectUri && (
-                        <Button
-                          variant="ghost"
-                          icon="file"
-                          aria-label="Copy redirect URI"
-                          onClick={() => {
-                            void navigator.clipboard.writeText(redirectUri)
-                            toast.success('Copied')
-                          }}
-                        />
-                      )}
-                    </div>
-                  </div>
-
-                  <ol className="mt-3 space-y-1.5 text-[11px] leading-relaxed text-muted">
-                    <li><span className="mono text-faint">1.</span> In Google Cloud, create a project and enable the <strong>Gmail API</strong>.</li>
-                    <li><span className="mono text-faint">2.</span> On the OAuth consent screen choose <strong>External</strong> and add your address as a test user.</li>
-                    <li><span className="mono text-faint">3.</span> Create an OAuth client of type <strong>Web application</strong> and paste the redirect URI above.</li>
-                    <li><span className="mono text-faint">4.</span> Copy the client ID and secret into the fields on the left, save, then press Connect.</li>
-                  </ol>
-                  <a
-                    href="https://console.cloud.google.com/apis/credentials"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="mt-3 inline-flex items-center gap-1 text-[12px] font-medium text-brand-ink hover:underline"
-                  >
-                    Open Google Cloud credentials
-                    <Icon name="arrowUpRight" size={12} />
-                  </a>
-                </Card>
-              )}
-
-              {current('EMAIL_PROVIDER') === 'gmail' && current('GMAIL_AUTH') === 'app-password' && (
-                <Alert tone="warning" title="This host blocks Gmail SMTP">
-                  Outbound ports 25, 465 and 587 are blocked here, and Gmail offers no alternative
-                  port. Switch <strong>Gmail authentication</strong> to <strong>OAuth2</strong>, which
-                  sends over HTTPS, or use a relay on port 2525 with the Custom SMTP provider.
-                </Alert>
-              )}
-
-              {current('EMAIL_PROVIDER') === 'gmail' && current('GMAIL_AUTH') === 'app-password' && (
-              <Card title="Gmail app password">
-                <ol className="space-y-2 text-[12px] leading-relaxed text-muted">
-                  <li className="flex gap-2">
-                    <span className="mono shrink-0 text-faint">1.</span>
-                    Turn on 2-Step Verification for the Google account.
-                  </li>
-                  <li className="flex gap-2">
-                    <span className="mono shrink-0 text-faint">2.</span>
-                    Go to Google Account, Security, App passwords.
-                  </li>
-                  <li className="flex gap-2">
-                    <span className="mono shrink-0 text-faint">3.</span>
-                    Create one for “Mail”, then paste the 16 characters above.
-                  </li>
-                </ol>
-                <a
-                  href="https://myaccount.google.com/apppasswords"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-3 inline-flex items-center gap-1 text-[12px] font-medium text-brand-ink hover:underline"
-                >
-                  Open Google app passwords
-                  <Icon name="arrowUpRight" size={12} />
-                </a>
-              </Card>
-              )}
             </>
           )}
 
