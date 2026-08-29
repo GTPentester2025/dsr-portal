@@ -77,39 +77,47 @@ try {
 
 // 4 — mailbox. A valid token proves the app registration; it says nothing
 // about Mail.Send consent or the application access policy. This does.
-const who = await fetch(
-  `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}`,
-  { headers: { authorization: `Bearer ${token}` } },
-);
-if (!who.ok) {
-  fail(
-    `mailbox lookup failed: ${who.status} ${await who.text()}`,
-    'Grant Mail.Send application permission with admin consent, and scope the application access policy to this mailbox.',
+try {
+  const who = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}`,
+    { headers: { authorization: `Bearer ${token}` } },
   );
+  if (!who.ok) {
+    fail(
+      `mailbox lookup failed: ${who.status} ${await who.text()}`,
+      'Grant Mail.Send application permission with admin consent, and scope the application access policy to this mailbox.',
+    );
+  }
+  pass(`mailbox reachable: ${(await who.json()).displayName || mailbox}`);
+} catch (e) {
+  fail(`mailbox lookup failed: ${e.message}`, 'Outbound HTTPS to graph.microsoft.com may be blocked.');
 }
-pass(`mailbox reachable: ${(await who.json()).displayName || mailbox}`);
 
 // 5 — optional real send
 if (sendTo) {
-  const sent = await fetch(
-    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}/sendMail`,
-    {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        message: {
-          subject: 'DSR portal mail path check',
-          body: { contentType: 'Text', content: `Sent by verify-email.mjs from ${mailbox}.` },
-          toRecipients: [{ emailAddress: { address: sendTo } }],
-        },
-        saveToSentItems: true,
-      }),
-    },
-  );
-  if (sent.status !== 202) {
-    fail(`sendMail rejected: ${sent.status} ${await sent.text()}`, 'Mail.Send consent is the usual cause.');
+  try {
+    const sent = await fetch(
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}/sendMail`,
+      {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          message: {
+            subject: 'DSR portal mail path check',
+            body: { contentType: 'Text', content: `Sent by verify-email.mjs from ${mailbox}.` },
+            toRecipients: [{ emailAddress: { address: sendTo } }],
+          },
+          saveToSentItems: true,
+        }),
+      },
+    );
+    if (sent.status !== 202) {
+      fail(`sendMail rejected: ${sent.status} ${await sent.text()}`, 'Mail.Send consent is the usual cause.');
+    }
+    pass(`test message accepted for ${sendTo}`);
+  } catch (e) {
+    fail(`sendMail failed: ${e.message}`, 'Outbound HTTPS to graph.microsoft.com may be blocked.');
   }
-  pass(`test message accepted for ${sendTo}`);
 }
 
 console.log('\nGraph mail path is working.');
