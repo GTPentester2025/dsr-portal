@@ -13,9 +13,9 @@ const DRAFT_TTL_HOURS = 24;
 /** Uniform response floor (spec §3: no timing side channel). */
 const MIN_RESPONSE_MS = 400;
 /**
- * Hard ceiling on the whole attempt. A blocked SMTP port would otherwise keep
- * the socket open until the reverse proxy returns a gateway timeout, which
- * looks to the requester like the button does nothing.
+ * Hard ceiling on the whole attempt. A blocked or black-holed outbound 443
+ * would otherwise keep the socket open until the reverse proxy returns a
+ * gateway timeout, which looks to the requester like the button does nothing.
  */
 const MAX_SEND_MS = 12_000;
 
@@ -164,7 +164,8 @@ export class VerificationService {
       .catch((err: Error) =>
         this.log.error(
           `verification email could not be delivered: ${err.message}. ` +
-            'Check Settings, Email delivery, and run the SMTP check.',
+            'Diagnose it on the server with: cd /opt/dsr/server && set -a && ' +
+            '. ./.env && set +a && node scripts/verify-email.mjs',
         ),
       );
   }

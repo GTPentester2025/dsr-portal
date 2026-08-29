@@ -16,8 +16,10 @@ import { SystemTemplateController } from './system-template.controller';
 import { AuthModule } from '../auth/auth.module';
 
 /**
- * Resolves the active adapter per call from runtime settings, so an operator
- * can switch providers from the Settings screen without a restart. Provider
+ * Resolves the active adapter per call from EMAIL_PROVIDER, which is an
+ * `envOnly` setting: it comes from /opt/dsr/server/.env or the catalog
+ * default, never from an app_settings row, so the Settings screen cannot
+ * change it and a restart is what makes a new value take effect. Provider
  * specific logic still lives only inside the adapters (spec section 4).
  */
 @Injectable()

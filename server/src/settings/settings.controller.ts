@@ -62,8 +62,9 @@ export class SettingsController {
   }
 
   /**
-   * Stage-by-stage SMTP check (DNS, TCP, TLS, authentication) so a failure
-   * points at the layer responsible instead of one opaque timeout.
+   * Stage-by-stage check of the Graph path — DNS, a TCP connect on 443, then
+   * an authenticated call — so a failure points at the layer responsible
+   * instead of one opaque timeout.
    */
   @Post('email/diagnose')
   async diagnose() {
@@ -71,7 +72,9 @@ export class SettingsController {
     if (!steps) {
       return {
         applicable: false,
-        reason: 'The active provider sends over HTTPS, so there is no SMTP connection to test.',
+        reason:
+          'The console adapter is selected. It writes messages to the server log ' +
+          'instead of sending them, so there is no connection to diagnose.',
         steps: [],
       };
     }

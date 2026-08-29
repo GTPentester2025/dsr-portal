@@ -99,8 +99,9 @@ const auth = { cookie: adminCookie }
   s.status === 200 ? pass('admin can read settings') : fail('low', 'settings unreadable by admin', String(s.status))
 
   // Secrets must never come back. Judge by the field's own secret flag rather
-  // than by keyword: GMAIL_AUTH legitimately has the value "app-password",
-  // which a keyword match reads as a leak.
+  // than by keyword: TURNSTILE_SITE_KEY is named and shaped exactly like a
+  // credential and is deliberately public — the browser cannot render the
+  // CAPTCHA without it — so a keyword match reads a correct response as a leak.
   const values = Array.isArray(s.body?.values) ? s.body.values : []
   const exposed = values.filter((v) => v.secret === true && typeof v.value === 'string' && v.value !== '')
   if (exposed.length === 0) pass(`no secret values returned (${values.filter((v) => v.secret).length} secret fields checked)`)

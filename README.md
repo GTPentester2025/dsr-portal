@@ -293,8 +293,9 @@ dropping the first verification email a data subject is waiting on.
 ### Confirming it works
 
 `server/scripts/verify-email.mjs` proves the whole path from the host,
-independent of whether the build or the service is currently healthy. The
-file is `chmod 600` and owned by `dsr`, so read it as that user or with sudo:
+independent of whether the build or the service is currently healthy. It needs
+the credentials, which means sourcing `/opt/dsr/server/.env` — and *that* file
+is `chmod 600` and owned by `dsr`, so run the command as that user or as root:
 
 ```bash
 cd /opt/dsr/server

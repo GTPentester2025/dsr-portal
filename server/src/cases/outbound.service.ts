@@ -277,7 +277,10 @@ export class OutboundService {
       return row;
     });
 
-    const fromMailbox = this.config.get<string>('PRIVACY_MAILBOX', 'privacy@example.com');
+    // No fallback: boot validation guarantees PRIVACY_MAILBOX is set, and an
+    // invented example.com sender on the path that emails data subjects would
+    // bounce rather than fail visibly.
+    const fromMailbox = this.config.get<string>('PRIVACY_MAILBOX');
     let status: 'sent' | 'failed' = 'sent';
     let providerMessageId: string | null = null;
     let error: string | null = null;
