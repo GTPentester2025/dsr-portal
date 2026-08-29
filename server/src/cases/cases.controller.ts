@@ -80,10 +80,16 @@ export class CasesController {
       { header: 'Form', value: (r) => r.formKey },
     ];
 
-    // Both headers before the first byte of the body: after that the status
+    // Every header before the first byte of the body: after that the status
     // line has gone out and nothing about it can be revised.
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${csvFilename('cases')}"`);
+    // nginx buffers proxied responses by default, which would swallow the
+    // backpressure this streams on -- it reads as fast as we write and the
+    // export accumulates in the proxy instead of the process. Set here rather
+    // than in the site config so the two cannot drift apart; nginx strips the
+    // header before the client sees it.
+    res.setHeader('X-Accel-Buffering', 'no');
 
     const outcome = await streamCsv(
       res,
@@ -105,13 +111,17 @@ export class CasesController {
 
     if (outcome.error) {
       // The response carries a 200 from before the failure and streamCsv has
-      // already marked and aborted the file. The rows that did leave still
-      // happened, so they are still recorded; the server log is the only place
+      // already marked and aborted the file. The server log is the only place
       // the reason survives.
       this.log.error(
         `cases export failed after ${outcome.rows} rows`,
         outcome.error instanceof Error ? outcome.error.stack : String(outcome.error),
       );
+    }
+    // The rows that did leave still left, so they are still recorded -- unless
+    // the hook above already recorded them and the response failed afterwards,
+    // in which case a second entry would only contradict the first.
+    if (outcome.error && !outcome.recorded) {
       await this.audit
         .record({
           actorId: req.user.id,

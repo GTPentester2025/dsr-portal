@@ -28,7 +28,16 @@ export interface CsvStreamOutcome {
   rows: number;
   /** What stopped the export, or null when the file was written in full. */
   error: unknown;
+  /**
+   * Whether `onComplete` ran without throwing. A caller that records the
+   * export in that hook needs to know: if the hook succeeded and the response
+   * failed afterwards, the record already exists and writing a second,
+   * contradicting one would be worse than writing none.
+   */
+  recorded: boolean;
 }
+
+const closedMidExport = () => new Error('The client closed the connection mid-export');
 
 /**
  * Write `chunk`, waiting out backpressure.
@@ -37,6 +46,12 @@ export interface CsvStreamOutcome {
  * costing database batches.
  */
 export function writeChunk(out: Writable, chunk: string): Promise<void> {
+  // Checked before writing, not only after. A real http.ServerResponse emits
+  // 'close' and nothing else when the client aborts, and it emits it once --
+  // before this call. Writing to it then returns false and no 'drain',
+  // 'error' or 'close' ever follows, so a promise waiting on those three would
+  // never settle and the handler would never return.
+  if (out.destroyed || out.writableEnded) return Promise.reject(closedMidExport());
   if (out.write(chunk)) return Promise.resolve();
   return new Promise<void>((resolve, reject) => {
     const settle = (err?: Error) => {
@@ -48,10 +63,13 @@ export function writeChunk(out: Writable, chunk: string): Promise<void> {
     };
     const onDrain = () => settle();
     const onError = (err: Error) => settle(err);
-    const onClose = () => settle(new Error('The client closed the connection mid-export'));
+    const onClose = () => settle(closedMidExport());
     out.on('drain', onDrain);
     out.on('error', onError);
     out.on('close', onClose);
+    // The abort can land between the write above and these listeners, in which
+    // case its 'close' has already been and gone.
+    if (out.destroyed) settle(closedMidExport());
   });
 }
 
@@ -62,6 +80,9 @@ export function writeChunk(out: Writable, chunk: string): Promise<void> {
  *
  * - A final marker line, for a client that keeps what it received: `curl -o`
  *   leaves the partial file on disk, and a human opening it sees the marker.
+ *   It opens with a CRLF of its own: the failure may have interrupted a write
+ *   mid-flush, and a blank line in a file already declared unusable costs
+ *   nothing next to the marker being glued onto half a row.
  * - Destroying the connection without the terminating zero-length chunk, so
  *   the HTTP client reports a failed transfer rather than a complete 200.
  *   Browsers discard the download on that; curl exits non-zero.
@@ -79,7 +100,7 @@ function abortPartialExport(out: Writable): void {
   // account either.
   const giveUp = setTimeout(() => out.destroy(), 5_000);
   giveUp.unref();
-  out.write(`${INCOMPLETE_EXPORT_MARKER}\r\n`, () => {
+  out.write(`\r\n${INCOMPLETE_EXPORT_MARKER}\r\n`, () => {
     clearTimeout(giveUp);
     out.destroy();
   });
@@ -104,19 +125,28 @@ export async function streamCsv<T>(
   onComplete?: (rows: number) => Promise<void>,
 ): Promise<CsvStreamOutcome> {
   let rows = 0;
-  // A response whose socket dies emits 'error', and an 'error' nobody is
-  // listening for takes the process down. writeChunk only listens while it is
-  // waiting on drain, so hold one for the whole stream: the export is over
-  // either way, but it should end as a failed download rather than a crash.
+  let recorded = false;
+  // Two listeners, held for the whole stream, because writeChunk only listens
+  // while it is waiting on drain and the interesting failures land between
+  // batches, while a database query is in flight.
+  //
+  // 'close' is the one that matters: an aborted http.ServerResponse emits it
+  // and never emits 'error' at all. 'error' is watched anyway because an
+  // 'error' with nobody listening is an uncaught exception -- a crashed
+  // process rather than a failed download.
   let socketError: Error | null = null;
   const noteError = (err: Error) => {
     socketError ??= err;
+  };
+  const noteClose = () => {
+    socketError ??= closedMidExport();
   };
   const stopIfTheSocketDied = () => {
     const err = socketError;
     if (err) throw err;
   };
   out.on('error', noteError);
+  out.on('close', noteClose);
   try {
     await writeChunk(out, CSV_BOM + csvHeader(columns) + '\r\n');
     for await (const batch of batches) {
@@ -126,13 +156,20 @@ export async function streamCsv<T>(
       rows += batch.length;
     }
     stopIfTheSocketDied();
-    if (onComplete) await onComplete(rows);
+    if (onComplete) {
+      await onComplete(rows);
+      recorded = true;
+    }
+    // The client can have gone while the hook was running. Ending here would
+    // report a complete file that nobody received.
+    stopIfTheSocketDied();
     out.end();
-    return { rows, error: null };
+    return { rows, error: null, recorded };
   } catch (error) {
     abortPartialExport(out);
-    return { rows, error };
+    return { rows, error, recorded };
   } finally {
     out.off('error', noteError);
+    out.off('close', noteClose);
   }
 }

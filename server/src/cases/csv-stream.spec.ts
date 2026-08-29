@@ -38,7 +38,17 @@ describe('writeChunk', () => {
     expect(done).toBe(true);
   });
 
-  it('rejects when the client goes away', async () => {
+  it('rejects a write to a response the client has already closed', async () => {
+    // The ordering a real http.ServerResponse produces: it emits 'close' once,
+    // when the client aborts, and never emits anything again. A write after
+    // that returns false and is followed by no 'drain', no 'error' and no
+    // 'close', so anything waiting on those three waits for ever.
+    const sink = new PassThrough({ highWaterMark: 8 });
+    sink.destroy();
+    await expect(writeChunk(sink, 'x'.repeat(256))).rejects.toThrow(/closed the connection/);
+  });
+
+  it('rejects when the client goes away mid-write', async () => {
     const sink = new PassThrough({ highWaterMark: 8 });
     const pending = writeChunk(sink, 'x'.repeat(256));
     await tick();
@@ -56,7 +66,7 @@ describe('streamCsv', () => {
       yield ROWS.slice(2);
     }
     const outcome = await streamCsv(sink, COLUMNS, batches());
-    expect(outcome).toEqual({ rows: 3, error: null });
+    expect(outcome).toEqual({ rows: 3, error: null, recorded: false });
     expect(seen.text()).toBe(toCsv(ROWS, COLUMNS));
   });
 
@@ -89,6 +99,24 @@ describe('streamCsv', () => {
     expect(sink.writableFinished).toBe(false);
   });
 
+  it('stops when the client closes between batches', async () => {
+    const sink = new PassThrough();
+    sink.resume();
+    async function* batches(): AsyncGenerator<Row[]> {
+      yield ROWS.slice(0, 1);
+      // An operator who clicked Export and navigated away. Nothing emits
+      // 'error' here -- only 'close' -- and the next write would otherwise
+      // hang the handler for the life of the process, holding the response,
+      // the generator and a batch of decrypted requester addresses.
+      sink.destroy();
+      await tick();
+      yield ROWS.slice(1);
+    }
+    const outcome = await streamCsv(sink, COLUMNS, batches());
+    expect((outcome.error as Error).message).toMatch(/closed the connection/);
+    expect(outcome.rows).toBe(1);
+  });
+
   it('stops when the response itself fails between batches', async () => {
     const sink = new PassThrough();
     sink.resume();
@@ -117,6 +145,7 @@ describe('streamCsv', () => {
     await tick();
 
     // An unrecorded export of personal data is not a completed export.
+    expect(outcome.recorded).toBe(false);
     expect((outcome.error as Error).message).toBe('audit write failed');
     expect(seen.text()).toContain(INCOMPLETE_EXPORT_MARKER);
     expect(sink.destroyed).toBe(true);
@@ -130,9 +159,12 @@ describe('streamCsv', () => {
       yield ROWS.slice(2);
     }
     const counted: number[] = [];
-    await streamCsv(sink, COLUMNS, batches(), async (n) => {
+    const outcome = await streamCsv(sink, COLUMNS, batches(), async (n) => {
       counted.push(n);
     });
     expect(counted).toEqual([3]);
+    // The caller uses this to avoid recording a contradicting second entry if
+    // the response fails after the export was already recorded.
+    expect(outcome.recorded).toBe(true);
   });
 });
