@@ -18,12 +18,12 @@ await admin.query(`
 await admin.query(`
   INSERT INTO users (email, name, role, zone_id)
   VALUES ('rls-probe@example.com','RLS Probe','approver','EUR')
-  ON CONFLICT (email) DO NOTHING
+  ON CONFLICT (email) DO UPDATE SET role = 'approver', zone_id = 'EUR'
 `);
 await admin.query(`
   INSERT INTO users (email, name, role, zone_id)
   VALUES ('rls-probe-global@example.com','RLS Probe Global','admin',NULL)
-  ON CONFLICT (email) DO NOTHING
+  ON CONFLICT (email) DO UPDATE SET role = 'admin', zone_id = NULL
 `);
 
 const app = new pg.Client(process.env.DATABASE_URL_APP ?? 'postgres://dsr_app:dsr_app@127.0.0.1:5433/dsr');
@@ -118,7 +118,7 @@ if (process.argv.includes('--roles')) {
     return deleted > 0;
   };
 
-  const CASE_WRITE = `UPDATE cases SET status = 'in_progress' WHERE zone_id = 'EUR'`;
+  const CASE_WRITE = `UPDATE cases SET status = 'open' WHERE zone_id = 'EUR'`;
   const USER_WRITE = `UPDATE users SET capacity_weight = capacity_weight WHERE zone_id = 'EUR'`;
   const SETTING_WRITE = `INSERT INTO app_settings (key, value) VALUES ('rls_probe','x')
                          ON CONFLICT (key) DO UPDATE SET value = 'x'`;
