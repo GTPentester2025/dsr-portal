@@ -9,7 +9,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import { AuthGuard, Roles, type AuthedRequest } from '../auth/auth.guard';
+import { AuthGuard, Requires, type AuthedRequest } from '../auth/auth.guard';
 import { SystemTemplateService } from './system-template.service';
 
 /**
@@ -21,7 +21,7 @@ import { SystemTemplateService } from './system-template.service';
  */
 @Controller('internal/admin/system-templates')
 @UseGuards(AuthGuard)
-@Roles('admin')
+@Requires('system.operate')
 export class SystemTemplateController {
   constructor(private readonly templates: SystemTemplateService) {}
 

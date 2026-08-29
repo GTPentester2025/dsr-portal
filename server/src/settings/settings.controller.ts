@@ -12,7 +12,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { AuthGuard, Roles } from '../auth/auth.guard';
+import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { SettingsService } from './settings.service';
 import { SETTINGS, SETTING_GROUPS } from './settings.catalog';
@@ -24,7 +24,7 @@ import { EmailDispatcher } from '../email/email.module';
  */
 @Controller('internal/admin/settings')
 @UseGuards(AuthGuard)
-@Roles('super_admin')
+@Requires('instance.administer')
 export class SettingsController {
   constructor(
     private readonly settings: SettingsService,

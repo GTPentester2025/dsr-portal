@@ -11,7 +11,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import { AuthGuard, Roles } from '../auth/auth.guard';
+import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { DbService } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
@@ -67,7 +67,7 @@ export class SlaPolicyController {
   }
 
   @Get()
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   async list(@Req() req: AuthedRequest) {
     const rows = await this.db.system(async (_db, client) => {
       const res = await client.query(
@@ -85,7 +85,7 @@ export class SlaPolicyController {
   }
 
   @Put(':zone/:requestType')
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   async upsert(
     @Req() req: AuthedRequest,
     @Param('zone') zone: string,
@@ -175,7 +175,7 @@ export class SlaPolicyController {
   }
 
   @Delete(':zone/:requestType')
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   async remove(
     @Req() req: AuthedRequest,
     @Param('zone') zone: string,

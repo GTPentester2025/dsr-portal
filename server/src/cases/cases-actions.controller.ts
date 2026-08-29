@@ -10,7 +10,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import { AuthGuard, Roles } from '../auth/auth.guard';
+import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { WorkflowService } from './workflow.service';
 import { AssignmentService } from './assignment.service';
@@ -30,7 +30,7 @@ export class CasesActionsController {
   ) {}
 
   @Post('cases/:id/status')
-  @Roles('admin', 'zone_manager', 'approver')
+  @Requires('cases.work')
   changeStatus(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
@@ -54,7 +54,7 @@ export class CasesActionsController {
   }
 
   @Post('cases/:id/assign')
-  @Roles('admin', 'zone_manager', 'approver')
+  @Requires('cases.work')
   assign(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
@@ -72,7 +72,7 @@ export class CasesActionsController {
 
   /** Grant more time on an open case. Approvers can do this; auditors cannot. */
   @Post('cases/:id/sla/extend')
-  @Roles('admin', 'zone_manager', 'approver')
+  @Requires('cases.work')
   extendSla(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
@@ -91,19 +91,19 @@ export class CasesActionsController {
   }
 
   @Post('cases/:id/sla/pause')
-  @Roles('admin', 'zone_manager', 'approver')
+  @Requires('cases.work')
   pause(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
     return this.sla.pause(req.zoneCtx, id, req.user.id);
   }
 
   @Post('cases/:id/sla/resume')
-  @Roles('admin', 'zone_manager', 'approver')
+  @Requires('cases.work')
   resume(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
     return this.sla.resume(req.zoneCtx, id, req.user.id);
   }
 
   @Post('sla/recompute')
-  @Roles('admin')
+  @Requires('system.operate')
   recompute() {
     return this.sla.recomputeAll();
   }
@@ -120,7 +120,7 @@ export class CasesActionsController {
   }
 
   @Post('templates')
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   upsertTemplate(
     @Req() req: AuthedRequest,
     @Body() body: {
@@ -132,7 +132,7 @@ export class CasesActionsController {
   }
 
   @Get('cases/:id/draft-email')
-  @Roles('admin', 'zone_manager', 'approver')
+  @Requires('cases.work')
   renderDraft(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
@@ -142,7 +142,7 @@ export class CasesActionsController {
   }
 
   @Post('cases/:id/send-email')
-  @Roles('admin', 'zone_manager', 'approver')
+  @Requires('cases.work')
   sendEmail(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
@@ -173,7 +173,7 @@ export class CasesActionsController {
    * nobody. Same derivation as an in-portal send, so the two agree.
    */
   @Post('cases/:id/pending')
-  @Roles('admin', 'zone_manager', 'approver')
+  @Requires('cases.work')
   setPending(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,

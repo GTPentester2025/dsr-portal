@@ -1,5 +1,5 @@
 import { BadRequestException, Body, Controller, Get, Ip, Param, ParseUUIDPipe, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
-import { AuthGuard, Roles } from '../auth/auth.guard';
+import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { Response } from 'express';
 import { toCsv, csvFilename } from '../cases/csv';
 import { AuthService } from '../auth/auth.service';
@@ -21,7 +21,7 @@ export class AdminUsersController {
   ) {}
 
   @Get('users')
-  @Roles('admin', 'zone_manager')
+  @Requires('team.manage')
   async listUsers(@Req() req: AuthedRequest, @Query('zone') zone?: string) {
     // Zone managers only see their own zone's team.
     const effectiveZone = req.user.role === 'zone_manager' ? req.user.zoneId : zone;
@@ -40,7 +40,7 @@ export class AdminUsersController {
   }
 
   @Post('users')
-  @Roles('admin', 'zone_manager')
+  @Requires('team.manage')
   async createUser(
     @Req() req: AuthedRequest,
     @Body() body: {
@@ -86,7 +86,7 @@ export class AdminUsersController {
   }
 
   @Patch('users/:id')
-  @Roles('admin', 'zone_manager')
+  @Requires('team.manage')
   async updateUser(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
@@ -146,7 +146,7 @@ export class AdminUsersController {
    * who cannot act on it is disclosure without purpose.
    */
   @Get('assignment-config')
-  @Roles('admin', 'zone_manager')
+  @Requires('team.manage')
   getAssignmentConfig(@Req() req: AuthedRequest) {
     const ownZone = req.user.role === 'zone_manager' ? req.user.zoneId : null;
     return this.db.system(async (_db, client) => {
@@ -170,7 +170,7 @@ export class AdminUsersController {
    * immediate access to another person's account.
    */
   @Post('users/:id/reset-password')
-  @Roles('super_admin')
+  @Requires('instance.administer')
   async resetPassword(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
@@ -180,7 +180,7 @@ export class AdminUsersController {
   }
 
   @Patch('assignment-config/:zone')
-  @Roles('admin', 'zone_manager')
+  @Requires('team.manage')
   async setAssignmentConfig(
     @Req() req: AuthedRequest,
     @Param('zone') zone: string,
@@ -235,7 +235,7 @@ export class AdminUsersController {
 
   /** The team roster as a spreadsheet. */
   @Get('users/export.csv')
-  @Roles('admin', 'zone_manager')
+  @Requires('team.manage')
   async exportUsers(
     @Req() req: AuthedRequest,
     @Res({ passthrough: true }) res: Response,
@@ -271,7 +271,7 @@ export class AdminUsersController {
 
   /** The audit trail as a spreadsheet, for evidencing to a regulator. */
   @Get('audit-log/export.csv')
-  @Roles('admin', 'auditor')
+  @Requires('audit.read')
   async exportAudit(
     @Res({ passthrough: true }) res: Response,
     @Query('entityType') entityType?: string,
@@ -311,7 +311,7 @@ export class AdminUsersController {
   }
 
   @Get('audit-log')
-  @Roles('admin', 'auditor')
+  @Requires('audit.read')
   auditLog(
     @Query('entityType') entityType?: string,
     @Query('entityId') entityId?: string,

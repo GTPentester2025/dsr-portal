@@ -10,38 +10,13 @@ import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
 import { AuthService, SessionUser, zoneContextFor } from './auth.service';
 import type { ZoneContext } from '../db/db.module';
+import { hasPermission, type Permission } from './permissions';
 
 export const INTERNAL_SESSION_COOKIE = 'dsr_int';
-const ROLES_KEY = 'dsr:roles';
+const PERMISSION_KEY = 'dsr:permission';
 
-/**
- * Privilege ladder for the operational roles, so @Roles('admin') also admits a
- * super admin without every decorator listing both.
- *
- * `auditor` is deliberately NOT on the ladder: it is a read-only lane that
- * must never be reachable by inheritance, and must never inherit anything.
- */
-const RANK: Record<string, number> = {
-  approver: 1,
-  zone_manager: 2,
-  admin: 3,
-  super_admin: 4,
-};
-
-export function satisfies(actual: string, required: string[]): boolean {
-  if (required.includes(actual)) return true;
-  if (actual === 'auditor') return false;
-
-  // Only ladder roles contribute to the threshold; a route open to auditors
-  // must not therefore become open to every ladder role.
-  const ladder = required.filter((r) => r in RANK);
-  if (ladder.length === 0) return false;
-  const need = Math.min(...ladder.map((r) => RANK[r]));
-  return (RANK[actual] ?? 0) >= need;
-}
-
-/** Restrict a handler to specific roles, e.g. @Roles('admin'). */
-export const Roles = (...roles: SessionUser['role'][]) => SetMetadata(ROLES_KEY, roles);
+/** Restrict a handler to holders of a permission, e.g. @Requires('team.manage'). */
+export const Requires = (permission: Permission) => SetMetadata(PERMISSION_KEY, permission);
 
 export interface AuthedRequest extends Request {
   user: SessionUser;
@@ -61,11 +36,11 @@ export class AuthGuard implements CanActivate {
     const user = await this.auth.resolveSession(sessionId);
     if (!user) throw new UnauthorizedException();
 
-    const roles = this.reflector.getAllAndOverride<SessionUser['role'][] | undefined>(
-      ROLES_KEY,
+    const required = this.reflector.getAllAndOverride<Permission | undefined>(
+      PERMISSION_KEY,
       [context.getHandler(), context.getClass()],
     );
-    if (roles && roles.length > 0 && !satisfies(user.role, roles)) {
+    if (required && !hasPermission(user.role, required)) {
       throw new ForbiddenException();
     }
 

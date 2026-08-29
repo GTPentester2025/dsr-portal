@@ -1,6 +1,6 @@
 import { Controller, Get, Post, Query, Req, Res, StreamableFile, UseGuards } from '@nestjs/common';
 import type { Response } from 'express';
-import { AuthGuard, Roles } from '../auth/auth.guard';
+import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { ReportService } from './report.service';
 import { ReportPdfService } from './report-pdf.service';
@@ -15,7 +15,7 @@ import { toCsv, csvFilename } from './csv';
  */
 @Controller('internal/reports')
 @UseGuards(AuthGuard)
-@Roles('admin', 'zone_manager')
+@Requires('reports.run')
 export class ReportController {
   constructor(
     private readonly reports: ReportService,
@@ -93,7 +93,7 @@ export class ReportController {
 
   /** Send the digest now rather than waiting for the morning run. */
   @Post('send')
-  @Roles('admin')
+  @Requires('system.operate')
   send() {
     return this.reports.dispatch();
   }

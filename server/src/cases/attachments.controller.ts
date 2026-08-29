@@ -16,7 +16,7 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
-import { AuthGuard, Roles } from '../auth/auth.guard';
+import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { DbService } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
@@ -102,7 +102,7 @@ export class AttachmentsController {
    * or a colleague becomes part of the case record.
    */
   @Post()
-  @Roles('admin', 'zone_manager', 'approver')
+  @Requires('cases.work')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_UPLOAD_BYTES } }))
   async upload(
     @Req() req: AuthedRequest,

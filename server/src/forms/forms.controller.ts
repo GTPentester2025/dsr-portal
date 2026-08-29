@@ -11,7 +11,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import { AuthGuard, Roles } from '../auth/auth.guard';
+import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { FIELD_TYPES, FormsService, LAYOUT_TYPES, type FormSchemaDoc } from './forms.service';
 
@@ -43,13 +43,13 @@ export class FormsController {
   }
 
   @Get('palette')
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   palette() {
     return { palette: PALETTE, fieldTypes: FIELD_TYPES, layoutTypes: LAYOUT_TYPES };
   }
 
   @Get()
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   async list(@Req() req: AuthedRequest) {
     const all = await this.forms.list();
     return req.user.role === 'zone_manager'
@@ -58,7 +58,7 @@ export class FormsController {
   }
 
   @Get(':key')
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   async get(@Req() req: AuthedRequest, @Param('key') key: string) {
     const result = await this.forms.get(key);
     this.assertZone(req, result.schema.zone);
@@ -66,7 +66,7 @@ export class FormsController {
   }
 
   @Get(':key/history')
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   async history(@Req() req: AuthedRequest, @Param('key') key: string) {
     const { schema } = await this.forms.get(key);
     this.assertZone(req, schema.zone);
@@ -74,7 +74,7 @@ export class FormsController {
   }
 
   @Put(':key')
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   async publish(
     @Req() req: AuthedRequest,
     @Param('key') key: string,
@@ -88,7 +88,7 @@ export class FormsController {
   }
 
   @Post(':key/restore/:version')
-  @Roles('admin', 'zone_manager')
+  @Requires('config.manage')
   async restore(
     @Req() req: AuthedRequest,
     @Param('key') key: string,
