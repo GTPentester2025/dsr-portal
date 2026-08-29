@@ -1,5 +1,6 @@
 import { resolveValue } from './settings.service';
 import type { SettingDef } from './settings.catalog';
+import { SETTINGS_BY_KEY } from './settings.catalog';
 
 const plain: SettingDef = { key: 'X', label: 'X', group: 'g', type: 'text', default: 'dflt' };
 const locked: SettingDef = { ...plain, key: 'Y', envOnly: true };
@@ -32,5 +33,28 @@ describe('resolveValue', () => {
 
   it('still resolves when the key is not in the catalog', () => {
     expect(resolveValue({ dbValue: 'db' })).toEqual({ value: 'db', source: 'database' });
+  });
+});
+
+describe('email settings ownership', () => {
+  const EMAIL_KEYS = [
+    'EMAIL_PROVIDER',
+    'EMAIL_FROM_NAME',
+    'PRIVACY_MAILBOX',
+    'GRAPH_TENANT_ID',
+    'GRAPH_CLIENT_ID',
+    'GRAPH_CLIENT_SECRET',
+  ];
+
+  it.each(EMAIL_KEYS)('%s is owned by the environment', (key) => {
+    expect(SETTINGS_BY_KEY[key]?.envOnly).toBe(true);
+  });
+
+  it('has no email key outside that list', () => {
+    const inGroup = Object.values(SETTINGS_BY_KEY)
+      .filter((d) => d.group === 'email')
+      .map((d) => d.key)
+      .sort();
+    expect(inGroup).toEqual([...EMAIL_KEYS].sort());
   });
 });

@@ -171,7 +171,7 @@ export class SystemTemplateService implements OnModuleInit {
       assignee: 'Alex Martin',
       status: 'in_progress',
       waiting: '2 hours',
-      provider: 'gmail',
+      provider: 'graph',
       sent_at: '2026-08-18 09:15 UTC',
     };
     const fill = (s: string) => s.replace(/\{\{(\w+)\}\}/g, (_, n: string) => sample[n] ?? `{{${n}}}`);

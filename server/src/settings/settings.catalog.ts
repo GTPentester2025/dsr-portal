@@ -83,6 +83,7 @@ export const SETTINGS: SettingDef[] = [
     type: 'select',
     default: 'graph',
     help: 'Set in /etc/dsr/dsr-api.env. Changing it needs a service restart.',
+    envOnly: true,
     options: [
       { value: 'graph', label: 'Microsoft Graph (shared mailbox)' },
       { value: 'console', label: 'Console (development only, writes to the log)' },
@@ -95,6 +96,7 @@ export const SETTINGS: SettingDef[] = [
     type: 'text',
     default: 'Privacy Team',
     placeholder: 'Privacy Team',
+    envOnly: true,
   },
   {
     key: 'PRIVACY_MAILBOX',
@@ -103,6 +105,7 @@ export const SETTINGS: SettingDef[] = [
     type: 'email',
     placeholder: 'privacy@company.com',
     help: 'Address that case responses are sent from. Required for Microsoft Graph.',
+    envOnly: true,
   },
 
   // microsoft graph
@@ -112,14 +115,14 @@ export const SETTINGS: SettingDef[] = [
     group: 'email',
     type: 'text',
     placeholder: '00000000-0000-0000-0000-000000000000',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['graph'] }],
+    envOnly: true,
   },
   {
     key: 'GRAPH_CLIENT_ID',
     label: 'Application (client) ID',
     group: 'email',
     type: 'text',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['graph'] }],
+    envOnly: true,
   },
   {
     key: 'GRAPH_CLIENT_SECRET',
@@ -128,7 +131,7 @@ export const SETTINGS: SettingDef[] = [
     type: 'password',
     secret: true,
     help: 'Needs Mail.Send application permission with admin consent, scoped to the privacy mailbox.',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['graph'] }],
+    envOnly: true,
   },
 
   // ---------------------------------------------------------------- portal --

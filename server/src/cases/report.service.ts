@@ -356,10 +356,9 @@ ${
       }
       try {
         await this.email.sendAsUser({
-          fromMailbox: this.settings.get<string>(
-            'PRIVACY_MAILBOX',
-            this.settings.get<string>('GMAIL_USER', 'privacy@example.com'),
-          ),
+          // Boot validation guarantees PRIVACY_MAILBOX is set, so there is no
+          // fallback to invent here — an example.com sender would bounce.
+          fromMailbox: this.settings.get<string>('PRIVACY_MAILBOX'),
           to: [person.email],
           subject: `Privacy request report — ${stats.zone} — ${new Date().toISOString().slice(0, 10)}`,
           body: this.renderHtml(stats),
