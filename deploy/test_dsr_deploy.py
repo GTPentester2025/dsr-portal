@@ -23,7 +23,13 @@ class TestCli(unittest.TestCase):
     def test_remote_is_accepted_but_hidden_from_help(self):
         args = dd.build_parser().parse_args(["doctor", "--remote"])
         self.assertTrue(args.remote)
-        self.assertNotIn("--remote", dd.build_parser().format_help())
+        # format_help() on the top-level parser never lists a subparser's own
+        # arguments, so asserting against it proves nothing -- --remote must
+        # be checked against the "doctor" subcommand's own help text, which
+        # is where argparse.SUPPRESS actually has an effect.
+        subparsers_action = dd.build_parser()._subparsers._group_actions[0]
+        doctor_help = subparsers_action.choices["doctor"].format_help()
+        self.assertNotIn("--remote", doctor_help)
 
     def test_doctor_takes_no_state_and_group_filters(self):
         args = dd.build_parser().parse_args(["doctor", "--no-state", "--disk"])
