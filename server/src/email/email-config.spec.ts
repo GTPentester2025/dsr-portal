@@ -49,6 +49,6 @@ describe('assertEmailConfig', () => {
     expect(() => assertEmailConfig(reader({ EMAIL_PROVIDER: 'graph' }), log)).toThrow();
     const output = log.error.mock.calls.flat().join('\n');
     for (const key of REQUIRED_GRAPH_KEYS) expect(output).toContain(key);
-    expect(output).toContain('/etc/dsr/dsr-api.env');
+    expect(output).toContain('/opt/dsr/server/.env');
   });
 });

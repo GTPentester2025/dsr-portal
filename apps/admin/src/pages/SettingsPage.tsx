@@ -249,7 +249,7 @@ export function SettingsPage() {
                     )}
                     {f.secret && v?.isSet && !edited && <Chip tone="positive" icon="key">Encrypted</Chip>}
                     {f.envOnly && (
-                      <span className="text-faint">Set in /etc/dsr/dsr-api.env</span>
+                      <span className="text-faint">Set in /opt/dsr/server/.env</span>
                     )}
                   </div>
                 </div>

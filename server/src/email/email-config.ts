@@ -17,7 +17,7 @@ export const REQUIRED_GRAPH_KEYS = [
   'PRIVACY_MAILBOX',
 ] as const;
 
-export const ENV_FILE = '/etc/dsr/dsr-api.env';
+export const ENV_FILE = '/opt/dsr/server/.env';
 
 export function missingEmailKeys(read: (key: string) => string | undefined): string[] {
   const provider = read('EMAIL_PROVIDER') || 'graph';

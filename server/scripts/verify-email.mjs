@@ -8,7 +8,7 @@
 import { lookup } from 'node:dns/promises';
 
 const REQUIRED = ['GRAPH_TENANT_ID', 'GRAPH_CLIENT_ID', 'GRAPH_CLIENT_SECRET', 'PRIVACY_MAILBOX'];
-const ENV_FILE = '/etc/dsr/dsr-api.env';
+const ENV_FILE = '/opt/dsr/server/.env';
 
 const sendTo = process.argv.includes('--send')
   ? process.argv[process.argv.indexOf('--send') + 1]

@@ -112,7 +112,7 @@ confirms (§14.3/.4), including business-day calendars and holiday lists.
 - Azure for Graph: app registration + `Mail.Send` **application** permission
   + admin consent + an application access policy restricting the app to the
   privacy shared mailbox. Config: `GRAPH_TENANT_ID/CLIENT_ID/CLIENT_SECRET`,
-  `PRIVACY_MAILBOX`, `EMAIL_PROVIDER=graph`, all in `/etc/dsr/dsr-api.env` —
+  `PRIVACY_MAILBOX`, `EMAIL_PROVIDER=graph`, all in `/opt/dsr/server/.env` —
   see "Email delivery" below. Confirm the whole path with
   `node server/scripts/verify-email.mjs`.
 - `npm audit`: 4 moderate findings, all inside `drizzle-kit`'s dev-time
@@ -179,7 +179,7 @@ lifetimes and rate limits, branding.
 **Email delivery is the one group that is not editable here.** `EMAIL_PROVIDER`,
 `EMAIL_FROM_NAME`, `PRIVACY_MAILBOX` and the three `GRAPH_*` credentials are
 **environment-only**: the Settings screen shows them read-only with "Set in
-`/etc/dsr/dsr-api.env`", and `PUT /internal/admin/settings` returns `400` for
+`/opt/dsr/server/.env`", and `PUT /internal/admin/settings` returns `400` for
 any of the six. A database row can never shadow the file on the server, and a
 missing Graph credential stops the service at boot rather than dropping the
 first data-subject email. See "Email delivery" below.
@@ -213,9 +213,11 @@ then update the two `PORTAL_*_URL` values in Settings.
 Microsoft Graph is the only production email adapter. `console` exists for
 dev/e2e only and refuses to run in production unless
 `ALLOW_CONSOLE_EMAIL=true`. Six keys select and configure it, all
-**environment-only** — read from `/etc/dsr/dsr-api.env` (mode `0640`, owner
-`root:dsr`), ignored as an `app_settings` row, and rejected with `400` if
-anything tries to write one through the settings API:
+**environment-only** — read from `/opt/dsr/server/.env` (the same file
+`deploy.sh` writes for every other server setting; `chmod 600`, owned by
+`dsr:dsr`, loaded by systemd as `dsr-api`'s `EnvironmentFile`), ignored as an
+`app_settings` row, and rejected with `400` if anything tries to write one
+through the settings API:
 
 ```
 EMAIL_PROVIDER=graph                    # graph | console
@@ -252,17 +254,20 @@ dropping the first verification email a data subject is waiting on.
    Without this policy, `Mail.Send` lets the app send as **any** mailbox in
    the tenant, not just the one the portal should use.
 4. Write the four `GRAPH_*`/`PRIVACY_MAILBOX` values, `EMAIL_PROVIDER=graph`
-   and `EMAIL_FROM_NAME` into `/etc/dsr/dsr-api.env` on the server, then
+   and `EMAIL_FROM_NAME` into `/opt/dsr/server/.env` on the server, then
    `systemctl restart dsr-api`.
 
 ### Confirming it works
 
 `server/scripts/verify-email.mjs` proves the whole path from the host,
-independent of whether the build or the service is currently healthy:
+independent of whether the build or the service is currently healthy. The
+file is `chmod 600` and owned by `dsr`, so read it as that user or with sudo:
 
 ```bash
 cd /opt/dsr/server
-set -a; . /etc/dsr/dsr-api.env; set +a
+sudo -u dsr bash -c 'set -a; . ./.env; set +a; node scripts/verify-email.mjs'
+# or, already root on the box:
+set -a; . /opt/dsr/server/.env; set +a
 node scripts/verify-email.mjs                          # 4 checks, sends nothing
 node scripts/verify-email.mjs --send you@company.com   # also sends a real message
 ```

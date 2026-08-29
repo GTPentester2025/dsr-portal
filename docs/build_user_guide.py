@@ -395,7 +395,7 @@ callout(doc, "ok",
 
 h2(doc, "10.2 Email delivery")
 para(doc, "Microsoft Graph is the portal's only production email adapter. The six fields in this "
-          "group are shown **read-only**, each marked \"Set in /etc/dsr/dsr-api.env\": saving "
+          "group are shown **read-only**, each marked \"Set in /opt/dsr/server/.env\": saving "
           "the screen never changes them, and the API refuses a write even if one is attempted "
           "directly. They live in a file on the server rather than the database on purpose — an "
           "email configuration that decides who a verification link appears to come from should "
@@ -408,7 +408,7 @@ table(doc, ["Field", "What it is"], [
 ], widths=[1.9, 4.5])
 callout(doc, "note",
         "To change any of these, ask whoever administers the server to edit "
-        "/etc/dsr/dsr-api.env and restart the dsr-api service. If a required Graph credential "
+        "/opt/dsr/server/.env and restart the dsr-api service. If a required Graph credential "
         "is left empty, the service refuses to start at all, rather than starting up healthy "
         "and silently dropping the first email.")
 

@@ -43,7 +43,7 @@ export class EmailDispatcher implements EmailProvider {
         step: 'Authentication',
         ok: status.ok,
         detail: status.detail,
-        hint: status.ok ? undefined : 'Check GRAPH_* credentials in /etc/dsr/dsr-api.env.',
+        hint: status.ok ? undefined : 'Check GRAPH_* credentials in /opt/dsr/server/.env.',
         ms: Date.now() - started,
       });
     }
@@ -63,7 +63,7 @@ export class EmailDispatcher implements EmailProvider {
       case 'console':
         if (process.env.NODE_ENV === 'production' && process.env.ALLOW_CONSOLE_EMAIL !== 'true') {
           throw new Error(
-            'The console email adapter is not allowed in production. Set EMAIL_PROVIDER=graph in /etc/dsr/dsr-api.env.',
+            'The console email adapter is not allowed in production. Set EMAIL_PROVIDER=graph in /opt/dsr/server/.env.',
           );
         }
         return this.consoleProvider;

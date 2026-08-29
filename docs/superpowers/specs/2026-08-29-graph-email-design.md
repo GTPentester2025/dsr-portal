@@ -59,7 +59,9 @@ deliberately generic: later sub-projects reuse it for SSO client secrets.
 
 ## Configuration contract
 
-`/etc/dsr/dsr-api.env`, mode 0640, owner `root:dsr`:
+`/opt/dsr/server/.env` — the same file `deploy.sh` already writes for every
+other server setting, `chmod 600`, owned by `dsr:dsr`, and loaded by systemd
+as `dsr-api`'s `EnvironmentFile`:
 
 ```
 EMAIL_PROVIDER=graph
@@ -231,7 +233,7 @@ node server/scripts/verify-email.mjs                     # 4 checks pass
 node server/scripts/verify-email.mjs --send you@co.com   # mail arrives
 
 # boot validation actually stops the service
-sudo sed -i 's/^GRAPH_CLIENT_SECRET=.*/GRAPH_CLIENT_SECRET=/' /etc/dsr/dsr-api.env
+sudo sed -i 's/^GRAPH_CLIENT_SECRET=.*/GRAPH_CLIENT_SECRET=/' /opt/dsr/server/.env
 sudo systemctl restart dsr-api                           # expected to fail
 journalctl -u dsr-api -n 20                              # names the missing key
 # restore the secret, restart, confirm healthy

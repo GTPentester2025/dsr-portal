@@ -82,7 +82,7 @@ export const SETTINGS: SettingDef[] = [
     group: 'email',
     type: 'select',
     default: 'graph',
-    help: 'Set in /etc/dsr/dsr-api.env. Changing it needs a service restart.',
+    help: 'Set in /opt/dsr/server/.env. Changing it needs a service restart.',
     envOnly: true,
     options: [
       { value: 'graph', label: 'Microsoft Graph (shared mailbox)' },

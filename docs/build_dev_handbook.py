@@ -280,7 +280,7 @@ caller ─► EMAIL_PROVIDER (EmailDispatcher)
                   └─ console → log only, refused in production unless ALLOW_CONSOLE_EMAIL=true
 """)
 bullets(doc, [
-    "Graph and console are the only adapters. Provider choice and every Graph credential are `envOnly` catalog entries (§4.6): `EMAIL_PROVIDER`, `EMAIL_FROM_NAME`, `PRIVACY_MAILBOX`, `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`. A database row can never shadow the value in `/etc/dsr/dsr-api.env`, and `PUT /internal/admin/settings` returns `400` for any of the six.",
+    "Graph and console are the only adapters. Provider choice and every Graph credential are `envOnly` catalog entries (§4.6): `EMAIL_PROVIDER`, `EMAIL_FROM_NAME`, `PRIVACY_MAILBOX`, `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`. A database row can never shadow the value in `/opt/dsr/server/.env`, and `PUT /internal/admin/settings` returns `400` for any of the six.",
     "`assertEmailConfig()` (`email-config.ts`) runs in `main.ts` before `app.listen()`. When `EMAIL_PROVIDER=graph`, all four required keys must be non-empty or the process exits non-zero, naming every missing key and the env file path in the log.",
     "`net-diagnostics.ts` (`diagnoseHttpsEndpoint`) checks DNS then a TCP connect to `graph.microsoft.com:443`; `EmailDispatcher.diagnose()` appends an authenticated `verifyConnection()` call as a third stage, so a failure names DNS, transport or credentials rather than one opaque timeout.",
 ])
@@ -296,7 +296,7 @@ node server/scripts/verify-email.mjs [--send someone@company.com]
 """)
 bullets(doc, [
     "Dependency-free and untranspiled on purpose: it has to run on a box where the build is broken, which is exactly when it is needed.",
-    "Reads `process.env` directly, so it is run after sourcing the same env file systemd gives the service: `set -a; . /etc/dsr/dsr-api.env; set +a; node scripts/verify-email.mjs`.",
+    "Reads `process.env` directly, so it is run after sourcing the same env file systemd gives the service: `set -a; . /opt/dsr/server/.env; set +a; node scripts/verify-email.mjs`. That file is `chmod 600`, owned by `dsr`, so this needs `sudo -u dsr` or root, not an unprivileged shell.",
     "Step 4 is the one that actually proves the Azure side is configured correctly — a valid token (step 3) only proves the app registration exists, not that `Mail.Send` was consented or that the application access policy scopes it to the right mailbox.",
 ])
 
@@ -501,7 +501,7 @@ h3(doc, "Add an email provider")
 numbered(doc, [
     "Implement `EmailProvider` in a new file under `server/src/email/`.",
     "Register it in `email.module.ts` and add a case to `EmailDispatcher.active()`.",
-    "Add the provider option to `EMAIL_PROVIDER`'s `options` and its credential fields to the settings catalog, marked `envOnly: true` if the value should live in `/etc/dsr/dsr-api.env` rather than be database-writable.",
+    "Add the provider option to `EMAIL_PROVIDER`'s `options` and its credential fields to the settings catalog, marked `envOnly: true` if the value should live in `/opt/dsr/server/.env` rather than be database-writable.",
     "If it speaks HTTPS, reuse `diagnoseHttpsEndpoint` from `net-diagnostics.ts` so it inherits the staged DNS/TCP diagnostic.",
 ])
 

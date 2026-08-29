@@ -178,7 +178,7 @@ export class SettingsService implements OnModuleInit, OnModuleDestroy {
       if (!def) throw new BadRequestException(`Unknown setting: ${key}`);
       if (def.envOnly) {
         throw new BadRequestException(
-          `${def.label} is set in /etc/dsr/dsr-api.env and cannot be changed here.`,
+          `${def.label} is set in /opt/dsr/server/.env and cannot be changed here.`,
         );
       }
       const value = rawValue.trim();
