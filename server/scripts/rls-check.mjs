@@ -81,21 +81,47 @@ check('audit_log DELETE blocked even for owner', blocked);
 // --roles: prove the write matrix from 0013_role-matrix.sql. Zone isolation is
 // covered above; this asserts who may write, per role, per table.
 if (process.argv.includes('--roles')) {
-  const tryWrite = async (role, zone, sql) => {
+  // Three outcomes, never two. "No exception thrown" is not evidence that a
+  // write was permitted: an UPDATE whose WHERE matches nothing succeeds
+  // without WITH CHECK ever being evaluated, so a missing seed, a wrong zone
+  // term or a read that RLS blocked outright would turn every positive
+  // assertion below green while proving nothing at all. An RLS refusal on
+  // INSERT/UPDATE raises (42501), a zero-row match does not, so the two stay
+  // distinguishable: 'refused' was thrown, 'nothing' matched no row, and only
+  // 'wrote' means the policy ran against a real row and allowed it. This is
+  // the same discipline tryDelete below already applies by counting rowCount.
+  const attemptWrite = async (role, zone, sql) => {
     try {
       await app.query('BEGIN');
       await app.query(
         `SELECT set_config('app.current_role', $1, true), set_config('app.current_zone', $2, true)`,
         [role, zone],
       );
-      await app.query(sql);
+      const r = await app.query(sql);
       await app.query('ROLLBACK');
-      return true;
+      return r.rowCount ? 'wrote' : 'nothing';
     } catch {
       await app.query('ROLLBACK');
-      return false;
+      return 'refused';
     }
   };
+
+  // For the WITH CHECK assertions, 'nothing' is neither answer -- it means the
+  // probe never reached the policy. Both helpers count it as a failure and say
+  // so, because a silent zero-row match is the failure mode being fixed here.
+  const decide = async (role, zone, sql, want) => {
+    const outcome = await attemptWrite(role, zone, sql);
+    if (outcome === 'nothing') {
+      console.log(`     (${role} @ ${zone}) matched no rows: ${sql.trim().split('\n')[0]}`);
+    }
+    return outcome === want;
+  };
+
+  /** Permitted: the policy was evaluated against a real row and allowed it. */
+  const mayWrite = (role, zone, sql) => decide(role, zone, sql, 'wrote');
+
+  /** Refused: the policy raised on a real row. */
+  const mayNotWrite = (role, zone, sql) => decide(role, zone, sql, 'refused');
 
   // DELETE is governed by a RESTRICTIVE USING-only policy (0013): a role that
   // fails it does not raise, it just leaves the row unmatched, so rowCount
@@ -124,21 +150,35 @@ if (process.argv.includes('--roles')) {
                          ON CONFLICT (key) DO UPDATE SET value = 'x'`;
   const CASE_DELETE = `DELETE FROM cases WHERE zone_id = 'EUR'`;
   const GLOBAL_USER_DELETE = `DELETE FROM users WHERE email = 'rls-probe-global@example.com'`;
+  const GLOBAL_USER_WRITE = `UPDATE users SET zone_id = 'EUR' WHERE email = 'rls-probe-global@example.com'`;
 
   for (const role of ['super_admin', 'admin', 'zone_manager', 'approver']) {
-    check(`${role} may write a case`, await tryWrite(role, 'EUR', CASE_WRITE));
+    check(`${role} may write a case`, await mayWrite(role, 'EUR', CASE_WRITE));
   }
-  check('auditor may not write a case', !(await tryWrite('auditor', '*', CASE_WRITE)));
+  check('auditor may not write a case', await mayNotWrite('auditor', '*', CASE_WRITE));
 
   for (const role of ['super_admin', 'admin', 'zone_manager']) {
-    check(`${role} may write a user`, await tryWrite(role, role === 'zone_manager' ? 'EUR' : '*', USER_WRITE));
+    check(`${role} may write a user`, await mayWrite(role, role === 'zone_manager' ? 'EUR' : '*', USER_WRITE));
   }
-  check('approver may not write a user', !(await tryWrite('approver', 'EUR', USER_WRITE)));
-  check('auditor may not write a user', !(await tryWrite('auditor', '*', USER_WRITE)));
+  check('approver may not write a user', await mayNotWrite('approver', 'EUR', USER_WRITE));
+  check('auditor may not write a user', await mayNotWrite('auditor', '*', USER_WRITE));
 
-  check('super_admin may write a setting', await tryWrite('super_admin', '*', SETTING_WRITE));
-  check('admin may not write a setting', !(await tryWrite('admin', '*', SETTING_WRITE)));
-  check('zone_manager may not write a setting', !(await tryWrite('zone_manager', 'EUR', SETTING_WRITE)));
+  check('super_admin may write a setting', await mayWrite('super_admin', '*', SETTING_WRITE));
+  check('admin may not write a setting', await mayNotWrite('admin', '*', SETTING_WRITE));
+  check('zone_manager may not write a setting', await mayNotWrite('zone_manager', 'EUR', SETTING_WRITE));
+
+  // users_update_zone (0013): a global account must not be selectable for
+  // UPDATE from inside a zone. That policy is RESTRICTIVE and blocks through
+  // USING, so like DELETE it leaves the row unmatched instead of raising --
+  // 'nothing' is the pass here and only 'wrote' is the failure.
+  check(
+    'zone_manager may not pull a global user (zone_id IS NULL) into their zone',
+    (await attemptWrite('zone_manager', 'EUR', GLOBAL_USER_WRITE)) !== 'wrote',
+  );
+  check(
+    'admin may rezone a global user (zone_id IS NULL)',
+    (await attemptWrite('admin', '*', GLOBAL_USER_WRITE)) === 'wrote',
+  );
 
   // DELETE coverage (spec: 0013's users_delete_role hole, closed in Task 7).
   check('auditor may not delete a case', !(await tryDelete('auditor', '*', CASE_DELETE)));
@@ -152,8 +192,16 @@ if (process.argv.includes('--roles')) {
   );
 }
 
-// clean up seeded rows so other tests never collide with them
+// Clean up everything this script seeded, so other tests never collide with
+// it -- the probe users as much as the cases. rls-probe-global@example.com is
+// an admin-role account with zone_id IS NULL, which is precisely the row shape
+// 0013 exists to protect; it has no password so it cannot sign in, but leaving
+// one lying around in every database this script has ever run against is not
+// something to do by omission.
 await admin.query(`DELETE FROM email_log; DELETE FROM case_fields; DELETE FROM sla_clocks; DELETE FROM case_status_history; DELETE FROM cases;`);
+await admin.query(
+  `DELETE FROM users WHERE email IN ('rls-probe@example.com','rls-probe-global@example.com')`,
+);
 
 await app.end();
 await admin.end();
