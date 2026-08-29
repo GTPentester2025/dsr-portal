@@ -1,4 +1,4 @@
-import { Global, Module, OnModuleDestroy } from '@nestjs/common';
+import { Global, Logger, Module, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { drizzle, NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { Pool, PoolClient } from 'pg';
@@ -22,21 +22,44 @@ const DEFAULT_STATEMENT_TIMEOUT_MS = 15_000;
  */
 export class DbService implements OnModuleDestroy {
   readonly pool: Pool;
+  private readonly log = new Logger(DbService.name);
 
   constructor(config: ConfigService) {
+    // ConfigService.get(key, default) falls back only when the value is
+    // *undefined*. A key present but empty -- DB_CONNECT_TIMEOUT_MS= -- gives
+    // '', and Number('') is 0; a plausible typo like '5s' or '30_000' gives
+    // NaN. pg-pool guards both timeouts with falsiness, so 0 and NaN alike
+    // mean "no timeout" to it: an operator hand-editing these on the box could
+    // restore exactly the unbounded behaviour they exist to remove -- requests
+    // queueing forever behind an exhausted pool, idle connections never
+    // released -- with a clean boot and no error. max survives such a value
+    // only by luck, because pg-pool spells its own fallback `max || 10`.
+    const ms = (k: string, d: number) => {
+      const n = Number(config.get<string>(k, String(d)));
+      return Number.isFinite(n) && n > 0 ? n : d;
+    };
+    const max = ms('DB_POOL_MAX', 10);
+    // A connection that has been idle this long is closed rather than held
+    // against the server's connection limit.
+    const idleTimeoutMillis = ms('DB_IDLE_TIMEOUT_MS', 30_000);
+    // Fail a request that cannot get a connection rather than queueing behind
+    // an exhausted pool until the caller gives up.
+    const connectionTimeoutMillis = ms('DB_CONNECT_TIMEOUT_MS', 5_000);
     this.pool = new Pool({
       connectionString: config.get<string>(
         'DATABASE_URL_APP',
         'postgres://dsr_app:dsr_app@127.0.0.1:5433/dsr',
       ),
-      max: Number(config.get<string>('DB_POOL_MAX', '10')),
-      // A connection that has been idle this long is closed rather than held
-      // against the server's connection limit.
-      idleTimeoutMillis: Number(config.get<string>('DB_IDLE_TIMEOUT_MS', '30000')),
-      // Fail a request that cannot get a connection rather than queueing behind
-      // an exhausted pool until the caller gives up.
-      connectionTimeoutMillis: Number(config.get<string>('DB_CONNECT_TIMEOUT_MS', '5000')),
+      max,
+      idleTimeoutMillis,
+      connectionTimeoutMillis,
     });
+    // Once, at boot. A value the guard rejected is otherwise invisible, and
+    // the failure it causes only shows up under load looking like anything but
+    // its cause.
+    this.log.log(
+      `pool max=${max} idleTimeoutMs=${idleTimeoutMillis} connectTimeoutMs=${connectionTimeoutMillis}`,
+    );
   }
 
   async withContext<T>(
