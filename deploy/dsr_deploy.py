@@ -20,6 +20,7 @@ import base64
 import binascii
 import collections
 import hashlib
+import re
 import sys
 
 INSTALL_PREFIX = "/opt/dsr"
@@ -208,6 +209,111 @@ def project_days_until_full(samples: list, free_now: int) -> float:
         return None
     per_day = grown * 86400.0 / elapsed
     return free_now / per_day
+
+
+MANAGED_MARKER = "# managed by dsr_deploy"
+
+_LOOPBACK = ("127.0.0.1/32", "::1/128")
+_WEAK_METHODS = ("ident", "md5", "trust", "password")
+
+
+def rewrite_pg_hba(text: str) -> tuple:
+    """Make loopback host connections use scram-sha-256.
+
+    RHEL's default is `ident`, under which the API -- which connects to
+    127.0.0.1:5432 with a password -- authenticates against nothing and every
+    query fails. Debian's default already allowed password auth, which is why
+    this never came up before.
+
+    Replication rows are left alone: they are not how the portal connects,
+    and changing them is not this tool's business.
+    """
+    out = []
+    changed = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        fields = stripped.split()
+        if (
+            stripped
+            and not stripped.startswith("#")
+            and len(fields) >= 5
+            and fields[0] == "host"
+            and fields[1] != "replication"
+            and any(addr in fields for addr in _LOOPBACK)
+            and fields[-1] in _WEAK_METHODS
+        ):
+            out.append(line[: line.rindex(fields[-1])] + "scram-sha-256")
+            changed = True
+        else:
+            out.append(line)
+    result = "\n".join(out)
+    if text.endswith("\n"):
+        result += "\n"
+    return result, changed
+
+
+def neutralise_default_server(text: str) -> tuple:
+    """Remove RHEL's stock default server block from nginx.conf.
+
+    Our own config declares `listen 80 default_server`, and nginx refuses to
+    start with two of them: `duplicate default server`. On Debian the stock
+    one is a file in sites-enabled you can delete; on RHEL it lives inside
+    nginx.conf itself, so it has to be edited out.
+
+    Brace-counted rather than regex-matched, because a regex that gets this
+    wrong produces an unbalanced file and nginx then fails for a second,
+    more confusing reason.
+    """
+    if MANAGED_MARKER in text:
+        return text, False
+
+    lines = text.splitlines()
+    out = []
+    i = 0
+    changed = False
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith("server") and stripped.endswith("{"):
+            depth = 0
+            j = i
+            block = []
+            while j < len(lines):
+                depth += lines[j].count("{") - lines[j].count("}")
+                block.append(lines[j])
+                j += 1
+                if depth == 0:
+                    break
+            if any("default_server" in b for b in block):
+                indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+                out.append(
+                    indent
+                    + MANAGED_MARKER
+                    + " -- stock default server removed; see conf.d/dsr.conf"
+                )
+                changed = True
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+
+    if not changed:
+        return text, False
+    result = "\n".join(out)
+    if text.endswith("\n"):
+        result += "\n"
+    return result, True
+
+
+def version_at_least(actual: str, minimum: str) -> bool:
+    """Compare dotted versions numerically. Unparseable input is False."""
+    found = re.search(r"(\d+(?:\.\d+)*)", actual or "")
+    if not found:
+        return False
+    got = [int(p) for p in found.group(1).split(".")]
+    want = [int(p) for p in (minimum or "0").split(".")]
+    got += [0] * (len(want) - len(got))
+    want += [0] * (len(got) - len(want))
+    return got >= want
 
 
 def build_parser() -> argparse.ArgumentParser:

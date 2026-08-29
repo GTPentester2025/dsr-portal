@@ -230,5 +230,121 @@ class TestProjection(unittest.TestCase):
         self.assertIsNone(dd.project_days_until_full([(5, 10), (5, 90)], 1000))
 
 
+PG_HBA_RHEL_DEFAULT = """# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             all                                     peer
+host    all             all             127.0.0.1/32            ident
+host    all             all             ::1/128                 ident
+host    replication     all             127.0.0.1/32            ident
+"""
+
+
+class TestPgHba(unittest.TestCase):
+    def test_loopback_ident_becomes_scram(self):
+        new, changed = dd.rewrite_pg_hba(PG_HBA_RHEL_DEFAULT)
+        self.assertTrue(changed)
+        for line in new.splitlines():
+            if (
+                line.startswith("host")
+                and "replication" not in line
+                and ("127.0.0.1/32" in line or "::1/128" in line)
+            ):
+                self.assertIn("scram-sha-256", line)
+                self.assertNotIn("ident", line)
+
+    def test_local_peer_line_is_left_alone(self):
+        new, _ = dd.rewrite_pg_hba(PG_HBA_RHEL_DEFAULT)
+        self.assertIn("local   all             all                                     peer", new)
+
+    def test_replication_line_is_left_alone(self):
+        new, _ = dd.rewrite_pg_hba(PG_HBA_RHEL_DEFAULT)
+        replication = [l for l in new.splitlines() if "replication" in l][0]
+        self.assertIn("ident", replication)
+
+    def test_second_run_is_a_no_op(self):
+        once, _ = dd.rewrite_pg_hba(PG_HBA_RHEL_DEFAULT)
+        twice, changed = dd.rewrite_pg_hba(once)
+        self.assertFalse(changed)
+        self.assertEqual(once, twice)
+
+    def test_comments_are_not_rewritten(self):
+        text = "# host all all 127.0.0.1/32 ident\n"
+        new, changed = dd.rewrite_pg_hba(text)
+        self.assertFalse(changed)
+        self.assertEqual(new, text)
+
+    def test_an_already_correct_file_is_unchanged(self):
+        text = "host    all   all   127.0.0.1/32   scram-sha-256\n"
+        new, changed = dd.rewrite_pg_hba(text)
+        self.assertFalse(changed)
+        self.assertEqual(new, text)
+
+    def test_md5_is_also_upgraded(self):
+        new, changed = dd.rewrite_pg_hba("host all all 127.0.0.1/32 md5\n")
+        self.assertTrue(changed)
+        self.assertIn("scram-sha-256", new)
+
+
+NGINX_RHEL_DEFAULT = """user nginx;
+http {
+    include /etc/nginx/conf.d/*.conf;
+
+    server {
+        listen       80 default_server;
+        listen       [::]:80 default_server;
+        server_name  _;
+        root         /usr/share/nginx/html;
+        error_page 404 /404.html;
+    }
+}
+"""
+
+
+class TestNginxDefaultServer(unittest.TestCase):
+    def test_default_server_block_is_removed(self):
+        new, changed = dd.neutralise_default_server(NGINX_RHEL_DEFAULT)
+        self.assertTrue(changed)
+        self.assertNotIn("default_server", new)
+        self.assertNotIn("/usr/share/nginx/html", new)
+
+    def test_the_include_survives(self):
+        new, _ = dd.neutralise_default_server(NGINX_RHEL_DEFAULT)
+        self.assertIn("include /etc/nginx/conf.d/*.conf;", new)
+        self.assertIn("user nginx;", new)
+
+    def test_braces_stay_balanced(self):
+        new, _ = dd.neutralise_default_server(NGINX_RHEL_DEFAULT)
+        self.assertEqual(new.count("{"), new.count("}"))
+
+    def test_it_leaves_a_marker_and_is_idempotent(self):
+        once, _ = dd.neutralise_default_server(NGINX_RHEL_DEFAULT)
+        self.assertIn(dd.MANAGED_MARKER, once)
+        twice, changed = dd.neutralise_default_server(once)
+        self.assertFalse(changed)
+        self.assertEqual(once, twice)
+
+    def test_a_file_without_a_default_server_is_untouched(self):
+        text = "user nginx;\nhttp {\n    include /etc/nginx/conf.d/*.conf;\n}\n"
+        new, changed = dd.neutralise_default_server(text)
+        self.assertFalse(changed)
+        self.assertEqual(new, text)
+
+
+class TestVersionAtLeast(unittest.TestCase):
+    def test_compares_numerically_not_as_strings(self):
+        self.assertTrue(dd.version_at_least("22.1.0", "22"))
+        self.assertTrue(dd.version_at_least("22.0.0", "22"))
+        self.assertTrue(dd.version_at_least("100.0.0", "22"))   # not a string compare
+        self.assertFalse(dd.version_at_least("20.19.0", "22"))
+        self.assertFalse(dd.version_at_least("9.6", "16"))
+
+    def test_tolerates_a_v_prefix_and_trailing_text(self):
+        self.assertTrue(dd.version_at_least("v22.11.0", "22"))
+        self.assertTrue(dd.version_at_least("psql (PostgreSQL) 16.2", "16"))
+
+    def test_unparseable_input_is_false_rather_than_an_exception(self):
+        self.assertFalse(dd.version_at_least("", "22"))
+        self.assertFalse(dd.version_at_least("unknown", "22"))
+
+
 if __name__ == "__main__":
     unittest.main()
