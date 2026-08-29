@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import pathlib
 import sys
 import unittest
@@ -464,6 +466,720 @@ class TestSsh(unittest.TestCase):
         # The whole point of pushing the tool to the box: no nested quoting.
         argv = dd.Ssh("root@h", "/k/id").argv("echo 'a b'; rm -rf /")
         self.assertIn("echo 'a b'; rm -rf /", argv)
+
+
+# ---------------------------------------------------------------------------
+# doctor
+#
+# Every fixture below is a hand-written example of what the matching command
+# prints on a RHEL 9 box. None of it was captured from a live host: there is
+# no host in this test run, by design.
+# ---------------------------------------------------------------------------
+
+SEBOOL_OFF = "httpd_can_network_connect --> off\n"
+SEBOOL_ON = "httpd_can_network_connect --> on\n"
+
+# One denial, in the shape ausearch prints. This is the log line behind the
+# 502 that started all of this.
+AVC_DENIAL = (
+    "----\n"
+    "time->Fri Aug 29 11:04:02 2026\n"
+    "type=AVC msg=audit(1756512242.113:271): avc:  denied  { name_connect } "
+    'for  pid=1214 comm="nginx" dest=3000 '
+    "scontext=system_u:system_r:httpd_t:s0 "
+    "tcontext=system_u:object_r:http_port_t:s0 tclass=tcp_socket permissive=0\n"
+)
+
+FORBIDDEN_SELINUX_ADVICE = ("setenforce 0", "SELINUX=disabled", "--permissive")
+
+
+def _blob(findings):
+    return " ".join(f.title + " " + f.detail + " " + f.fix for f in findings)
+
+
+class TestSelinuxEvaluator(unittest.TestCase):
+    def test_boolean_off_is_a_failure_that_names_the_boolean(self):
+        findings = dd.evaluate_selinux("Enforcing", "httpd_can_network_connect --> off", "")
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertTrue(bad)
+        self.assertIn("httpd_can_network_connect", bad[0].fix)
+        self.assertIn("setsebool -P", bad[0].fix)
+
+    def test_the_fix_is_the_exact_command_to_paste(self):
+        findings = dd.evaluate_selinux("Enforcing", SEBOOL_OFF, "")
+        fixes = [f.fix for f in findings if f.severity == dd.FAIL]
+        self.assertIn("setsebool -P httpd_can_network_connect on", fixes)
+
+    def test_the_failure_names_the_symptom_the_operator_actually_sees(self):
+        # The point of the whole mode: 502 plus one nginx log line, and
+        # nothing anywhere says the word "SELinux".
+        findings = dd.evaluate_selinux("Enforcing", SEBOOL_OFF, "")
+        detail = " ".join(f.detail for f in findings if f.severity == dd.FAIL)
+        self.assertIn("502", detail)
+        self.assertIn("Permission denied while connecting to upstream", detail)
+
+    def test_boolean_on_and_enforcing_is_clean(self):
+        findings = dd.evaluate_selinux("Enforcing", "httpd_can_network_connect --> on", "")
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_permissive_is_a_warning_not_a_recommendation(self):
+        findings = dd.evaluate_selinux("Permissive", "httpd_can_network_connect --> on", "")
+        warn = [f for f in findings if f.severity == dd.WARN]
+        self.assertTrue(warn)
+        blob = " ".join(f.fix + f.detail for f in findings)
+        self.assertNotIn("setenforce 0", blob)
+        self.assertNotIn("SELINUX=disabled", blob)
+
+    def test_avc_denials_are_surfaced(self):
+        avc = "type=AVC msg=audit(1): avc:  denied  { name_connect } for  pid=1 comm=\"nginx\""
+        findings = dd.evaluate_selinux("Enforcing", "httpd_can_network_connect --> on", avc)
+        self.assertTrue(any("denial" in f.title.lower() for f in findings))
+
+    def test_a_denial_names_the_process_that_was_blocked(self):
+        findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, AVC_DENIAL)
+        denials = [f for f in findings if "denial" in f.title.lower()]
+        self.assertTrue(denials)
+        self.assertNotEqual(denials[0].severity, dd.OK)
+        self.assertIn("nginx", denials[0].detail)
+
+    def test_no_denials_is_not_an_error(self):
+        # ausearch exits 1 and prints nothing to stdout when the audit log is
+        # clean, which is the good case.
+        findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, "")
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_an_unreadable_boolean_warns_rather_than_passing(self):
+        findings = dd.evaluate_selinux("Enforcing", "", "")
+        self.assertTrue(any(f.severity == dd.WARN for f in findings))
+
+    def test_no_finding_anywhere_offers_to_turn_selinux_off(self):
+        for mode in ("Enforcing", "Permissive", "Disabled", "", "getenforce: not found"):
+            for booleans in (SEBOOL_ON, SEBOOL_OFF, ""):
+                for avc in ("", AVC_DENIAL):
+                    blob = _blob(dd.evaluate_selinux(mode, booleans, avc))
+                    for forbidden in FORBIDDEN_SELINUX_ADVICE:
+                        self.assertNotIn(forbidden, blob)
+
+
+JOURNAL_CLEAN = (
+    "Aug 29 11:02:14 dsr-prod systemd[1]: Started DSR portal API.\n"
+    "Aug 29 11:02:15 dsr-prod node[4111]: listening on 127.0.0.1:3000\n"
+)
+
+JOURNAL_CRASH_LOOP = (
+    "Aug 29 11:02:14 dsr-prod systemd[1]: Started DSR portal API.\n"
+    "Aug 29 11:02:15 dsr-prod node[4111]: Error: CRYPTO_MASTER_KEY must decode "
+    "to 32 bytes\n"
+    "Aug 29 11:02:15 dsr-prod systemd[1]: dsr-api.service: Main process exited, "
+    "code=exited, status=1/FAILURE\n"
+    "Aug 29 11:02:18 dsr-prod systemd[1]: dsr-api.service: Scheduled restart "
+    "job, restart counter is at 57.\n"
+)
+
+
+class TestServiceEvaluator(unittest.TestCase):
+    def test_a_crash_loop_is_distinguished_from_merely_down(self):
+        findings = dd.evaluate_service("activating", "NRestarts=57", "some error")
+        self.assertTrue(any("restart" in f.title.lower() for f in findings))
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+
+    def test_active_with_no_restarts_is_clean(self):
+        findings = dd.evaluate_service("active", "NRestarts=0", "")
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_inactive_is_a_failure(self):
+        findings = dd.evaluate_service("inactive", "NRestarts=0", "")
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+
+    def test_active_but_restarting_is_still_a_crash_loop(self):
+        # systemd reports "active" for most of each three-second cycle, so
+        # is-active alone would call this healthy.
+        findings = dd.evaluate_service("active", "NRestarts=57", JOURNAL_CRASH_LOOP)
+        loop = [f for f in findings if "restart" in f.title.lower()]
+        self.assertTrue(loop)
+        self.assertEqual(loop[0].severity, dd.FAIL)
+        self.assertIn("57", loop[0].title + loop[0].detail)
+
+    def test_down_and_crash_looping_get_different_first_moves(self):
+        down = " ".join(f.fix for f in dd.evaluate_service("inactive", "NRestarts=0", ""))
+        loop = " ".join(
+            f.fix for f in dd.evaluate_service("active", "NRestarts=57", JOURNAL_CRASH_LOOP)
+        )
+        self.assertNotEqual(down.strip(), loop.strip())
+        self.assertIn("systemctl start", down)
+
+    def test_a_known_boot_error_in_the_journal_is_named(self):
+        findings = dd.evaluate_service("activating", "NRestarts=12", JOURNAL_CRASH_LOOP)
+        blob = _blob(findings)
+        self.assertIn("CRYPTO_MASTER_KEY", blob)
+
+    def test_a_journal_line_holding_a_password_is_never_echoed(self):
+        journal = (
+            "Aug 29 11:02:15 dsr-prod node[4111]: error: connect ECONNREFUSED "
+            "postgres://dsr:hunter2@127.0.0.1:5432/dsr\n"
+        )
+        findings = dd.evaluate_service("inactive", "NRestarts=3", journal)
+        self.assertNotIn("hunter2", _blob(findings))
+
+    def test_a_missing_restart_counter_does_not_crash(self):
+        self.assertTrue(dd.evaluate_service("active", "", JOURNAL_CLEAN))
+
+
+MASTER_KEY_GOOD = base64.b64encode(b"\x01" * 32).decode()
+DB_PASSWORD = "n0t-in-a-finding"
+
+ENV_GOOD = (
+    "NODE_ENV=production\n"
+    "PORT=3000\n"
+    "DATABASE_URL=postgres://dsr:" + DB_PASSWORD + "@127.0.0.1:5432/dsr\n"
+    "DATABASE_URL_APP=postgres://dsr_app:" + DB_PASSWORD + "@127.0.0.1:5432/dsr\n"
+    "CRYPTO_MASTER_KEY=" + MASTER_KEY_GOOD + "\n"
+    "COOKIE_SECURE=true\n"
+    "EMAIL_PROVIDER=graph\n"
+    "PRIVACY_MAILBOX=privacy@example.com\n"
+    "GRAPH_TENANT_ID=00000000-0000-0000-0000-000000000000\n"
+    "GRAPH_CLIENT_ID=00000000-0000-0000-0000-000000000001\n"
+    "GRAPH_CLIENT_SECRET=graph-client-secret-value\n"
+)
+
+
+class TestEnvEvaluator(unittest.TestCase):
+    GOOD = (
+        "NODE_ENV=production\nPORT=3000\n"
+        "DATABASE_URL=postgres://dsr:p@127.0.0.1:5432/dsr\n"
+        "DATABASE_URL_APP=postgres://dsr_app:p@127.0.0.1:5432/dsr\n"
+        "CRYPTO_MASTER_KEY=" + base64.b64encode(b"\x01" * 32).decode() + "\n"
+        "EMAIL_PROVIDER=graph\nPRIVACY_MAILBOX=p@e.com\n"
+        "GRAPH_TENANT_ID=t\nGRAPH_CLIENT_ID=c\nGRAPH_CLIENT_SECRET=s\n"
+    )
+
+    def test_a_good_env_at_mode_600_is_clean(self):
+        self.assertTrue(all(f.severity == dd.OK for f in dd.evaluate_env(self.GOOD, "600")))
+
+    def test_a_world_readable_env_is_a_failure(self):
+        findings = dd.evaluate_env(self.GOOD, "644")
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+
+    def test_a_hex_master_key_is_caught_here_too(self):
+        text = self.GOOD.replace(
+            base64.b64encode(b"\x01" * 32).decode(), "a" * 64
+        )
+        self.assertTrue(any(f.severity == dd.FAIL for f in dd.evaluate_env(text, "600")))
+
+    def test_no_finding_ever_contains_the_key_itself(self):
+        key = base64.b64encode(b"\x01" * 32).decode()
+        for f in dd.evaluate_env(self.GOOD, "600"):
+            self.assertNotIn(key, f.title + f.detail + f.fix)
+
+    def test_no_finding_ever_contains_the_database_password(self):
+        for mode in ("600", "644"):
+            self.assertNotIn(DB_PASSWORD, _blob(dd.evaluate_env(ENV_GOOD, mode)))
+        broken = ENV_GOOD.replace(MASTER_KEY_GOOD, "a" * 64)
+        self.assertNotIn(DB_PASSWORD, _blob(dd.evaluate_env(broken, "600")))
+
+    def test_a_leading_zero_mode_is_still_owner_only(self):
+        self.assertTrue(all(f.severity == dd.OK for f in dd.evaluate_env(self.GOOD, "0600")))
+
+    def test_a_missing_setting_is_named(self):
+        text = "\n".join(
+            l for l in self.GOOD.splitlines() if not l.startswith("DATABASE_URL_APP=")
+        )
+        findings = dd.evaluate_env(text, "600")
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+        self.assertIn("DATABASE_URL_APP", _blob(findings))
+
+    def test_an_unreadable_env_file_is_a_failure_not_a_crash(self):
+        findings = dd.evaluate_env("", "")
+        self.assertTrue(findings)
+        self.assertEqual(dd.exit_code_for(findings), 2)
+
+    def test_the_console_mailer_warns_because_production_refuses_to_send(self):
+        text = self.GOOD.replace("EMAIL_PROVIDER=graph", "EMAIL_PROVIDER=console")
+        self.assertTrue(any(f.severity == dd.WARN for f in dd.evaluate_env(text, "600")))
+
+    def test_a_missing_graph_credential_is_a_failure_that_names_it(self):
+        text = self.GOOD.replace("GRAPH_CLIENT_SECRET=s", "GRAPH_CLIENT_SECRET=")
+        findings = dd.evaluate_env(text, "600")
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+        self.assertIn("GRAPH_CLIENT_SECRET", _blob(findings))
+
+
+class TestRedaction(unittest.TestCase):
+    def test_a_connection_string_keeps_its_shape_and_loses_its_password(self):
+        out = dd.redact_url("postgres://dsr:hunter2@127.0.0.1:5432/dsr")
+        self.assertNotIn("hunter2", out)
+        self.assertIn("dsr", out)
+        self.assertIn("127.0.0.1:5432/dsr", out)
+
+    def test_text_with_no_credentials_is_unchanged(self):
+        self.assertEqual(dd.redact_url("nginx -t failed"), "nginx -t failed")
+
+
+DF_ALMOST_FULL = """Filesystem     1B-blocks        Used  Available Capacity Mounted on
+/dev/vda1     21474836480 20937965568  536870912      98% /
+"""
+
+DF_ROOMY = """Filesystem     1B-blocks        Used  Available Capacity Mounted on
+/dev/vda1     53687091200 10737418240 42949672960      20% /
+"""
+
+DF_TIGHT = """Filesystem      1B-blocks         Used  Available Capacity Mounted on
+/dev/vda1     214748364800 210453397504 4294967296      98% /
+"""
+
+DF_SNUG = """Filesystem      1B-blocks         Used  Available Capacity Mounted on
+/dev/vda1     214748364800 193273528320 21474836480      90% /
+"""
+
+DF_SMALL_WARN = """Filesystem     1B-blocks       Used  Available Capacity Mounted on
+/dev/vda1      8589934592 6979321856 1610612736      81% /
+"""
+
+DF_SMALL_FAIL = """Filesystem     1B-blocks       Used  Available Capacity Mounted on
+/dev/vda1      4294967296 3875536896  419430400      90% /
+"""
+
+DAY = 86400
+
+
+class TestDiskEvaluator(unittest.TestCase):
+    def test_a_nearly_full_mount_is_not_reported_as_fine(self):
+        findings = dd.evaluate_disk(DF_ALMOST_FULL, {})
+        self.assertIn(dd.exit_code_for(findings), (1, 2))
+        space = [f for f in findings if f.severity in (dd.WARN, dd.FAIL)]
+        self.assertTrue(space)
+        self.assertIn("/", space[0].title)
+        self.assertIn("512.0 MB", space[0].title + space[0].detail)
+
+    def test_the_percentage_thresholds_separate_warn_from_fail(self):
+        # Both of these have gigabytes free, so the absolute-bytes rule
+        # cannot fire and only the percentage decides the severity.
+        tight = [f for f in dd.evaluate_disk(DF_TIGHT, {}) if f.severity != dd.OK]
+        self.assertEqual([f.severity for f in tight], [dd.FAIL])
+        snug = [f for f in dd.evaluate_disk(DF_SNUG, {}) if f.severity != dd.OK]
+        self.assertEqual([f.severity for f in snug], [dd.WARN])
+
+    def test_a_small_disk_is_judged_on_bytes_not_only_on_percentage(self):
+        # Both of these are comfortable by percentage and cramped in
+        # absolute terms: an npm install needs room, not a share.
+        warn = [f for f in dd.evaluate_disk(DF_SMALL_WARN, {}) if f.severity != dd.OK]
+        self.assertEqual([f.severity for f in warn], [dd.WARN])
+        fail = [f for f in dd.evaluate_disk(DF_SMALL_FAIL, {}) if f.severity != dd.OK]
+        self.assertEqual([f.severity for f in fail], [dd.FAIL])
+
+    def test_a_roomy_mount_is_ok(self):
+        findings = dd.evaluate_disk(DF_ROOMY, {})
+        self.assertTrue(findings)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_without_a_baseline_it_says_so_rather_than_projecting(self):
+        for samples in ({}, {"/": [[1000, 10737418240]]}):
+            findings = dd.evaluate_disk(DF_ROOMY, samples)
+            baseline = [f for f in findings if "baseline" in (f.title + f.detail).lower()]
+            self.assertTrue(baseline, "no baseline finding for %r" % (samples,))
+            self.assertEqual(baseline[0].severity, dd.OK)
+            # Nothing may claim a number of days from a single reading.
+            self.assertNotIn("day", _blob(findings).lower())
+
+    def test_steady_growth_projects_a_deadline_and_warns(self):
+        # 4 GB/day against 40 GB free is ten days.
+        samples = {"/": [[0, 10737418240 - 4294967296], [DAY, 10737418240]]}
+        findings = dd.evaluate_disk(DF_ROOMY, samples)
+        growth = [f for f in findings if "day" in f.title.lower()]
+        self.assertTrue(growth)
+        self.assertEqual(growth[0].severity, dd.WARN)
+        self.assertIn("10", growth[0].title)
+
+    def test_flat_usage_is_reported_as_no_growth_not_as_a_deadline(self):
+        samples = {"/": [[0, 10737418240], [DAY, 10737418240]]}
+        findings = dd.evaluate_disk(DF_ROOMY, samples)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_unreadable_df_output_warns_instead_of_crashing(self):
+        findings = dd.evaluate_disk("", {})
+        self.assertTrue(findings)
+        self.assertTrue(any(f.severity == dd.WARN for f in findings))
+
+
+class TestTlsEvaluator(unittest.TestCase):
+    # 1788220800 is 2026-09-01T00:00:00Z. Nine days before the cert below.
+    NOW = 1788220800
+
+    def test_expiry_inside_two_weeks_warns(self):
+        findings = dd.evaluate_tls("notAfter=Sep 10 00:00:00 2026 GMT", self.NOW)
+        self.assertTrue(any(f.severity in (dd.WARN, dd.FAIL) for f in findings))
+
+    def test_expiry_months_away_is_clean(self):
+        findings = dd.evaluate_tls("notAfter=Dec 31 00:00:00 2026 GMT", self.NOW)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_an_already_expired_certificate_is_a_failure(self):
+        findings = dd.evaluate_tls("notAfter=Jan 10 00:00:00 2026 GMT", self.NOW)
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+
+    def test_no_certificate_is_a_warning_not_a_crash(self):
+        self.assertTrue(dd.evaluate_tls("", self.NOW))
+
+    def test_no_certificate_is_a_warning_and_says_how_to_get_one(self):
+        findings = dd.evaluate_tls("", self.NOW)
+        self.assertTrue(any(f.severity == dd.WARN for f in findings))
+        self.assertIn("enable-tls", _blob(findings))
+
+    def test_the_day_count_is_stated_not_implied(self):
+        findings = dd.evaluate_tls("notAfter=Sep 10 00:00:00 2026 GMT", self.NOW)
+        self.assertIn("9 days", _blob(findings))
+
+    def test_an_unparseable_date_warns_rather_than_raising(self):
+        findings = dd.evaluate_tls("notAfter=whenever", self.NOW)
+        self.assertTrue(any(f.severity == dd.WARN for f in findings))
+
+    def test_month_names_are_read_without_help_from_the_locale(self):
+        # openssl always prints English month abbreviations; strptime("%b")
+        # would follow LC_TIME and stop matching under a non-English locale.
+        for month, expected_ok in (("Dec", True), ("Sep", False)):
+            findings = dd.evaluate_tls(
+                "notAfter=%s 10 00:00:00 2026 GMT" % month, self.NOW
+            )
+            self.assertEqual(all(f.severity == dd.OK for f in findings), expected_ok)
+
+
+PSQL_ROLES = "dsr\ndsr_app\n"
+MIGRATION_FILES = ["0000_init.sql", "0001_rls-audit-seeds.sql", "0002_internal-auth.sql"]
+MIGRATIONS_APPLIED = "0000_init.sql\n0001_rls-audit-seeds.sql\n0002_internal-auth.sql\n"
+
+PSQL_AUTH_FAILURE = (
+    'psql: error: connection to server at "127.0.0.1", port 5432 failed: '
+    'FATAL:  password authentication failed for user "dsr"\n'
+)
+
+
+class TestDatabaseEvaluator(unittest.TestCase):
+    def test_both_roles_and_a_current_schema_are_clean(self):
+        findings = dd.evaluate_database(PSQL_ROLES, MIGRATIONS_APPLIED, MIGRATION_FILES)
+        self.assertTrue(findings)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_a_missing_role_is_a_failure_that_names_it(self):
+        findings = dd.evaluate_database("dsr\n", MIGRATIONS_APPLIED, MIGRATION_FILES)
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+        self.assertIn("dsr_app", _blob(findings))
+
+    def test_pending_migrations_are_a_failure_that_names_the_script(self):
+        findings = dd.evaluate_database(
+            PSQL_ROLES, "0000_init.sql\n", MIGRATION_FILES
+        )
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+        blob = _blob(findings)
+        self.assertIn("0001_rls-audit-seeds.sql", blob)
+        self.assertIn("migrate.mjs", blob)
+
+    def test_a_database_ahead_of_the_code_warns(self):
+        findings = dd.evaluate_database(
+            PSQL_ROLES, MIGRATIONS_APPLIED + "0003_app-settings.sql\n", MIGRATION_FILES
+        )
+        self.assertTrue(any(f.severity == dd.WARN for f in findings))
+
+    def test_an_auth_failure_points_at_pg_hba_not_at_the_password(self):
+        # RHEL's stock pg_hba uses ident on loopback, under which a password
+        # authenticates against nothing. That is the cause worth naming.
+        findings = dd.evaluate_database(PSQL_AUTH_FAILURE, "", MIGRATION_FILES)
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+        blob = _blob(findings)
+        self.assertIn("pg_hba", blob)
+        self.assertIn("scram-sha-256", blob)
+
+    def test_a_missing_migrations_table_says_migrations_never_ran(self):
+        error = 'ERROR:  relation "schema_migrations" does not exist\n'
+        findings = dd.evaluate_database(PSQL_ROLES, error, MIGRATION_FILES)
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+        self.assertIn("migrate.mjs", _blob(findings))
+
+    def test_a_password_inside_a_psql_error_is_redacted(self):
+        error = (
+            "psql: error: connection to server on socket failed for "
+            "postgres://dsr:hunter2@127.0.0.1:5432/dsr\n"
+        )
+        self.assertNotIn(
+            "hunter2", _blob(dd.evaluate_database(error, error, MIGRATION_FILES))
+        )
+
+
+NGINX_T_OK = (
+    "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\n"
+    "nginx: configuration file /etc/nginx/nginx.conf test is successful\n"
+)
+
+NGINX_T_DUPLICATE = (
+    "nginx: [emerg] a duplicate default server for 0.0.0.0:80 in "
+    "/etc/nginx/conf.d/dsr.conf:11\n"
+    "nginx: configuration file /etc/nginx/nginx.conf test failed\n"
+)
+
+SS_HEALTHY = """State  Recv-Q Send-Q  Local Address:Port  Peer Address:Port Process
+LISTEN 0      511           0.0.0.0:80          0.0.0.0:*     users:(("nginx",pid=1210,fd=6))
+LISTEN 0      511           0.0.0.0:443         0.0.0.0:*     users:(("nginx",pid=1210,fd=8))
+LISTEN 0      511         127.0.0.1:3000        0.0.0.0:*     users:(("node",pid=4111,fd=20))
+LISTEN 0      244         127.0.0.1:5432        0.0.0.0:*     users:(("postmaster",pid=980,fd=7))
+"""
+
+SS_NO_APP = """State  Recv-Q Send-Q  Local Address:Port  Peer Address:Port Process
+LISTEN 0      511           0.0.0.0:80          0.0.0.0:*     users:(("nginx",pid=1210,fd=6))
+LISTEN 0      511           0.0.0.0:443         0.0.0.0:*     users:(("nginx",pid=1210,fd=8))
+"""
+
+SS_HTTP_ONLY = """State  Recv-Q Send-Q  Local Address:Port  Peer Address:Port Process
+LISTEN 0      511           0.0.0.0:80          0.0.0.0:*     users:(("nginx",pid=1210,fd=6))
+LISTEN 0      511         127.0.0.1:3000        0.0.0.0:*     users:(("node",pid=4111,fd=20))
+"""
+
+
+class TestWebEvaluator(unittest.TestCase):
+    def test_a_valid_config_and_every_port_is_clean(self):
+        findings = dd.evaluate_web(NGINX_T_OK, SS_HEALTHY)
+        self.assertTrue(findings)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_a_duplicate_default_server_is_a_failure_that_names_the_cause(self):
+        findings = dd.evaluate_web(NGINX_T_DUPLICATE, SS_HEALTHY)
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+        self.assertIn("default_server", _blob(findings))
+
+    def test_nothing_listening_on_the_app_port_explains_the_502(self):
+        findings = dd.evaluate_web(NGINX_T_OK, SS_NO_APP)
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertTrue(bad)
+        self.assertIn("3000", _blob(bad))
+        self.assertIn("502", _blob(bad))
+
+    def test_http_only_is_a_warning(self):
+        findings = dd.evaluate_web(NGINX_T_OK, SS_HTTP_ONLY)
+        self.assertTrue(any(f.severity == dd.WARN for f in findings))
+
+    def test_no_ss_output_warns_rather_than_declaring_every_port_shut(self):
+        findings = dd.evaluate_web(NGINX_T_OK, "")
+        self.assertEqual(dd.exit_code_for(findings), 1)
+
+
+OS_RELEASE_EL9 = (
+    'NAME="Red Hat Enterprise Linux"\n'
+    'VERSION="9.4 (Plow)"\n'
+    'ID="rhel"\n'
+    'VERSION_ID="9.4"\n'
+    'PLATFORM_ID="platform:el9"\n'
+)
+
+
+class TestHostEvaluator(unittest.TestCase):
+    def test_el9_with_the_right_runtimes_is_clean(self):
+        findings = dd.evaluate_host(OS_RELEASE_EL9, "v22.11.0", "psql (PostgreSQL) 16.2")
+        self.assertTrue(findings)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_an_old_node_is_a_failure_that_names_the_version_wanted(self):
+        findings = dd.evaluate_host(OS_RELEASE_EL9, "v20.19.0", "psql (PostgreSQL) 16.2")
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+        self.assertIn("22", _blob(findings))
+
+    def test_an_old_postgres_is_a_failure(self):
+        findings = dd.evaluate_host(OS_RELEASE_EL9, "v22.11.0", "psql (PostgreSQL) 13.7")
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+
+    def test_a_host_that_is_not_el9_warns(self):
+        findings = dd.evaluate_host(
+            'PLATFORM_ID="platform:el8"\n', "v22.11.0", "psql (PostgreSQL) 16.2"
+        )
+        self.assertTrue(any(f.severity == dd.WARN for f in findings))
+
+    def test_a_missing_runtime_is_a_failure_not_a_pass(self):
+        findings = dd.evaluate_host(OS_RELEASE_EL9, "", "")
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+
+
+class TestDoctorState(unittest.TestCase):
+    def test_a_sample_records_used_bytes_per_mount(self):
+        mounts = dd.parse_df(DF_ROOMY)
+        samples = dd.update_samples({}, mounts, 1000)
+        self.assertEqual(samples["/"], [[1000, 10737418240]])
+
+    def test_samples_accumulate_and_are_trimmed_to_the_last_few(self):
+        mounts = dd.parse_df(DF_ROOMY)
+        samples = {}
+        for t in range(50):
+            samples = dd.update_samples(samples, mounts, t, keep=30)
+        self.assertEqual(len(samples["/"]), 30)
+        self.assertEqual(samples["/"][-1][0], 49)
+
+    def test_a_recorded_pair_feeds_the_projection(self):
+        mounts = dd.parse_df(DF_ROOMY)
+        samples = dd.update_samples({"/": [[0, 10737418240 - 4294967296]]}, mounts, DAY)
+        days = dd.project_days_until_full(samples["/"], mounts[0].free)
+        self.assertAlmostEqual(days, 10.0, places=3)
+
+    def test_unreadable_state_is_no_state_rather_than_an_exception(self):
+        for text in ("", "not json", "[]", '{"samples": 3}'):
+            self.assertEqual(dd.parse_state(text), {})
+
+    def test_state_round_trips_through_json(self):
+        samples = {"/": [[1, 2], [3, 4]]}
+        self.assertEqual(dd.parse_state(dd.render_state(samples)), samples)
+
+
+class FakeRunner:
+    """Answers collector commands from fixtures; records anything written."""
+
+    def __init__(self, replies):
+        self.replies = replies
+        self.commands = []
+        self.writes = []
+
+    def run(self, command):
+        self.commands.append(command)
+        for needle, text in self.replies:
+            if needle in command:
+                return text
+        return ""
+
+    def write(self, path, text):
+        self.writes.append((path, text))
+
+
+HEALTHY_REPLIES = [
+    ("cat /etc/os-release", OS_RELEASE_EL9),
+    ("node -v", "v22.11.0\n"),
+    ("psql --version", "psql (PostgreSQL) 16.2\n"),
+    ("getenforce", "Enforcing\n"),
+    ("getsebool", SEBOOL_ON),
+    ("ausearch", ""),
+    ("is-active", "active\n"),
+    ("NRestarts", "NRestarts=0\n"),
+    ("journalctl", JOURNAL_CLEAN),
+    ("df -PB1", DF_ROOMY),
+    ("stat -c", "600\n"),
+    ("cat %s" % dd.ENV_PATH, ENV_GOOD),
+    ("pg_roles", PSQL_ROLES),
+    ("schema_migrations", MIGRATIONS_APPLIED),
+    ("drizzle", "\n".join(MIGRATION_FILES) + "\n"),
+    ("openssl x509", "notAfter=Dec 31 00:00:00 2026 GMT\n"),
+    ("nginx -t", NGINX_T_OK),
+    ("ss -lntp", SS_HEALTHY),
+]
+
+BROKEN_REPLIES = [
+    (needle, text) for needle, text in HEALTHY_REPLIES if needle not in ("getsebool", "ausearch")
+] + [("getsebool", SEBOOL_OFF), ("ausearch", AVC_DENIAL)]
+
+NOW = 1788220800
+
+
+class TestDoctorCommands(unittest.TestCase):
+    def test_it_runs_the_commands_the_spec_names(self):
+        blob = " ".join(command for _name, command in dd.DOCTOR_COMMANDS)
+        for expected in (
+            "getenforce",
+            "getsebool httpd_can_network_connect",
+            "ausearch -m avc -ts recent",
+            "systemctl is-active",
+            "NRestarts",
+            "journalctl -u",
+            "df -PB1",
+            "stat -c",
+            "psql -tAc",
+            "openssl x509 -enddate -noout",
+            "nginx -t",
+            "ss -lntp",
+        ):
+            self.assertIn(expected, blob, "doctor never runs %s" % expected)
+
+    def test_not_one_collector_changes_anything(self):
+        for name, command in dd.DOCTOR_COMMANDS:
+            for forbidden in (
+                "systemctl restart",
+                "systemctl start",
+                "systemctl stop",
+                "systemctl reload",
+                "setsebool",
+                "setenforce",
+                "rm -",
+                "chmod",
+                "chown",
+                "dnf install",
+                "INSERT",
+                "UPDATE ",
+                "DELETE",
+                "DROP",
+                "CREATE",
+                "certbot",
+                "migrate.mjs",
+            ):
+                self.assertNotIn(forbidden, command, "%s would change the box" % name)
+
+
+class TestDoctorAssembly(unittest.TestCase):
+    def healthy(self):
+        return dd.collect(FakeRunner(HEALTHY_REPLIES))
+
+    def test_a_healthy_box_produces_findings_and_none_of_them_are_bad(self):
+        findings = dd.assemble_findings(self.healthy(), {}, NOW)
+        self.assertTrue(findings)
+        bad = [(f.group, f.title, f.detail) for f in findings if f.severity != dd.OK]
+        self.assertEqual(bad, [])
+        self.assertEqual(dd.exit_code_for(findings), 0)
+
+    def test_every_group_the_cli_can_filter_on_actually_reports(self):
+        groups = {f.group for f in dd.assemble_findings(self.healthy(), {}, NOW)}
+        self.assertEqual(set(dd.DOCTOR_GROUPS), groups)
+
+    def test_the_selinux_boolean_is_found_end_to_end(self):
+        findings = dd.assemble_findings(dd.collect(FakeRunner(BROKEN_REPLIES)), {}, NOW)
+        fixes = [f.fix for f in findings if f.severity == dd.FAIL]
+        self.assertIn("setsebool -P httpd_can_network_connect on", fixes)
+        self.assertEqual(dd.exit_code_for(findings), 2)
+
+    def test_no_finding_anywhere_recommends_something_destructive(self):
+        for replies in (HEALTHY_REPLIES, BROKEN_REPLIES):
+            blob = _blob(dd.assemble_findings(dd.collect(FakeRunner(replies)), {}, NOW))
+            for forbidden in FORBIDDEN_SELINUX_ADVICE + ("rm -rf", "DROP TABLE", "dropdb"):
+                self.assertNotIn(forbidden, blob)
+
+    def test_a_broken_box_still_reports_every_group(self):
+        # One failure must not stop the rest of the checks from running.
+        findings = dd.assemble_findings(dd.collect(FakeRunner([])), {}, NOW)
+        self.assertEqual(set(dd.DOCTOR_GROUPS), {f.group for f in findings})
+
+
+class TestCmdDoctor(unittest.TestCase):
+    def run_doctor(self, argv, replies=HEALTHY_REPLIES):
+        args = dd.build_parser().parse_args(argv)
+        runner = FakeRunner(replies)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = dd.cmd_doctor(args, runner, now_epoch=NOW)
+        return code, buffer.getvalue(), runner
+
+    def test_a_healthy_box_prints_a_report_and_exits_zero(self):
+        code, text, _runner = self.run_doctor(["doctor", "--no-state"])
+        self.assertEqual(code, 0)
+        self.assertIn("selinux", text)
+        self.assertIn("All checks passed.", text)
+
+    def test_a_broken_box_exits_two_and_prints_the_setsebool_line(self):
+        code, text, _runner = self.run_doctor(["doctor", "--no-state"], BROKEN_REPLIES)
+        self.assertEqual(code, 2)
+        self.assertIn("setsebool -P httpd_can_network_connect on", text)
+
+    def test_a_group_filter_narrows_the_report(self):
+        _code, text, _runner = self.run_doctor(["doctor", "--no-state", "--selinux"])
+        self.assertIn("[selinux]", text)
+        self.assertNotIn("[disk]", text)
+
+    def test_it_records_a_sample_by_default(self):
+        _code, _text, runner = self.run_doctor(["doctor"])
+        self.assertEqual([path for path, _text in runner.writes], [dd.STATE_PATH])
+        self.assertIn("/", dd.parse_state(runner.writes[0][1]))
+
+    def test_no_state_writes_nothing_at_all(self):
+        _code, _text, runner = self.run_doctor(["doctor", "--no-state"])
+        self.assertEqual(runner.writes, [])
 
 
 if __name__ == "__main__":

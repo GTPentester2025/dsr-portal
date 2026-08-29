@@ -18,12 +18,16 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import calendar
 import collections
 import hashlib
+import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
+import time
 
 INSTALL_PREFIX = "/opt/dsr"
 WEB_ROOT = "/var/www/dsr"
@@ -775,6 +779,1260 @@ def deploy_steps(env: dict) -> list:
     ]
 
 
+# ---------------------------------------------------------------------------
+# doctor
+#
+# Every check is two pieces. A *collector* runs one command on the box and
+# hands back whatever it printed. An *evaluator* is a pure function from that
+# text to a list of Finding. Only the evaluators are tested, and they are
+# tested against captured-looking output pasted into the test file, because
+# an evaluator that shells out is an evaluator that cannot be tested.
+#
+# The reason this mode exists: deploy/smoke.mjs tests the portal from outside
+# over HTTPS, so it can report *that* the portal is broken but never *why*.
+# The commonest RHEL failure is a 502 whose only trace is one nginx line --
+# "Permission denied while connecting to upstream" -- which names neither
+# SELinux nor the boolean that would fix it.
+# ---------------------------------------------------------------------------
+
+DOCTOR_GROUPS = ("host", "disk", "database", "service", "web", "selinux")
+
+SELINUX_BOOLEAN = "httpd_can_network_connect"
+SELINUX_FIX = "setsebool -P %s on" % SELINUX_BOOLEAN
+
+
+def redact_url(text: str) -> str:
+    """Blank the password out of any connection string in `text`.
+
+    Command output reaches a Finding in a few places -- a psql error, an
+    nginx error -- and any of it can carry a URL with credentials. A finding
+    is printed, logged and pasted into chat; nothing in one may be a secret.
+    """
+    return re.sub(r"(://[^\s:/@]+):[^\s@]*@", r"\1:***@", text or "")
+
+
+def evaluate_selinux(getenforce: str, booleans: str, avc: str) -> list:
+    """Read `getenforce`, `getsebool` and `ausearch` output.
+
+    Nothing here ever suggests turning SELinux off. That is the fix people
+    reach for, it is wrong, and on a box holding scanned identity documents
+    it trades a five-second boolean for a permanent loss of confinement.
+    """
+    group = "selinux"
+    findings = []
+
+    mode = (getenforce or "").strip()
+    mode = mode.splitlines()[0].strip() if mode else ""
+    if mode == "Enforcing":
+        findings.append(Finding(group, OK, "SELinux is enforcing", "", ""))
+    elif mode == "Permissive":
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "SELinux is not enforcing",
+                "Denials are logged but allowed, so the portal appears to work "
+                "while its confinement does nothing. This box stores scanned "
+                "identity documents.",
+                "Clear the denials below, then restore enforcement: "
+                "setenforce 1, and SELINUX=enforcing in /etc/selinux/config",
+            )
+        )
+    elif mode == "Disabled":
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "SELinux is switched off entirely",
+                "No policy is loaded, so no denial is even recorded. This box "
+                "stores scanned identity documents.",
+                "Set SELINUX=enforcing in /etc/selinux/config, then: "
+                "touch /.autorelabel && reboot",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the SELinux mode",
+                "`getenforce` printed %s."
+                % (repr(mode) if mode else "nothing"),
+                "getenforce",
+            )
+        )
+
+    state = re.search(r"%s\s*-->\s*(on|off)" % SELINUX_BOOLEAN, booleans or "")
+    if state is None:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the %s boolean" % SELINUX_BOOLEAN,
+                "This is the one setting that decides whether nginx may reach "
+                "the app at all, so an unreadable answer is not a pass.",
+                "getsebool %s" % SELINUX_BOOLEAN,
+            )
+        )
+    elif state.group(1) == "off":
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "nginx is not allowed to connect to the app (%s is off)"
+                % SELINUX_BOOLEAN,
+                "Every request to the portal answers 502, and the only trace "
+                "is one nginx line: Permission denied while connecting to "
+                "upstream. It names neither SELinux nor this boolean, which "
+                "is why the failure is unguessable.",
+                SELINUX_FIX,
+            )
+        )
+    else:
+        findings.append(
+            Finding(group, OK, "%s is on" % SELINUX_BOOLEAN, "", "")
+        )
+
+    denials = [line for line in (avc or "").splitlines() if "denied" in line]
+    if denials:
+        who = sorted(set(re.findall(r'comm="([^"]+)"', avc or "")))
+        what = sorted(set(re.findall(r"\{\s*([a-z_]+(?:\s+[a-z_]+)*)\s*\}", avc or "")))
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "%d recent SELinux denial%s"
+                % (len(denials), "" if len(denials) == 1 else "s"),
+                "Blocked: %s. Process: %s. Something the portal needs is "
+                "being refused by policy."
+                % (", ".join(what) or "unknown", ", ".join(who) or "unknown"),
+                "ausearch -m avc -ts recent -i     "
+                "(then set the boolean the denial points at -- never a blanket "
+                "policy change)",
+            )
+        )
+    else:
+        findings.append(Finding(group, OK, "no recent SELinux denials", "", ""))
+
+    return findings
+
+
+# A service that is up but restarting every few seconds is a different
+# problem from one that is simply down, and it needs a different first move:
+# starting it again just feeds the loop.
+CRASH_LOOP_RESTARTS = 3
+
+# Journal lines are never quoted into a Finding -- a stack trace can print a
+# connection string with its password. Each signature is matched, and the
+# advice is written out here instead.
+_JOURNAL_SIGNATURES = (
+    (
+        "CRYPTO_MASTER_KEY",
+        "CRYPTO_MASTER_KEY is rejected at startup",
+        "The API validates the key before it listens and exits if it is "
+        "wrong, so systemd restarts it forever and nginx proxies the public "
+        "form to a dead port.",
+        "The key must base64-decode to exactly 32 bytes: openssl rand "
+        "-base64 32. A 64-character hex string is the usual mistake.",
+    ),
+    (
+        "EADDRINUSE",
+        "port %d is already taken" % APP_PORT,
+        "Another process is bound to the port the API wants, so it exits "
+        "immediately.",
+        "ss -lntp | grep %d" % APP_PORT,
+    ),
+    (
+        "password authentication failed",
+        "the database refused the API's password",
+        "RHEL's stock pg_hba.conf answers loopback connections with `ident`, "
+        "under which a password authenticates against nothing.",
+        "Make the 127.0.0.1/32 and ::1/128 host rows in %s use scram-sha-256, "
+        "then: systemctl reload postgresql" % PG_HBA_REMOTE,
+    ),
+    (
+        "no pg_hba.conf entry",
+        "pg_hba.conf has no rule for the API's connection",
+        "Postgres rejected the connection before checking any password.",
+        "Add a host rule for 127.0.0.1/32 with scram-sha-256 in %s, then: "
+        "systemctl reload postgresql" % PG_HBA_REMOTE,
+    ),
+    (
+        "ECONNREFUSED",
+        "the API could not reach something it depends on",
+        "A connection was refused outright at startup; postgres not running "
+        "is the usual reason.",
+        "systemctl status postgresql",
+    ),
+    (
+        "GRAPH_",
+        "the Graph mailer is not configured",
+        "Email is environment-owned: with a credential missing the API exits "
+        "at boot rather than starting unable to reach a data subject.",
+        "Fill in PRIVACY_MAILBOX and the three GRAPH_ values, then redeploy.",
+    ),
+)
+
+_JOURNAL_ERROR = re.compile(r"\b(error|fatal|exception|failed)\b", re.IGNORECASE)
+
+
+def evaluate_service(is_active: str, show_output: str, journal: str) -> list:
+    """Read `systemctl is-active`, `systemctl show -p NRestarts` and the journal."""
+    group = "service"
+    findings = []
+
+    state = (is_active or "").strip()
+    state = state.splitlines()[0].strip() if state else ""
+    if state == "active":
+        findings.append(Finding(group, OK, "%s is active" % SERVICE, "", ""))
+    elif state in ("activating", "deactivating", "reloading"):
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "%s is %s, not running" % (SERVICE, state),
+                "systemd caught it mid-cycle; on a settled box this state "
+                "does not persist.",
+                "journalctl -u %s -n 50 --no-pager" % SERVICE,
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "%s is not running (%s)" % (SERVICE, state or "state unknown"),
+                "nginx has nothing to proxy to, so every request to the "
+                "portal answers 502.",
+                "systemctl start %s, then journalctl -u %s -n 50 --no-pager"
+                % (SERVICE, SERVICE),
+            )
+        )
+
+    counter = re.search(r"NRestarts=(\d+)", show_output or "")
+    if counter is None:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the restart counter",
+                "Without NRestarts a crash loop is indistinguishable from a "
+                "healthy service, because systemd reports `active` for most "
+                "of each restart cycle.",
+                "systemctl show %s -p NRestarts" % SERVICE,
+            )
+        )
+    else:
+        restarts = int(counter.group(1))
+        if restarts >= CRASH_LOOP_RESTARTS:
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "%s has restarted %d times (crash loop)" % (SERVICE, restarts),
+                    "It exits on startup and systemd starts it again every few "
+                    "seconds, so `is-active` calls it healthy. Starting it "
+                    "again will not help; the env file is the usual cause.",
+                    "journalctl -u %s -n 50 --no-pager, then check %s"
+                    % (SERVICE, ENV_PATH),
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    group,
+                    OK,
+                    "%s has restarted %d time%s"
+                    % (SERVICE, restarts, "" if restarts == 1 else "s"),
+                    "",
+                    "",
+                )
+            )
+
+    text = journal or ""
+    matched = False
+    for needle, title, detail, fix in _JOURNAL_SIGNATURES:
+        if needle in text:
+            matched = True
+            findings.append(Finding(group, FAIL, title, detail, fix))
+    if not matched:
+        noisy = [line for line in text.splitlines() if _JOURNAL_ERROR.search(line)]
+        if noisy:
+            findings.append(
+                Finding(
+                    group,
+                    WARN,
+                    "%d error line%s in the last 25 journal lines"
+                    % (len(noisy), "" if len(noisy) == 1 else "s"),
+                    "Not quoted here: a journal line can contain a connection "
+                    "string with its password.",
+                    "journalctl -u %s -n 50 --no-pager" % SERVICE,
+                )
+            )
+        else:
+            findings.append(
+                Finding(group, OK, "no errors in the recent journal", "", "")
+            )
+
+    return findings
+
+
+# NODE_ENV and PORT are here because the unit file does not set them and the
+# API reads them at startup; the two DATABASE_URLs because the app connects
+# as the unprivileged role so row-level security applies to it.
+_ENV_REQUIRED = (
+    "NODE_ENV",
+    "PORT",
+    "DATABASE_URL",
+    "DATABASE_URL_APP",
+    "CRYPTO_MASTER_KEY",
+)
+
+
+def evaluate_env(env_text: str, mode: str) -> list:
+    """Read the service .env and its permissions.
+
+    Re-uses validate_master_key and validate_email_config rather than
+    restating their rules: a second implementation of the 32-byte check is a
+    second place for it to drift.
+
+    Nothing read out of this file is ever placed in a Finding. It holds the
+    crypto master key and two database passwords, and findings get printed,
+    logged and pasted into chat.
+    """
+    group = "service"
+    if not (env_text or "").strip():
+        return [
+            Finding(
+                group,
+                FAIL,
+                "%s is missing or unreadable" % ENV_PATH,
+                "The API has no database URL, no key and no mailer, so it "
+                "exits at boot.",
+                "Run a deploy: it writes this file from deploy/.secrets.env.",
+            )
+        ]
+
+    findings = []
+    digits = (mode or "").strip()
+    if not digits.isdigit():
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the permissions of %s" % ENV_PATH,
+                "`stat -c %%a` printed %s." % (repr(digits) if digits else "nothing"),
+                "stat -c %%a %s" % ENV_PATH,
+            )
+        )
+    else:
+        perms = digits[-3:].zfill(3)
+        if perms[1:] != "00":
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "%s is mode %s -- readable beyond its owner" % (ENV_PATH, perms),
+                    "It holds the crypto master key and both database "
+                    "passwords. Every local account can read it.",
+                    "chown dsr:dsr %s && chmod 600 %s" % (ENV_PATH, ENV_PATH),
+                )
+            )
+        else:
+            findings.append(
+                Finding(group, OK, "%s is mode %s (owner only)" % (ENV_PATH, perms), "", "")
+            )
+
+    env = parse_env_text(env_text)
+    missing = [key for key in _ENV_REQUIRED if not (env.get(key) or "").strip()]
+    if missing:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "%d required setting%s missing from the env file"
+                % (len(missing), " is" if len(missing) == 1 else "s are"),
+                "Missing: %s." % " ".join(missing),
+                "Add them to deploy/.secrets.env and redeploy.",
+            )
+        )
+    else:
+        findings.append(
+            Finding(group, OK, "every required setting is present", "", "")
+        )
+
+    raw = env.get("CRYPTO_MASTER_KEY", "")
+    if raw.strip():
+        try:
+            validate_master_key(raw)
+        except SecretsError as exc:
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "CRYPTO_MASTER_KEY will not load",
+                    str(exc),
+                    "openssl rand -base64 32 -- but note that every stored "
+                    "ciphertext was written under the key the API booted "
+                    "with, so replacing it is not a free action.",
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    group,
+                    OK,
+                    "CRYPTO_MASTER_KEY decodes to 32 bytes",
+                    "fingerprint %s (a hash of the key, not the key)"
+                    % key_fingerprint(raw),
+                    "",
+                )
+            )
+
+    try:
+        warnings = validate_email_config(env)
+    except SecretsError as exc:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "the mailer is misconfigured and the API will exit at boot",
+                str(exc),
+                "Fix EMAIL_PROVIDER and the GRAPH_ values in "
+                "deploy/.secrets.env, then redeploy.",
+            )
+        )
+    else:
+        for warning in warnings:
+            findings.append(
+                Finding(
+                    group,
+                    WARN,
+                    "the mailer will not send",
+                    warning,
+                    "Set EMAIL_PROVIDER=graph with the four Graph values.",
+                )
+            )
+        if not warnings:
+            findings.append(
+                Finding(group, OK, "the Graph mailer is fully configured", "", "")
+            )
+
+    for key in ("DATABASE_URL", "DATABASE_URL_APP"):
+        value = (env.get(key) or "").strip()
+        if not value:
+            continue
+        if not value.startswith("postgres://") and not value.startswith("postgresql://"):
+            findings.append(
+                Finding(
+                    group,
+                    WARN,
+                    "%s does not look like a postgres URL" % key,
+                    "node-postgres will not parse it.",
+                    "postgres://user:password@127.0.0.1:5432/dsr",
+                )
+            )
+        else:
+            findings.append(
+                Finding(group, OK, "%s -> %s" % (key, redact_url(value)), "", "")
+            )
+
+    cookie = (env.get("COOKIE_SECURE") or "").strip().lower()
+    if cookie and cookie != "true":
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "COOKIE_SECURE is %s" % cookie,
+                "The admin session cookie will be sent over plain HTTP.",
+                "COOKIE_SECURE=true, once TLS is installed.",
+            )
+        )
+
+    node_env = (env.get("NODE_ENV") or "").strip()
+    if node_env and node_env != "production":
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "NODE_ENV is %s, not production" % node_env,
+                "Development paths behave differently and some guards are off.",
+                "NODE_ENV=production",
+            )
+        )
+
+    return findings
+
+
+# The paths whose filesystem is worth watching. Two of them usually share a
+# mount, which is exactly why mount_for resolves each one rather than
+# assuming a layout.
+DISK_WATCH = (INSTALL_PREFIX, UPLOADS_DIR, WEB_ROOT, "/var/lib/pgsql", "/var/log")
+
+DISK_FAIL_FRACTION = 0.05
+DISK_WARN_FRACTION = 0.15
+DISK_FAIL_BYTES = 512 * 1024 * 1024
+DISK_WARN_BYTES = 2 * 1024 * 1024 * 1024
+
+DISK_FIX = (
+    "journalctl --vacuum-size=100M; npm cache clean --force; "
+    "check %s for orphaned uploads" % UPLOADS_DIR
+)
+
+
+def evaluate_disk(df_text: str, samples: dict) -> list:
+    """Report free space per watched mount, and growth where there is a baseline.
+
+    `samples` is the recorded history: mountpoint -> [[epoch, used], ...].
+    With fewer than two readings this says so rather than inventing a rate.
+    """
+    group = "disk"
+    mounts = parse_df(df_text or "")
+    if not mounts:
+        return [
+            Finding(
+                group,
+                WARN,
+                "could not read the filesystem table",
+                "`df -PB1` printed nothing this tool could parse.",
+                "df -PB1",
+            )
+        ]
+
+    watched = []
+    seen = set()
+    for path in DISK_WATCH:
+        found = mount_for(path, mounts)
+        if found is not None and found.mountpoint not in seen:
+            seen.add(found.mountpoint)
+            watched.append(found)
+    if not watched:
+        watched = mounts[:1]
+
+    findings = []
+    for mount in watched:
+        fraction = float(mount.free) / mount.total if mount.total else 0.0
+        if fraction < DISK_FAIL_FRACTION or mount.free < DISK_FAIL_BYTES:
+            severity = FAIL
+        elif fraction < DISK_WARN_FRACTION or mount.free < DISK_WARN_BYTES:
+            severity = WARN
+        else:
+            severity = OK
+        title = "%s has %s free (%d%% of %s)" % (
+            mount.mountpoint,
+            human_bytes(mount.free),
+            round(fraction * 100),
+            human_bytes(mount.total),
+        )
+        if severity == OK:
+            findings.append(Finding(group, severity, title, "", ""))
+        else:
+            findings.append(
+                Finding(
+                    group,
+                    severity,
+                    title,
+                    "A full filesystem stops postgres writing and stops the "
+                    "portal accepting an upload, and both fail late.",
+                    DISK_FIX,
+                )
+            )
+
+    for mount in watched:
+        series = (samples or {}).get(mount.mountpoint) or []
+        if len(series) < 2:
+            findings.append(
+                Finding(
+                    group,
+                    OK,
+                    "no growth baseline for %s yet" % mount.mountpoint,
+                    "doctor records one reading per run and a projection "
+                    "needs two, so there is no rate to report.",
+                    "",
+                )
+            )
+            continue
+        left = project_days_until_full(series, mount.free)
+        if left is None:
+            findings.append(
+                Finding(
+                    group,
+                    OK,
+                    "%s is not growing" % mount.mountpoint,
+                    "Usage is flat or falling across the recorded readings.",
+                    "",
+                )
+            )
+        elif left < 7:
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "%s fills in about %.0f days at the current rate"
+                    % (mount.mountpoint, left),
+                    "Measured between the first and last recorded readings.",
+                    DISK_FIX,
+                )
+            )
+        elif left < 30:
+            findings.append(
+                Finding(
+                    group,
+                    WARN,
+                    "%s fills in about %.0f days at the current rate"
+                    % (mount.mountpoint, left),
+                    "Measured between the first and last recorded readings.",
+                    DISK_FIX,
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    group,
+                    OK,
+                    "%s has about %.0f days of headroom at the current rate"
+                    % (mount.mountpoint, left),
+                    "",
+                    "",
+                )
+            )
+
+    return findings
+
+
+# openssl prints English month abbreviations whatever the box's locale is,
+# while time.strptime("%b") follows LC_TIME and silently stops matching under
+# a non-English one. Spelling the months out keeps this readable anywhere.
+_MONTHS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
+_NOT_AFTER = re.compile(
+    r"notAfter\s*=\s*(\w{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})"
+)
+
+
+def _parse_openssl_date(text: str):
+    """`notAfter=Sep 10 00:00:00 2026 GMT` -> epoch seconds, or None."""
+    found = _NOT_AFTER.search(text or "")
+    if found is None:
+        return None
+    month = _MONTHS.get(found.group(1))
+    if month is None:
+        return None
+    return calendar.timegm(
+        (
+            int(found.group(6)),
+            month,
+            int(found.group(2)),
+            int(found.group(3)),
+            int(found.group(4)),
+            int(found.group(5)),
+            0,
+            0,
+            0,
+        )
+    )
+
+
+def evaluate_tls(cert_dates: str, now_epoch: int) -> list:
+    """Read `openssl x509 -enddate -noout` output against a clock."""
+    group = "web"
+    text = (cert_dates or "").strip()
+    if not text:
+        return [
+            Finding(
+                group,
+                WARN,
+                "no TLS certificate is installed",
+                "The portal is served over plain HTTP: session cookies and "
+                "uploaded identity documents cross the network in the clear.",
+                "deploy/enable-tls.sh, or deploy/enable-tls-ip.sh for a host "
+                "with no domain name",
+            )
+        ]
+
+    expiry = _parse_openssl_date(text)
+    if expiry is None:
+        return [
+            Finding(
+                group,
+                WARN,
+                "could not read the certificate expiry date",
+                "`openssl x509 -enddate -noout` printed something this tool "
+                "does not recognise.",
+                "openssl x509 -enddate -noout -in "
+                "/etc/letsencrypt/live/<name>/cert.pem",
+            )
+        ]
+
+    days = (expiry - now_epoch) / 86400.0
+    if days < 0:
+        return [
+            Finding(
+                group,
+                FAIL,
+                "the TLS certificate expired %d days ago" % int(-days),
+                "Browsers refuse the portal outright, and a data subject "
+                "following an emailed link sees a security warning.",
+                "certbot renew --force-renewal && systemctl reload nginx",
+            )
+        ]
+    if days < 14:
+        return [
+            Finding(
+                group,
+                WARN,
+                "the TLS certificate expires in %d days" % int(days),
+                "Renewal is normally automatic; this close to the date it "
+                "has not happened.",
+                "systemctl list-timers | grep certbot, then: certbot renew",
+            )
+        ]
+    return [
+        Finding(
+            group,
+            OK,
+            "the TLS certificate is valid for another %d days" % int(days),
+            "",
+            "",
+        )
+    ]
+
+
+_PG_ERROR_MARKERS = (
+    "psql: error",
+    "FATAL:",
+    "ERROR:",
+    "could not connect",
+    "Connection refused",
+)
+
+
+def _psql_error(text: str):
+    """The first line of a psql failure, with any password removed."""
+    for marker in _PG_ERROR_MARKERS:
+        if marker in (text or ""):
+            return redact_url(text.strip().splitlines()[0])
+    return None
+
+
+def evaluate_database(psql_roles: str, migrations_applied: str, migration_files: list) -> list:
+    """Compare the roles and the applied migrations against what should be there.
+
+    stdlib Python has no Postgres driver, so both inputs are `psql -tAc`
+    output rather than query results.
+    """
+    group = "database"
+    findings = []
+
+    roles_text = psql_roles or ""
+    error = _psql_error(roles_text)
+    if error is not None:
+        if "password authentication failed" in roles_text or "no pg_hba.conf entry" in roles_text:
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "the database refused the connection",
+                    "%s  RHEL's stock pg_hba.conf answers loopback with "
+                    "`ident`, under which a password authenticates against "
+                    "nothing -- Debian's default allowed password auth, which "
+                    "is why this never came up before." % error,
+                    "Make the 127.0.0.1/32 and ::1/128 host rows in %s use "
+                    "scram-sha-256, then: systemctl reload postgresql"
+                    % PG_HBA_REMOTE,
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "could not query the database",
+                    error,
+                    "systemctl status postgresql",
+                )
+            )
+    elif not roles_text.strip():
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "could not read the portal's database roles",
+                "psql returned nothing at all, so the database is either "
+                "down or unreachable from here.",
+                "systemctl status postgresql",
+            )
+        )
+    else:
+        names = set(line.strip() for line in roles_text.splitlines() if line.strip())
+        absent = [role for role in ("dsr", "dsr_app") if role not in names]
+        if absent:
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "database role%s missing: %s"
+                    % ("" if len(absent) == 1 else "s", " ".join(absent)),
+                    "dsr owns the schema; dsr_app is the unprivileged role the "
+                    "API connects as, so that row-level security applies to it.",
+                    "python3 deploy/dsr_deploy.py provision",
+                )
+            )
+        else:
+            findings.append(
+                Finding(group, OK, "both database roles exist", "", "")
+            )
+
+    applied_text = migrations_applied or ""
+    files = [name.strip() for name in (migration_files or []) if name.strip().endswith(".sql")]
+    error = _psql_error(applied_text)
+    if error is not None and "schema_migrations" in applied_text:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "the schema_migrations table does not exist",
+                "No migration has ever run here, so the API is talking to an "
+                "empty or foreign schema and every query fails.",
+                "cd %s/server && set -a && . ./.env && set +a && "
+                "node scripts/migrate.mjs" % INSTALL_PREFIX,
+            )
+        )
+    elif error is not None:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "could not read the applied migrations",
+                error,
+                "cd %s/server && set -a && . ./.env && set +a && "
+                "node scripts/migrate.mjs" % INSTALL_PREFIX,
+            )
+        )
+    elif not files:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not list the migration files",
+                "`ls %s/server/drizzle` returned nothing, so the applied set "
+                "cannot be compared with anything." % INSTALL_PREFIX,
+                "",
+            )
+        )
+    else:
+        applied = set(line.strip() for line in applied_text.splitlines() if line.strip())
+        pending = [name for name in files if name not in applied]
+        ahead = sorted(applied - set(files))
+        if pending:
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "%d migration%s not applied"
+                    % (len(pending), " is" if len(pending) == 1 else "s are"),
+                    "Pending: %s." % " ".join(pending),
+                    "cd %s/server && set -a && . ./.env && set +a && "
+                    "node scripts/migrate.mjs" % INSTALL_PREFIX,
+                )
+            )
+        elif ahead:
+            findings.append(
+                Finding(
+                    group,
+                    WARN,
+                    "the database is ahead of the deployed code",
+                    "Applied here but not present on disk: %s. The build on "
+                    "this box is older than its schema." % " ".join(ahead),
+                    "Deploy the current build.",
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    group, OK, "all %d migrations are applied" % len(files), "", ""
+                )
+            )
+
+    return findings
+
+
+def evaluate_web(nginx_t: str, listeners: str) -> list:
+    """Read `nginx -t` and `ss -lntp`."""
+    group = "web"
+    findings = []
+
+    text = nginx_t or ""
+    if "duplicate default server" in text:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "nginx has two default servers and will not start",
+                "RHEL keeps its stock `listen 80 default_server` block inside "
+                "/etc/nginx/nginx.conf itself rather than in a file you can "
+                "delete, and conf.d/dsr.conf declares another one.",
+                "python3 deploy/dsr_deploy.py provision edits the stock block "
+                "out; then: nginx -t && systemctl reload nginx",
+            )
+        )
+    elif "test is successful" in text:
+        findings.append(Finding(group, OK, "nginx accepts its configuration", "", ""))
+    elif not text.strip():
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not run nginx -t",
+                "The configuration may or may not be valid; nothing was "
+                "printed.",
+                "nginx -t",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "nginx rejects its configuration",
+                redact_url(text.strip().splitlines()[0]),
+                "nginx -t",
+            )
+        )
+
+    if not (listeners or "").strip():
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the listening sockets",
+                "`ss -lntp` printed nothing, so no port could be checked.",
+                "ss -lntp",
+            )
+        )
+        return findings
+
+    ports = set(int(port) for port in re.findall(r":(\d+)\s", listeners))
+    if APP_PORT not in ports:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "nothing is listening on port %d" % APP_PORT,
+                "nginx proxies to 127.0.0.1:%d; with nothing there every "
+                "request answers 502." % APP_PORT,
+                "systemctl status %s" % SERVICE,
+            )
+        )
+    else:
+        findings.append(
+            Finding(group, OK, "the API is listening on %d" % APP_PORT, "", "")
+        )
+
+    if 80 not in ports:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "nginx is not listening on port 80",
+                "The portal is unreachable, and certbot's HTTP challenge "
+                "cannot complete either.",
+                "nginx -t && systemctl status nginx",
+            )
+        )
+    else:
+        findings.append(Finding(group, OK, "nginx is listening on 80", "", ""))
+
+    if 443 not in ports:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "nothing is listening on 443",
+                "The portal is HTTP-only, so identity documents are uploaded "
+                "in the clear.",
+                "deploy/enable-tls.sh",
+            )
+        )
+    else:
+        findings.append(Finding(group, OK, "nginx is listening on 443", "", ""))
+
+    return findings
+
+
+def _version_number(text: str) -> str:
+    """The dotted number out of `v22.11.0` or `psql (PostgreSQL) 16.2`."""
+    found = re.search(r"(\d+(?:\.\d+)*)", text or "")
+    return found.group(1) if found else (text or '').strip()
+
+
+NODE_MINIMUM = "22"
+POSTGRES_MINIMUM = "16"
+
+
+def evaluate_host(os_release: str, node_version: str, psql_version: str) -> list:
+    """Read /etc/os-release and the two runtime versions."""
+    group = "host"
+    findings = []
+
+    text = os_release or ""
+    if "platform:el9" in text:
+        findings.append(Finding(group, OK, "the host is RHEL 9", "", ""))
+    elif not text.strip():
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read /etc/os-release",
+                "Nothing else here assumes a distribution, but a surprise "
+                "here usually explains the rest.",
+                "cat /etc/os-release",
+            )
+        )
+    else:
+        named = re.search(r'PRETTY_NAME="([^"]*)"', text)
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "this host does not look like RHEL 9",
+                "/etc/os-release says %s. The paths this tool uses -- "
+                "/var/lib/pgsql/data, /etc/nginx/conf.d -- are RHEL's."
+                % (named.group(1) if named else "something else"),
+                "",
+            )
+        )
+
+    for label, actual, minimum, install in (
+        ("Node", node_version, NODE_MINIMUM,
+         "dnf module enable -y nodejs:22 && dnf install -y nodejs"),
+        ("PostgreSQL", psql_version, POSTGRES_MINIMUM,
+         "dnf module enable -y postgresql:16 && dnf install -y postgresql-server"),
+    ):
+        got = (actual or "").strip()
+        if version_at_least(got, minimum):
+            findings.append(
+                Finding(
+                    group, OK, "%s %s is installed" % (label, _version_number(got)), "", ""
+                )
+            )
+        elif got:
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "%s %s or newer is required; this host has %s"
+                    % (label, minimum, _version_number(got)),
+                    "",
+                    install,
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    group,
+                    FAIL,
+                    "%s is not installed, or not on PATH" % label,
+                    "",
+                    install,
+                )
+            )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# doctor: collectors, state and the command itself
+# ---------------------------------------------------------------------------
+
+# Read-only, every one of them. doctor changes nothing on the box: no
+# service, no config, no database row, no uploaded file. The only thing it
+# writes anywhere is the disk sample below, and --no-state suppresses that.
+DOCTOR_COMMANDS = (
+    ("os_release", "cat /etc/os-release"),
+    ("node_version", "node -v 2>&1"),
+    ("psql_version", "psql --version 2>&1"),
+    ("getenforce", "getenforce 2>&1"),
+    ("sebool", "getsebool %s 2>&1" % SELINUX_BOOLEAN),
+    # ausearch exits 1 when the audit log holds no denials, which is the good
+    # case and not an error.
+    ("avc", "ausearch -m avc -ts recent 2>/dev/null"),
+    ("is_active", "systemctl is-active %s" % SERVICE),
+    ("nrestarts", "systemctl show %s -p NRestarts" % SERVICE),
+    ("journal", "journalctl -u %s -n 25 --no-pager 2>&1" % SERVICE),
+    ("df", "df -PB1"),
+    ("env_mode", "stat -c %%a %s 2>/dev/null" % ENV_PATH),
+    ("env_text", "cat %s 2>/dev/null" % ENV_PATH),
+    (
+        "psql_roles",
+        "sudo -u postgres psql -tAc \"SELECT rolname FROM pg_roles WHERE "
+        "rolname IN ('dsr', 'dsr_app') ORDER BY rolname\" 2>&1",
+    ),
+    (
+        "migrations",
+        "sudo -u postgres psql -d dsr -tAc 'SELECT name FROM "
+        "schema_migrations ORDER BY name' 2>&1",
+    ),
+    ("migration_files", "ls %s/server/drizzle 2>/dev/null" % INSTALL_PREFIX),
+    (
+        "cert",
+        "DSR_CERT=$(ls /etc/letsencrypt/live/*/fullchain.pem 2>/dev/null | head -1); "
+        "[ -n \"$DSR_CERT\" ] && openssl x509 -enddate -noout -in \"$DSR_CERT\"",
+    ),
+    ("nginx_t", "nginx -t 2>&1"),
+    ("listeners", "ss -lntp 2>&1"),
+)
+
+
+class LocalRunner:
+    """Runs collectors on this machine -- what `doctor --remote` uses.
+
+    A collector that fails is not an error. `ausearch -m avc -ts recent`
+    exits 1 when there are no denials, which is the good case, and a missing
+    binary is itself something an evaluator reports. Whatever the command
+    managed to print is the answer.
+    """
+
+    def run(self, command: str) -> str:
+        try:
+            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        except OSError:
+            return ""
+        return result.stdout
+
+    def write(self, path: str, text: str) -> None:
+        try:
+            destination = pathlib.Path(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(text)
+        except OSError:
+            # A read-only /var is a reason to skip the sample, not to fail
+            # the diagnosis the operator asked for.
+            pass
+
+
+class SshRunner:
+    """Runs collectors on the target over ssh; evaluation stays local."""
+
+    def __init__(self, ssh: "Ssh"):
+        self.ssh = ssh
+
+    def run(self, command: str) -> str:
+        return self.ssh.run(command, check=False).stdout
+
+    def write(self, path: str, text: str) -> None:
+        directory = path.rsplit("/", 1)[0]
+        self.ssh.run(
+            "mkdir -p '%s' && %s"
+            % (directory, _cat_heredoc_command(path, text, "DSR_STATE")),
+            check=False,
+        )
+
+
+def collect(runner) -> dict:
+    """Run every collector, keyed by name. Nothing is interpreted here."""
+    return dict((name, runner.run(command)) for name, command in DOCTOR_COMMANDS)
+
+
+def parse_state(text: str) -> dict:
+    """The recorded samples, or {} for anything unreadable."""
+    try:
+        data = json.loads(text or "")
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    samples = data.get("samples")
+    return samples if isinstance(samples, dict) else {}
+
+
+def render_state(samples: dict) -> str:
+    return json.dumps({"version": 1, "samples": samples}, sort_keys=True) + "\n"
+
+
+def update_samples(samples: dict, mounts: list, now_epoch: int, keep: int = 30) -> dict:
+    """Append one used-bytes reading per mount, keeping the last `keep`.
+
+    Used is derived as total - free rather than read from df's Used column,
+    which excludes root-reserved blocks. The absolute number matters less
+    than that every sample is measured the same way.
+    """
+    updated = dict((key, list(value)) for key, value in (samples or {}).items())
+    for mount in mounts:
+        series = updated.setdefault(mount.mountpoint, [])
+        series.append([int(now_epoch), int(mount.total - mount.free)])
+        del series[:-keep]
+    return updated
+
+
+def assemble_findings(capture: dict, samples: dict, now_epoch: int) -> list:
+    """Every evaluator, over one capture. Pure: no command runs here."""
+    def get(name):
+        return capture.get(name, "") or ""
+
+    findings = []
+    findings += evaluate_host(get("os_release"), get("node_version"), get("psql_version"))
+    findings += evaluate_selinux(get("getenforce"), get("sebool"), get("avc"))
+    findings += evaluate_service(get("is_active"), get("nrestarts"), get("journal"))
+    findings += evaluate_env(get("env_text"), get("env_mode"))
+    findings += evaluate_disk(get("df"), samples)
+    findings += evaluate_database(
+        get("psql_roles"),
+        get("migrations"),
+        [line.strip() for line in get("migration_files").splitlines() if line.strip()],
+    )
+    findings += evaluate_tls(get("cert"), now_epoch)
+    findings += evaluate_web(get("nginx_t"), get("listeners"))
+    return findings
+
+
+def cmd_doctor(args, runner, now_epoch=None) -> int:
+    """Collect, evaluate, print, and exit 0/1/2 on the worst severity seen."""
+    if now_epoch is None:
+        now_epoch = int(time.time())
+    capture = collect(runner)
+
+    no_state = getattr(args, "no_state", False)
+    samples = {} if no_state else parse_state(runner.run("cat %s 2>/dev/null" % STATE_PATH))
+
+    findings = assemble_findings(capture, samples, now_epoch)
+    selected = [group for group in DOCTOR_GROUPS if getattr(args, group, False)]
+    if selected:
+        findings = [f for f in findings if f.group in selected]
+
+    if not no_state:
+        runner.write(
+            STATE_PATH,
+            render_state(update_samples(samples, parse_df(capture.get("df", "")), now_epoch)),
+        )
+
+    sys.stdout.write(render_findings(findings))
+    return exit_code_for(findings)
+
+
+TARGET_ENV_LOCAL = _DEPLOY_DIR / ".target.env"
+
+
+def doctor_runner(args):
+    """Local when already on the box, ssh otherwise. Evaluation is always local."""
+    if getattr(args, "remote", False):
+        return LocalRunner()
+    if not TARGET_ENV_LOCAL.exists():
+        raise SecretsError(
+            "No ssh target. Copy deploy/target.example.env to deploy/.target.env, "
+            "or run this on the box itself with --remote."
+        )
+    target = load_target(TARGET_ENV_LOCAL.read_text())
+    host = (target.get("HOST") or "").strip()
+    if not host:
+        raise SecretsError("deploy/.target.env has no HOST (or DEPLOY_HOST).")
+    key = (target.get("SSH_KEY") or "").strip() or os.path.expanduser("~/.ssh/id_ed25519")
+    return SshRunner(Ssh(host, key))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dsr_deploy.py",
@@ -802,7 +2060,7 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="do not record this run's measurements (no growth projection)",
             )
-            for group in ("host", "disk", "database", "service", "web", "selinux"):
+            for group in DOCTOR_GROUPS:
                 p.add_argument(
                     "--" + group,
                     action="store_true",
@@ -820,7 +2078,7 @@ def main(argv: list) -> int:
         return 2
     args = build_parser().parse_args(argv)
 
-    # Executing steps for real -- picking a target, pushing this file to the
+    # Executing provision/deploy steps for real -- pushing this file to the
     # box, running Ssh.run over each Step -- is the next task's job. What is
     # already true is that the plan is data, so a dry run can print it now
     # without touching a host.
@@ -834,7 +2092,18 @@ def main(argv: list) -> int:
             "use --dry-run to see the plan.\n" % args.command
         )
         return 1
-    return 0
+
+    if args.dry_run:
+        sys.stdout.write(
+            render_plan([Step(name, command) for name, command in DOCTOR_COMMANDS])
+        )
+        return 0
+    try:
+        runner = doctor_runner(args)
+    except SecretsError as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 2
+    return cmd_doctor(args, runner)
 
 
 if __name__ == "__main__":
