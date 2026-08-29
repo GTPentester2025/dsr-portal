@@ -10,6 +10,7 @@ import {
   users,
 } from '../db/schema';
 import { CryptoService } from '../crypto/crypto.service';
+import { cursorClause, nextCursor, type Cursor } from './keyset';
 
 export interface CaseListQuery {
   status?: string;
@@ -151,18 +152,43 @@ export class CasesService {
   }
 
   /**
-   * Every case matching the filters, unpaged, for CSV. Capped so one click
-   * cannot pull an unbounded result set into memory.
+   * Every case matching the filters, yielded a batch at a time.
+   *
+   * The old implementation capped at 10,000 rows and built the whole array in
+   * memory, so a larger filter silently exported a prefix -- an operator had no
+   * way to know the file was short. Batching by keyset bounds memory to one
+   * batch and removes the cap.
+   *
+   * Each batch is its own short transaction, so an export is not a consistent
+   * snapshot: a case created mid-export may or may not appear. For an
+   * operational CSV that is the right trade against holding one transaction
+   * open for the length of a large download.
    */
-  async exportRows(ctx: ZoneContext, q: CaseListQuery) {
-    return this.db.withContext(ctx, async (_db, client) => {
-      const { sql: filterSql, params } = listFilters(q);
-      const rows = await client.query(
-        `${LIST_SELECT} ${filterSql} ORDER BY c.created_at DESC, c.id DESC LIMIT 10000`,
-        params,
+  async *streamExportRows(ctx: ZoneContext, q: CaseListQuery, batchSize = 1000) {
+    let cursor: Cursor | null = null;
+    for (;;) {
+      const batch: ReturnType<typeof this.shapeListRow>[] = await this.db.withContext(
+        ctx,
+        async (_db, client) => {
+          const { sql: filterSql, params } = listFilters(q);
+          const keyset = cursorClause(cursor, params.length + 1);
+          const rows = await client.query(
+            `${LIST_SELECT} ${filterSql}${keyset.sql}
+              ORDER BY c.created_at DESC, c.id DESC
+              LIMIT ${batchSize}`,
+            [...params, ...keyset.params],
+          );
+          return rows.rows.map((r) => this.shapeListRow(r));
+        },
+        // An export legitimately outlives an interactive query. Each batch is
+        // its own transaction, so this is a per-batch budget, not a total.
+        { statementTimeoutMs: 60_000 },
       );
-      return rows.rows.map((r) => this.shapeListRow(r));
-    });
+      if (batch.length === 0) return;
+      yield batch;
+      cursor = nextCursor(batch as { createdAt: unknown; id: string }[]);
+      if (batch.length < batchSize) return;
+    }
   }
 
   async detail(ctx: ZoneContext, id: string) {
@@ -309,3 +335,12 @@ export class CasesService {
     }
   }
 }
+
+/**
+ * One case as the list and the CSV export see it.
+ *
+ * Derived from the shaping rather than written out a second time: a
+ * hand-copied interface is free to drift from the columns the export
+ * actually contains.
+ */
+export type CaseListRow = ReturnType<CasesService['shapeListRow']>;

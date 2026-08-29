@@ -1,7 +1,9 @@
-import { BadRequestException, Body, Controller, Get, Ip, Param, ParseUUIDPipe, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Ip, Logger, Param, ParseUUIDPipe, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { Response } from 'express';
-import { toCsv, csvFilename } from '../cases/csv';
+import { toCsv, csvFilename, type CsvColumn } from '../cases/csv';
+import { streamCsv } from '../cases/csv-stream';
+import { cursorClause, nextCursor, type Cursor } from '../cases/keyset';
 import { AuthService } from '../auth/auth.service';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { DbService } from '../db/db.module';
@@ -16,6 +18,8 @@ const ZONES = new Set(['EUR', 'SAZ', 'MAZ']);
 @Controller('internal/admin')
 @UseGuards(AuthGuard)
 export class AdminUsersController {
+  private readonly log = new Logger(AdminUsersController.name);
+
   constructor(
     private readonly db: DbService,
     private readonly audit: AuditService,
@@ -274,33 +278,20 @@ export class AdminUsersController {
     return csv;
   }
 
-  /** The audit trail as a spreadsheet, for evidencing to a regulator. */
+  /**
+   * The audit trail as a spreadsheet, for evidencing to a regulator.
+   *
+   * Streamed in batches. The previous version stopped at 10,000 rows without
+   * saying so, which for an evidence pack is the one failure that matters.
+   */
   @Get('audit-log/export.csv')
   @Requires('audit.read')
   async exportAudit(
-    @Res({ passthrough: true }) res: Response,
+    @Res() res: Response,
     @Query('entityType') entityType?: string,
     @Query('entityId') entityId?: string,
   ) {
-    // Audit log reads are cross-zone by definition: an auditor's whole job is
-    // to see every zone, and the rows carry no zone column to filter on.
-    const rows = await this.db.system(async (_db, client) => {
-      const q = await client.query(
-        `SELECT a.created_at, a.action, a.entity_type, a.entity_id, a.zone_id,
-                a.actor_type, a.source_ip, a.before, a.after,
-                u.name AS actor_name, u.email AS actor_email
-           FROM audit_log a
-      LEFT JOIN users u ON u.id = a.actor_id
-          WHERE ($1::text IS NULL OR a.entity_type = $1)
-            AND ($2::text IS NULL OR a.entity_id = $2)
-          ORDER BY a.created_at DESC
-          LIMIT 10000`,
-        [entityType ?? null, entityId ?? null],
-      );
-      return q.rows as Record<string, unknown>[];
-    });
-
-    const csv = toCsv(rows, [
+    const columns: CsvColumn<Record<string, unknown>>[] = [
       { header: 'When', value: (r) => r.created_at },
       { header: 'Action', value: (r) => r.action },
       { header: 'Actor', value: (r) => r.actor_name ?? r.actor_type },
@@ -311,10 +302,67 @@ export class AdminUsersController {
       { header: 'Source IP', value: (r) => r.source_ip },
       { header: 'Before', value: (r) => r.before },
       { header: 'After', value: (r) => r.after },
-    ]);
+    ];
+
+    // Before the first byte of the body: after that the status line has gone
+    // out and nothing about it can be revised.
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${csvFilename('audit-log')}"`);
-    return csv;
+
+    const outcome = await streamCsv(res, columns, this.streamAuditRows(entityType, entityId));
+    if (outcome.error) {
+      // streamCsv has marked and aborted the half-written file; the client
+      // cannot be told why, so the server log is where the reason lives.
+      this.log.error(
+        `audit log export failed after ${outcome.rows} rows`,
+        outcome.error instanceof Error ? outcome.error.stack : String(outcome.error),
+      );
+    }
+  }
+
+  /**
+   * The audit trail newest first, a batch at a time.
+   *
+   * a.id joins the SELECT only so the cursor has something unique to carry; it
+   * is deliberately not one of the CSV columns above, which stay exactly what
+   * they were. The cursor is the (created_at, id) pair and not the bigserial
+   * id alone, because created_at defaults to the transaction start time: a
+   * long transaction can write a row with a higher id and an earlier timestamp
+   * than a short one that began after it, and under ORDER BY created_at an
+   * id-only predicate would step straight over that row.
+   */
+  private async *streamAuditRows(entityType?: string, entityId?: string, batchSize = 1000) {
+    let cursor: Cursor | null = null;
+    for (;;) {
+      const params = [entityType ?? null, entityId ?? null];
+      const keyset = cursorClause(cursor, params.length + 1, ['a.created_at', 'a.id']);
+      // Audit log reads are cross-zone by definition: an auditor's whole job is
+      // to see every zone, and the rows carry no zone column to filter on.
+      const batch = await this.db.system(
+        async (_db, client) => {
+          const q = await client.query(
+            `SELECT a.id, a.created_at, a.action, a.entity_type, a.entity_id, a.zone_id,
+                    a.actor_type, a.source_ip, a.before, a.after,
+                    u.name AS actor_name, u.email AS actor_email
+               FROM audit_log a
+          LEFT JOIN users u ON u.id = a.actor_id
+              WHERE ($1::text IS NULL OR a.entity_type = $1)
+                AND ($2::text IS NULL OR a.entity_id = $2)${keyset.sql}
+              ORDER BY a.created_at DESC, a.id DESC
+              LIMIT ${batchSize}`,
+            [...params, ...keyset.params],
+          );
+          return q.rows as Record<string, unknown>[];
+        },
+        // An export legitimately outlives an interactive query. Each batch is
+        // its own transaction, so this is a per-batch budget, not a total.
+        { statementTimeoutMs: 60_000 },
+      );
+      if (batch.length === 0) return;
+      yield batch;
+      cursor = nextCursor(batch.map((r) => ({ createdAt: r.created_at, id: String(r.id) })));
+      if (batch.length < batchSize) return;
+    }
   }
 
   @Get('audit-log')
