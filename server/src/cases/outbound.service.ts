@@ -155,7 +155,7 @@ export class OutboundService {
     });
     if (to.length === 0) return { ok: true };
 
-    await this.setPendingFrom(caseId, to, row.requesterEmailEnc);
+    await this.setPendingFrom(ctx, caseId, to, row.requesterEmailEnc);
     await this.audit.record({
       actorId,
       actorType: 'user',
@@ -170,6 +170,7 @@ export class OutboundService {
 
   /** Returns whether the requester was among the recipients. */
   private async setPendingFrom(
+    ctx: ZoneContext,
     caseId: string,
     to: string[],
     requesterEmailEnc: string | null,
@@ -188,7 +189,18 @@ export class OutboundService {
     const party = toRequester ? 'customer' : 'internal';
     const names = toRequester
       ? 'Requester'
-      : await this.db.system(async (_db, client) => {
+      : // Left on system() deliberately, unlike the write just below. This
+        // result is stored in cases.pending_on, not rendered per-viewer, so
+        // running it under the caller's context would make row-level
+        // security on `users` decide what gets persisted: an admin's action
+        // would store "Jane Smith, Bob Lee" while a zone_manager performing
+        // the identical action would store "jane@x.com, bob@y.com" because
+        // RLS hid the other zone's users and the code fell back to raw
+        // addresses. Stored data depending on who happened to act is worse
+        // than the privilege this one read self-declares, in a system whose
+        // point is a defensible audit trail. Logged for a future system()
+        // audit rather than fixed here.
+        await this.db.system(async (_db, client) => {
           // Prefer the person's name over their address; fall back to the
           // address so an external contact still reads sensibly.
           const res = await client.query(
@@ -199,7 +211,7 @@ export class OutboundService {
           return recipients.map((r) => byEmail.get(r.toLowerCase()) ?? r).join(', ');
         });
 
-    await this.db.system(async (_db, client) => {
+    await this.db.withContext(ctx, async (_db, client) => {
       await client.query(
         `UPDATE cases
             SET pending_party = $2, pending_on = $3, pending_since = now(), updated_at = now()
@@ -310,7 +322,7 @@ export class OutboundService {
       error = (err as Error).message;
     }
 
-    await this.db.system((db) =>
+    await this.db.withContext(ctx, (db) =>
       db.insert(emailLog).values({
         caseId: args.caseId,
         provider: this.email.activeName(),
@@ -340,7 +352,7 @@ export class OutboundService {
 
     // Record who the case is now waiting on. Derived from the recipients rather
     // than asked for separately, so it cannot drift from what was actually sent.
-    const toRequester = await this.setPendingFrom(args.caseId, args.to, c.requesterEmailEnc);
+    const toRequester = await this.setPendingFrom(ctx, args.caseId, args.to, c.requesterEmailEnc);
     if (toRequester) {
       await this.markAwaitingRequester(ctx, args.caseId, args.actorId, args.ip);
     }
