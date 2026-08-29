@@ -1268,6 +1268,21 @@ ENV_GOOD = (
     "GRAPH_CLIENT_SECRET=graph-client-secret-value\n"
 )
 
+ENV_GOOD_URL = "postgres://dsr:" + DB_PASSWORD + "@127.0.0.1:5432/dsr"
+
+# Every shape DB_PASS can legally take in deploy/.secrets.env. An operator
+# picks that password, so an `@` in it is ordinary -- and a password with an
+# `@` also breaks node-postgres URL parsing, which means the box doctor is
+# pointed at because the database is unreachable is disproportionately the
+# box whose password must not be printed.
+DB_URL_SHAPES = (
+    ENV_GOOD_URL,
+    "postgres://dsr:hun@" + DB_PASSWORD + "@127.0.0.1:5432/dsr",
+    "postgres://:" + DB_PASSWORD + "@127.0.0.1:5432/dsr",
+    "postgres://dsr@127.0.0.1:5432/dsr?password=" + DB_PASSWORD,
+    "postgres://dsr:" + DB_PASSWORD + "@127.0.0.1:notaport/dsr",
+)
+
 
 class TestEnvEvaluator(unittest.TestCase):
     GOOD = (
@@ -1298,10 +1313,28 @@ class TestEnvEvaluator(unittest.TestCase):
             self.assertNotIn(key, f.title + f.detail + f.fix)
 
     def test_no_finding_ever_contains_the_database_password(self):
-        for mode in ("600", "644"):
-            self.assertNotIn(DB_PASSWORD, _blob(dd.evaluate_env(ENV_GOOD, mode)))
-        broken = ENV_GOOD.replace(MASTER_KEY_GOOD, "a" * 64)
-        self.assertNotIn(DB_PASSWORD, _blob(dd.evaluate_env(broken, "600")))
+        # The healthy path is the dangerous one: a good box prints the
+        # DATABASE_URL finding on every single run.
+        for url in DB_URL_SHAPES:
+            text = ENV_GOOD.replace(ENV_GOOD_URL, url)
+            self.assertIn(url, text, "the fixture substitution missed")
+            for mode in ("600", "644"):
+                findings = dd.evaluate_env(text, mode)
+                self.assertTrue(findings)
+                self.assertNotIn(DB_PASSWORD, _blob(findings), url)
+            broken = text.replace(MASTER_KEY_GOOD, "a" * 64)
+            findings = dd.evaluate_env(broken, "600")
+            self.assertTrue(findings)
+            self.assertNotIn(DB_PASSWORD, _blob(findings), url)
+
+    def test_the_database_url_finding_still_names_host_port_and_database(self):
+        # Redacting by deleting the whole value would pass the test above and
+        # tell the operator nothing.
+        findings = dd.evaluate_env(ENV_GOOD, "600")
+        titles = [f.title for f in findings if f.title.startswith("DATABASE_URL")]
+        self.assertEqual(len(titles), 2)
+        for title in titles:
+            self.assertIn("127.0.0.1:5432/dsr", title)
 
     def test_a_leading_zero_mode_is_still_owner_only(self):
         self.assertTrue(all(f.severity == dd.OK for f in dd.evaluate_env(self.GOOD, "0600")))
@@ -1339,6 +1372,70 @@ class TestRedaction(unittest.TestCase):
 
     def test_text_with_no_credentials_is_unchanged(self):
         self.assertEqual(dd.redact_url("nginx -t failed"), "nginx -t failed")
+
+    def test_an_at_sign_inside_the_password_does_not_leave_the_tail_visible(self):
+        out = dd.redact_url("postgres://dsr:hun@ter2@127.0.0.1:5432/dsr")
+        self.assertNotIn("hun", out)
+        self.assertNotIn("ter2", out)
+        self.assertEqual(out, "postgres://dsr:***@127.0.0.1:5432/dsr")
+
+    def test_a_url_with_no_username_is_still_redacted(self):
+        out = dd.redact_url("postgres://:hunter2@127.0.0.1:5432/dsr")
+        self.assertNotIn("hunter2", out)
+        self.assertEqual(out, "postgres://:***@127.0.0.1:5432/dsr")
+
+    def test_two_urls_on_one_line_are_both_redacted(self):
+        out = dd.redact_url(
+            "tried postgres://a:pw1@h1/db then postgres://b:pw2@h2/db"
+        )
+        self.assertNotIn("pw1", out)
+        self.assertNotIn("pw2", out)
+
+    def test_a_credential_free_host_and_port_is_not_over_matched(self):
+        # The `@` further along the line must not drag the host:port before
+        # it into the match: widening the password class to cross `/` is
+        # exactly the mistake that would.
+        for text in (
+            "conninfo=postgres://127.0.0.1:5432/dsr,notify=root@localhost",
+            "psql: could not connect to postgres://127.0.0.1:5432/dsr",
+            "nginx: [emerg] bind() to 0.0.0.0:80 failed",
+        ):
+            self.assertEqual(dd.redact_url(text), text)
+
+
+class TestDescribeUrl(unittest.TestCase):
+    """describe_url never reads the secret, which is why it cannot leak it."""
+
+    def test_it_reports_host_port_and_database(self):
+        self.assertEqual(
+            dd.describe_url("postgres://dsr:hunter2@127.0.0.1:5432/dsr"),
+            "127.0.0.1:5432/dsr",
+        )
+
+    def test_no_shape_of_password_survives(self):
+        for url in (
+            "postgres://dsr:hunter2@127.0.0.1:5432/dsr",
+            "postgres://dsr:hun@ter2@127.0.0.1:5432/dsr",
+            "postgres://:hunter2@127.0.0.1:5432/dsr",
+            "postgres://dsr@127.0.0.1:5432/dsr?password=hunter2",
+        ):
+            self.assertNotIn("hunter2", dd.describe_url(url), url)
+            self.assertNotIn("ter2", dd.describe_url(url), url)
+
+    def test_the_port_defaults_rather_than_disappearing(self):
+        self.assertEqual(
+            dd.describe_url("postgres://dsr:pw@db.internal/dsr"), "db.internal:5432/dsr"
+        )
+
+    def test_something_that_is_not_a_url_is_not_echoed_back(self):
+        # A malformed env value can be the bare password itself.
+        for value in ("hunter2", "not a url at all", ""):
+            self.assertEqual(dd.describe_url(value), "unparseable connection string")
+
+    def test_a_non_numeric_port_is_refused_rather_than_raising(self):
+        out = dd.describe_url("postgres://dsr:hunter2@127.0.0.1:notaport/dsr")
+        self.assertEqual(out, "unparseable connection string")
+        self.assertNotIn("hunter2", out)
 
 
 DF_ALMOST_FULL = """Filesystem     1B-blocks        Used  Available Capacity Mounted on

@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 
 INSTALL_PREFIX = "/opt/dsr"
 WEB_ROOT = "/var/www/dsr"
@@ -1391,8 +1392,43 @@ def redact_url(text: str) -> str:
     Command output reaches a Finding in a few places -- a psql error, an
     nginx error -- and any of it can carry a URL with credentials. A finding
     is printed, logged and pasted into chat; nothing in one may be a secret.
+
+    This is a filter over arbitrary text, so it is best-effort by nature: a
+    password handed over as `?password=` is not a match for any rule about
+    userinfo. Where the URL is the subject rather than something buried in an
+    error message, use describe_url, which never reads the secret at all.
+
+    The password class stops at `/` rather than at `@`, so an `@` inside the
+    password -- ordinary, and something node-postgres cannot parse either --
+    no longer ends the match early and leaves the tail of the password
+    visible. The username class allows the empty string, because
+    `postgres://:pw@host` is a legal URL that the earlier form left untouched.
     """
-    return re.sub(r"(://[^\s:/@]+):[^\s@]*@", r"\1:***@", text or "")
+    return re.sub(r"(://[^\s:/]*):[^\s/]*@", r"\1:***@", text or "")
+
+
+def describe_url(value: str) -> str:
+    """`host:port/database` out of a connection string. Never the credentials.
+
+    Nothing here reads userinfo or the query string, so no shape of password
+    -- an `@` inside it, an empty username, `?password=` -- can reach a
+    Finding through this function. That is the whole point: redaction is a
+    filter that can miss, and this is a construction with nothing to miss.
+    """
+    try:
+        parsed = urlsplit(value or "")
+        if not parsed.scheme:
+            # Without a scheme this is not a URL, and echoing it back would
+            # print whatever the env file actually holds -- which, for a
+            # malformed value, can be the bare password.
+            return "unparseable connection string"
+        host = parsed.hostname or "?"
+        port = parsed.port or 5432
+    except ValueError:
+        # A non-numeric port makes .port raise rather than return None.
+        return "unparseable connection string"
+    database = (parsed.path or "/").lstrip("/") or "?"
+    return "%s:%s/%s" % (host, port, database)
 
 
 def evaluate_selinux(getenforce: str, booleans: str, avc: str) -> list:
@@ -1818,7 +1854,7 @@ def evaluate_env(env_text: str, mode: str) -> list:
             )
         else:
             findings.append(
-                Finding(group, OK, "%s -> %s" % (key, redact_url(value)), "", "")
+                Finding(group, OK, "%s -> %s" % (key, describe_url(value)), "", "")
             )
 
     cookie = (env.get("COOKIE_SECURE") or "").strip().lower()
