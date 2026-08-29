@@ -68,7 +68,7 @@ esac
 if [ "$EMAIL_PROVIDER" = "graph" ]; then
   missing=""
   for var in PRIVACY_MAILBOX GRAPH_TENANT_ID GRAPH_CLIENT_ID GRAPH_CLIENT_SECRET; do
-    if [ -z "${!var:-}" ]; then missing="$missing $var"; fi
+    if [ -z "$(printf '%s' "${!var:-}" | tr -d '[:space:]')" ]; then missing="$missing $var"; fi
   done
   if [ -n "$missing" ]; then
     echo "FATAL: EMAIL_PROVIDER=graph, but these are empty:$missing" >&2
