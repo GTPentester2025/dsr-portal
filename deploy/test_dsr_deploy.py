@@ -6,6 +6,7 @@ import contextlib
 import io
 import os
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -548,20 +549,65 @@ class TestPlans(unittest.TestCase):
             self.assertIn(expected, names, "provision has no %s step" % expected)
 
     def test_provision_never_disables_selinux(self):
-        blob = " ".join(s.command for s in dd.provision_steps())
-        for forbidden in ("setenforce 0", "SELINUX=disabled", "--permissive"):
-            self.assertNotIn(forbidden, blob)
+        # Widened from three exact substrings to a pattern, because the
+        # three had blind spots wide enough to drive through and all of
+        # these passed the old check:
+        #     semanage permissive -a httpd_t
+        #     echo 0 > /sys/fs/selinux/enforce
+        #     sed -i 's/SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+        # None of them is in the file today. This test is the safety net for
+        # every future edit, so it has to catch the ones nobody thought of.
+        #
+        # `setsebool -P httpd_can_network_connect on` and `restorecon` are
+        # the SELinux commands this tool is *for*, and neither matches.
+        forbidden = re.compile(r"selinux|enforce|permissive", re.IGNORECASE)
+        for step in dd.provision_steps() + dd.deploy_steps({}):
+            match = forbidden.search(step.command)
+            self.assertIsNone(
+                match,
+                "step %r reaches for SELinux: %r. Turning it off is the fix "
+                "people reach for on a RHEL 502, it is wrong, and this box "
+                "holds identity documents. Set httpd_can_network_connect "
+                "instead." % (step.name, match.group(0) if match else ""),
+            )
 
     def test_provision_turns_the_proxy_boolean_on(self):
         blob = " ".join(s.command for s in dd.provision_steps())
         self.assertIn("httpd_can_network_connect", blob)
         self.assertIn("setsebool -P", blob)
 
+    # A deletion verb anywhere near the uploads path. The old check was two
+    # exact spellings of `rm -rf`, which let all of these through:
+    #     rm  -rf /opt/dsr/uploads          (two spaces)
+    #     find /opt/dsr/uploads -mindepth 1 -delete
+    #     shred /opt/dsr/uploads/*
+    #     mv /opt/dsr/uploads /tmp
+    # None is in the file today. The point of this test is the edit that has
+    # not happened yet: these are identity documents held as regulatory
+    # records, and no step of this tool may remove, prune, truncate or
+    # relocate them.
+    DESTRUCTIVE_NEAR_UPLOADS = re.compile(
+        r"\b(rm|rmdir|unlink|shred|truncate|mv|find|dd)\b[^\n;&|]*uploads"
+        r"|uploads[^\n;&|]*(-delete|-exec\s+rm|--remove|\bshred\b|\btruncate\b)",
+        re.IGNORECASE,
+    )
+
     def test_no_step_anywhere_removes_uploads(self):
         every = dd.provision_steps() + dd.deploy_steps({"EMAIL_PROVIDER": "console"})
         for step in every:
-            self.assertNotIn("rm -rf %s" % dd.UPLOADS_DIR, step.command)
-            self.assertNotIn("rm -rf /opt/dsr/uploads", step.command)
+            match = self.DESTRUCTIVE_NEAR_UPLOADS.search(step.command)
+            self.assertIsNone(
+                match,
+                "step %r would destroy uploaded identity documents: %r"
+                % (step.name, match.group(0) if match else ""),
+            )
+
+    def test_no_payload_destination_is_the_uploads_directory(self):
+        # push_dir mirrors by removing the destination first, so this is the
+        # other way uploads could be deleted without a step ever saying rm.
+        for item in dd.deploy_payload("/repo"):
+            self.assertIsNone(self.DESTRUCTIVE_NEAR_UPLOADS.search(item.remote))
+            self.assertNotIn("uploads", item.remote)
 
     def test_deploy_migrates_before_it_restarts(self):
         names = [s.name for s in dd.deploy_steps({"EMAIL_PROVIDER": "console"})]
