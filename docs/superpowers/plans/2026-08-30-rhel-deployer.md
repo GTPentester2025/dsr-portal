@@ -1223,12 +1223,23 @@ class TestEnvEvaluator(unittest.TestCase):
 
 
 class TestTlsEvaluator(unittest.TestCase):
+    # 1788220800 is 2026-09-01T00:00:00Z. Nine days before the cert below.
+    NOW = 1788220800
+
     def test_expiry_inside_two_weeks_warns(self):
-        findings = dd.evaluate_tls("notAfter=Sep 10 00:00:00 2026 GMT", 1756512000)
+        findings = dd.evaluate_tls("notAfter=Sep 10 00:00:00 2026 GMT", self.NOW)
         self.assertTrue(any(f.severity in (dd.WARN, dd.FAIL) for f in findings))
 
+    def test_expiry_months_away_is_clean(self):
+        findings = dd.evaluate_tls("notAfter=Dec 31 00:00:00 2026 GMT", self.NOW)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+
+    def test_an_already_expired_certificate_is_a_failure(self):
+        findings = dd.evaluate_tls("notAfter=Jan 10 00:00:00 2026 GMT", self.NOW)
+        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+
     def test_no_certificate_is_a_warning_not_a_crash(self):
-        self.assertTrue(dd.evaluate_tls("", 1756512000))
+        self.assertTrue(dd.evaluate_tls("", self.NOW))
 ```
 
 - [ ] **Step 2: Run and watch it fail**
