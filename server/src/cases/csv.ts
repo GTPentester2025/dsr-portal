@@ -33,12 +33,27 @@ function cell(value: unknown): string {
   return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
+/**
+ * Excel mangles non-ASCII without a byte-order mark, and this data is full of
+ * names that need it. Emitted once at the start of a file — never per row.
+ */
+export const CSV_BOM = '﻿';
+
+/** One header line, no trailing newline. The caller joins with CRLF. */
+export function csvHeader<T>(columns: CsvColumn<T>[]): string {
+  return columns.map((c) => cell(c.header)).join(',');
+}
+
+/** One data line, no trailing newline. Quoting and formula-neutralising as `toCsv`. */
+export function csvRow<T>(row: T, columns: CsvColumn<T>[]): string {
+  return columns.map((c) => cell(c.value(row))).join(',');
+}
+
 export function toCsv<T>(rows: T[], columns: CsvColumn<T>[]): string {
-  const head = columns.map((c) => cell(c.header)).join(',');
-  const body = rows.map((row) => columns.map((c) => cell(c.value(row))).join(','));
+  const lines = [csvHeader(columns), ...rows.map((row) => csvRow(row, columns))];
   // CRLF and a UTF-8 BOM: without the BOM Excel mangles non-ASCII names, which
   // this data is full of.
-  return '﻿' + [head, ...body].join('\r\n') + '\r\n';
+  return CSV_BOM + lines.join('\r\n') + '\r\n';
 }
 
 /** RFC 5987 filename, timestamped so repeated downloads do not overwrite. */
