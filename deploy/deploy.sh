@@ -38,6 +38,27 @@ if [ "$(printf '%s' "${CRYPTO_MASTER_KEY:-}" | base64 -d 2>/dev/null | wc -c | t
   exit 1
 fi
 
+# The email configuration now lives in the .env file this script rewrites, so
+# the secrets file has to carry it. An empty Graph credential is no longer just
+# "mail is broken": assertEmailConfig exits the process at boot, systemd
+# restarts it every 3s, and nginx is left proxying the public form and the
+# admin console to a dead API. Fail here, on the operator's machine, before a
+# single byte reaches the server.
+EMAIL_PROVIDER="${EMAIL_PROVIDER:-graph}"
+if [ "$EMAIL_PROVIDER" = "graph" ]; then
+  missing=""
+  for var in PRIVACY_MAILBOX GRAPH_TENANT_ID GRAPH_CLIENT_ID GRAPH_CLIENT_SECRET; do
+    if [ -z "${!var:-}" ]; then missing="$missing $var"; fi
+  done
+  if [ -n "$missing" ]; then
+    echo "FATAL: EMAIL_PROVIDER=graph, but these are empty:$missing" >&2
+    echo "       They belong in $SECRETS_FILE, alongside DB_PASS and" >&2
+    echo "       CRYPTO_MASTER_KEY. Without them the API exits at boot and" >&2
+    echo "       systemd crash-loops it, taking the whole portal offline." >&2
+    exit 1
+  fi
+fi
+
 # Refuse to overwrite a live .env whose master key differs from the one about
 # to be written. Compares fingerprints, never the keys themselves.
 remote_fp=$($SSH "test -f /opt/dsr/server/.env && (set -a; . /opt/dsr/server/.env; set +a; printf '%s' \"\$CRYPTO_MASTER_KEY\" | md5sum | cut -c1-8)" 2>/dev/null || true)
@@ -94,6 +115,13 @@ CRYPTO_MASTER_KEY=${CRYPTO_MASTER_KEY}
 # TLS is in place, so session cookies carry the Secure flag. Only set this to
 # false for a deliberately plain-HTTP environment.
 COOKIE_SECURE=${COOKIE_SECURE:-true}
+# Email is environment-owned (no app_settings row can supply it), so these have
+# to be rewritten here or the service refuses to start. Guarded above.
+EMAIL_PROVIDER=${EMAIL_PROVIDER:-graph}
+PRIVACY_MAILBOX=${PRIVACY_MAILBOX:-}
+GRAPH_TENANT_ID=${GRAPH_TENANT_ID:-}
+GRAPH_CLIENT_ID=${GRAPH_CLIENT_ID:-}
+GRAPH_CLIENT_SECRET=${GRAPH_CLIENT_SECRET:-}
 ENV
 $SSH "chmod 600 /opt/dsr/server/.env"
 

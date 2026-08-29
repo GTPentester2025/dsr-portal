@@ -154,6 +154,35 @@ The script is idempotent: it rebuilds all three bundles, mirrors them with
 tar-over-ssh, runs `scripts/migrate.mjs` (tracked in `schema_migrations`),
 re-imports the form schemas, then restarts the service.
 
+### The deployment secrets file
+
+`deploy.sh` sources a per-host, gitignored secrets file —
+`deploy/.secrets.<host>.env`, chosen with `SECRETS_FILE=` and defaulting to
+`deploy/.secrets.blr.env`. Everything the script writes into
+`/opt/dsr/server/.env` comes from there, and it rewrites that file wholesale on
+every deploy: a value not in the secrets file does not survive the next release.
+
+| Variable | What it is |
+|---|---|
+| `DB_PASS` | password for the `dsr` database owner |
+| `APP_PASS` | password for the RLS-constrained `dsr_app` role |
+| `CRYPTO_MASTER_KEY` | 32 bytes, base64 — encrypts every secret setting at rest |
+| `COOKIE_SECURE` | optional; `true` unless you are deliberately on plain HTTP |
+| `EMAIL_PROVIDER` | optional; `graph` (the default) or `console` |
+| `PRIVACY_MAILBOX` | the shared mailbox the portal sends as |
+| `GRAPH_TENANT_ID` | Azure directory (tenant) ID |
+| `GRAPH_CLIENT_ID` | Azure application (client) ID |
+| `GRAPH_CLIENT_SECRET` | the client secret's value |
+
+> **Upgrading an existing server: add the five email variables before your next
+> deploy.** They are new. The provider and its Graph credentials used to live in
+> `app_settings`; they are now environment-only, in the very file `deploy.sh`
+> truncates and rewrites. If they are absent, `deploy.sh` stops with a `FATAL:`
+> naming them and uploads nothing — which is the good outcome. Skipping that
+> guard would leave the API exiting at boot, systemd restarting it every three
+> seconds, and nginx proxying the public intake form and the admin console to a
+> dead process.
+
 Useful one-liners:
 
 ```bash
