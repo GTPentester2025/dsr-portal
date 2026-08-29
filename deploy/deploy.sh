@@ -44,7 +44,27 @@ fi
 # restarts it every 3s, and nginx is left proxying the public form and the
 # admin console to a dead API. Fail here, on the operator's machine, before a
 # single byte reaches the server.
+#
+# Note this reads the shell as well as the secrets file, the same way
+# COOKIE_SECURE does. Set EMAIL_PROVIDER in the secrets file so it cannot be
+# decided by whatever happens to be exported in the operator's shell.
 EMAIL_PROVIDER="${EMAIL_PROVIDER:-graph}"
+case "$EMAIL_PROVIDER" in
+  graph) ;;
+  console)
+    echo "WARNING: deploying with EMAIL_PROVIDER=console. The API runs with" >&2
+    echo "         NODE_ENV=production, where the console adapter refuses to" >&2
+    echo "         send. No mail will reach a data subject." >&2
+    ;;
+  *)
+    # Same legal set as EMAIL_PROVIDERS in server/src/email/email-config.ts.
+    # Boot validation rejects anything else by name, so shipping it would mean
+    # the same crash loop as a missing credential.
+    echo "FATAL: EMAIL_PROVIDER is \"$EMAIL_PROVIDER\"; valid values are graph" >&2
+    echo "       and console, exact and lower case. Fix it in $SECRETS_FILE." >&2
+    exit 1
+    ;;
+esac
 if [ "$EMAIL_PROVIDER" = "graph" ]; then
   missing=""
   for var in PRIVACY_MAILBOX GRAPH_TENANT_ID GRAPH_CLIENT_ID GRAPH_CLIENT_SECRET; do
