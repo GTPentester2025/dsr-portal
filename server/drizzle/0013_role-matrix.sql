@@ -140,8 +140,13 @@ CREATE POLICY users_zone_role ON users
   WITH CHECK (app_zone_allows(zone_id)
     AND app_role_may_write(ARRAY['system','super_admin','admin','zone_manager']));
 --> statement-breakpoint
+-- DELETE is checked against USING alone -- the WITH CHECK above never runs
+-- for it -- so the zone term has to be repeated here rather than inherited;
+-- without it a zone manager could delete a global account even though they
+-- cannot create or edit one.
 CREATE POLICY users_delete_role ON users AS RESTRICTIVE FOR DELETE
-  USING (app_role_may_write(ARRAY['system','super_admin','admin','zone_manager']));
+  USING (app_zone_allows(zone_id)
+    AND app_role_may_write(ARRAY['system','super_admin','admin','zone_manager']));
 --> statement-breakpoint
 
 -- form_versions, sla_policies, templates and assignment_config are all
