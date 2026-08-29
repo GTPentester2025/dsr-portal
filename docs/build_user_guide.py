@@ -394,7 +394,7 @@ callout(doc, "ok",
         "only shows whether one is set.")
 
 h2(doc, "10.2 Email delivery")
-para(doc, "Microsoft Graph is the portal's only production email adapter. The six fields in this "
+para(doc, "Microsoft Graph is the portal's only production email adapter. The five fields in this "
           "group are shown **read-only**, each marked \"Set in /opt/dsr/server/.env\": saving "
           "the screen never changes them, and the API refuses a write even if one is attempted "
           "directly. They live in a file on the server rather than the database on purpose — an "
@@ -402,8 +402,7 @@ para(doc, "Microsoft Graph is the portal's only production email adapter. The si
           "not be a setting a browser session can change.")
 table(doc, ["Field", "What it is"], [
     ["Active provider", "`graph` in production. `console` is a development-only setting that writes messages to a log instead of sending."],
-    ["From display name", "The sender name shown on outgoing mail."],
-    ["Privacy mailbox", "The shared mailbox that case responses and verification links are sent from."],
+    ["Privacy mailbox", "The shared mailbox that case responses and verification links are sent from. The sender name recipients see is that mailbox's own display name, set in Exchange rather than here."],
     ["Azure tenant ID, application ID, client secret", "The Microsoft Graph app registration authorised to send as the privacy mailbox."],
 ], widths=[1.9, 4.5])
 callout(doc, "note",

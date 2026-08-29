@@ -39,7 +39,6 @@ describe('resolveValue', () => {
 describe('email settings ownership', () => {
   const EMAIL_KEYS = [
     'EMAIL_PROVIDER',
-    'EMAIL_FROM_NAME',
     'PRIVACY_MAILBOX',
     'GRAPH_TENANT_ID',
     'GRAPH_CLIENT_ID',

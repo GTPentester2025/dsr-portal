@@ -90,15 +90,6 @@ export const SETTINGS: SettingDef[] = [
     ],
   },
   {
-    key: 'EMAIL_FROM_NAME',
-    label: 'From display name',
-    group: 'email',
-    type: 'text',
-    default: 'Privacy Team',
-    placeholder: 'Privacy Team',
-    envOnly: true,
-  },
-  {
     key: 'PRIVACY_MAILBOX',
     label: 'Privacy mailbox',
     group: 'email',

@@ -65,16 +65,20 @@ as `dsr-api`'s `EnvironmentFile`:
 
 ```
 EMAIL_PROVIDER=graph
-EMAIL_FROM_NAME=Privacy Team
 PRIVACY_MAILBOX=privacy@company.com
 GRAPH_TENANT_ID=
 GRAPH_CLIENT_ID=
 GRAPH_CLIENT_SECRET=
 ```
 
-`EMAIL_PROVIDER` accepts `graph` or `console`. The existing production guard on the
-console adapter is unchanged: in production it throws unless `ALLOW_CONSOLE_EMAIL`
-is `true`.
+`EMAIL_PROVIDER` accepts `graph` or `console`; any other value is rejected at boot
+by name, rather than being carried to the first send. The existing production guard
+on the console adapter is unchanged: in production it throws unless
+`ALLOW_CONSOLE_EMAIL` is `true`.
+
+There is deliberately no sender-name key. No adapter reads one, and setting `from`
+on a shared-mailbox `sendMail` risks `ErrorSendAsDenied` under some application
+access policies; the display name belongs in the mailbox's Exchange properties.
 
 ### Boot-time validation
 

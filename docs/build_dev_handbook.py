@@ -136,7 +136,7 @@ table(doc, ["File", "Responsibility"], [
 
 h3(doc, "server/src/settings and audit")
 table(doc, ["File", "Responsibility"], [
-    ["`settings/settings.catalog.ts`", "Declarative field catalog. Adding an entry here is all it takes to surface a new setting in the UI. The `envOnly` flag locks the six email keys to the environment."],
+    ["`settings/settings.catalog.ts`", "Declarative field catalog. Adding an entry here is all it takes to surface a new setting in the UI. The `envOnly` flag locks the five email keys to the environment."],
     ["`settings/settings.service.ts`", "Resolution order (`resolveValue()`), in-memory cache, encryption of secrets, validation, `envOnly` write rejection, audit."],
     ["`settings/settings.controller.ts`", "Super-admin API: catalog + values, update, connection check, diagnostics, test send."],
     ["`audit/audit.service.ts`", "The single writer to the append-only audit log."],
@@ -280,7 +280,7 @@ caller ─► EMAIL_PROVIDER (EmailDispatcher)
                   └─ console → log only, refused in production unless ALLOW_CONSOLE_EMAIL=true
 """)
 bullets(doc, [
-    "Graph and console are the only adapters. Provider choice and every Graph credential are `envOnly` catalog entries (§4.6): `EMAIL_PROVIDER`, `EMAIL_FROM_NAME`, `PRIVACY_MAILBOX`, `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`. A database row can never shadow the value in `/opt/dsr/server/.env`, and `PUT /internal/admin/settings` returns `400` for any of the six.",
+    "Graph and console are the only adapters. Provider choice and every Graph credential are `envOnly` catalog entries (§4.6): `EMAIL_PROVIDER`, `PRIVACY_MAILBOX`, `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`. A database row can never shadow the value in `/opt/dsr/server/.env`, and `PUT /internal/admin/settings` returns `400` for any of the five. There is no sender-name key: the display name on outgoing mail comes from the shared mailbox's properties in Exchange, and no adapter reads one.",
     "`assertEmailConfig()` (`email-config.ts`) runs in `main.ts` before `app.listen()`. When `EMAIL_PROVIDER=graph`, all four required keys must be non-empty or the process exits non-zero, naming every missing key and the env file path in the log.",
     "`net-diagnostics.ts` (`diagnoseHttpsEndpoint`) checks DNS then a TCP connect to `graph.microsoft.com:443`; `EmailDispatcher.diagnose()` appends an authenticated `verifyConnection()` call as a third stage, so a failure names DNS, transport or credentials rather than one opaque timeout.",
 ])

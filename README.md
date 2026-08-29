@@ -39,7 +39,7 @@ cd apps/admin && npm run dev         # http://localhost:5181  (proxies /internal
 
 Microsoft Graph testing: set `EMAIL_PROVIDER=graph` plus `GRAPH_TENANT_ID`,
 `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` and `PRIVACY_MAILBOX` (see "Email
-delivery" below). All six email keys are environment-only — there is no
+delivery" below). All five email keys are environment-only — there is no
 Gmail, SMTP or Resend adapter, and no in-app way to set any of them. Admin
 panel → "Test connection" exercises the active provider, or run
 `node server/scripts/verify-email.mjs` from the host.
@@ -77,8 +77,8 @@ panel → "Test connection" exercises the active provider, or run
 - **Email adapters:** `graph` (Microsoft Graph, client credentials, send-as a
   shared mailbox) and `console` (dev/e2e; refused in production unless
   `ALLOW_CONSOLE_EMAIL=true`). Selection and every Graph credential are
-  environment-only — `EMAIL_PROVIDER`, `EMAIL_FROM_NAME`, `PRIVACY_MAILBOX`,
-  `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` — so a database
+  environment-only — `EMAIL_PROVIDER`, `PRIVACY_MAILBOX`, `GRAPH_TENANT_ID`,
+  `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` — so a database
   row can never shadow the file on the server, and the settings API refuses
   to write one (§4).
 
@@ -206,10 +206,10 @@ lifetimes and rate limits, branding.
   stage by stage; "Send test" delivers a real message through it.
 
 **Email delivery is the one group that is not editable here.** `EMAIL_PROVIDER`,
-`EMAIL_FROM_NAME`, `PRIVACY_MAILBOX` and the three `GRAPH_*` credentials are
+`PRIVACY_MAILBOX` and the three `GRAPH_*` credentials are
 **environment-only**: the Settings screen shows them read-only with "Set in
 `/opt/dsr/server/.env`", and `PUT /internal/admin/settings` returns `400` for
-any of the six. A database row can never shadow the file on the server, and a
+any of the five. A database row can never shadow the file on the server, and a
 missing Graph credential stops the service at boot rather than dropping the
 first data-subject email. See "Email delivery" below.
 
@@ -241,7 +241,7 @@ then update the two `PORTAL_*_URL` values in Settings.
 
 Microsoft Graph is the only production email adapter. `console` exists for
 dev/e2e only and refuses to run in production unless
-`ALLOW_CONSOLE_EMAIL=true`. Six keys select and configure it, all
+`ALLOW_CONSOLE_EMAIL=true`. Five keys select and configure it, all
 **environment-only** — read from `/opt/dsr/server/.env` (the same file
 `deploy.sh` writes for every other server setting; `chmod 600`, owned by
 `dsr:dsr`, loaded by systemd as `dsr-api`'s `EnvironmentFile`), ignored as an
@@ -250,13 +250,16 @@ through the settings API:
 
 ```
 EMAIL_PROVIDER=graph                    # graph | console
-EMAIL_FROM_NAME=Privacy Team
 PRIVACY_MAILBOX=privacy@company.com
 
 GRAPH_TENANT_ID=
 GRAPH_CLIENT_ID=
 GRAPH_CLIENT_SECRET=
 ```
+
+There is no sender-name key. The display name recipients see is whatever the
+privacy shared mailbox carries in Exchange, so change it there rather than in
+this file.
 
 When `EMAIL_PROVIDER=graph`, `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`,
 `GRAPH_CLIENT_SECRET` and `PRIVACY_MAILBOX` must all be non-empty or the
@@ -282,9 +285,10 @@ dropping the first verification email a data subject is waiting on.
    ```
    Without this policy, `Mail.Send` lets the app send as **any** mailbox in
    the tenant, not just the one the portal should use.
-4. Write the four `GRAPH_*`/`PRIVACY_MAILBOX` values, `EMAIL_PROVIDER=graph`
-   and `EMAIL_FROM_NAME` into `/opt/dsr/server/.env` on the server, then
-   `systemctl restart dsr-api`.
+4. Write the four `GRAPH_*`/`PRIVACY_MAILBOX` values and `EMAIL_PROVIDER=graph`
+   into `/opt/dsr/server/.env` on the server, then `systemctl restart dsr-api`.
+   Set the sender's display name on the mailbox itself in Exchange; the portal
+   has no setting for it.
 
 ### Confirming it works
 
