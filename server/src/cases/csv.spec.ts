@@ -32,6 +32,22 @@ describe('csv streaming pieces', () => {
     expect(csvHeader(COLUMNS)).toBe('Name,Note');
   });
 
+  it('produces exactly these bytes', () => {
+    // Written out by hand rather than assembled from the same helpers under
+    // test: every other case here compares one composition of cell() against
+    // another, so a bug inside cell() or neutralise() would satisfy both
+    // sides. The BOM is spelled as an escape below so that it is visible; the
+    // leading ' on the last field is the formula-injection guard, and the
+    // doubled quotes are RFC 4180 escaping.
+    expect(toCsv(ROWS, COLUMNS)).toBe(
+      '\uFEFF' +
+        'Name,Note\r\n' +
+        'Ada,plain\r\n' +
+        'Bob,"has, comma"\r\n' +
+        'Cy,"\'=HYPERLINK(""http://evil"")"\r\n',
+    );
+  });
+
   it('puts the BOM only at the start, never per row', () => {
     expect(CSV_BOM).toBe('﻿');
     expect(csvRow(ROWS[0], COLUMNS)).not.toContain('﻿');
