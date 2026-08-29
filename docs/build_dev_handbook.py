@@ -91,12 +91,14 @@ callout(doc, "warn",
 
 h3(doc, "server/src/auth")
 table(doc, ["File", "Responsibility"], [
-    ["`auth.service.ts`", "Password verification with argon2id, session creation, idle and absolute expiry, and `zoneContextFor` which maps a user to their RLS context."],
+    ["`password.strategy.ts`", "`PasswordStrategy.authenticate`: the only code that knows a password exists. Verifies the argon2id hash against a dummy hash for unknown users, so lookup and mismatch take the same time."],
+    ["`auth.service.ts`", "`startSession`: provider-agnostic session creation, the active-account check, idle and absolute expiry, `zoneContextFor` which maps a user to their RLS context, and `login`, which calls the password strategy then applies the break-glass policy."],
+    ["`break-glass.ts`", "`canUsePassword`: who may still sign in with a password once `SSO_ENABLED` is true, and `PasswordDisabledException`, the refusal it raises."],
     ["`auth.guard.ts`", "`AuthGuard` resolves the session cookie, attaches `req.user` and `req.zoneCtx`, and checks the handler's `@Requires(...)` permission with `hasPermission()`."],
     ["`permissions.ts`", "The permission table: the seven named permissions and the set each role holds. Also `ZONE_WIDE_ROLES`, the roles whose session sees every zone."],
     ["`admin-policy.ts`", "`canAssignRole`: who may produce a user with a given role in a given zone. Both the create and the update path call it."],
     ["`auth.controller.ts`", "Sign in, sign out, and `me`. Also owns `cookieSecure()`, which decides whether session cookies carry the Secure flag."],
-    ["`permissions.spec.ts`, `admin-policy.spec.ts`", "Unit tests for the permission table and for role assignment, including the auditor's read-only lane."],
+    ["`permissions.spec.ts`, `admin-policy.spec.ts`, `break-glass.spec.ts`", "Unit tests for the permission table, role assignment (including the auditor's read-only lane), and the break-glass policy across role × SSO state."],
 ], widths=[1.7, 4.7])
 
 h3(doc, "server/src/public")

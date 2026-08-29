@@ -49,10 +49,13 @@ PasswordStrategy.authenticate(email, password, ip): Promise<AuthenticatedIdentit
 AuthService.startSession(identity, ip, via): Promise<{ sessionId: string; user: SessionUser }>
 ```
 
-`login()` then reads: apply the break-glass rule, call the strategy, call
-`startSession`. When an Entra strategy arrives it calls the same `startSession`,
-so there is one place that creates a session and one place that records a
-successful sign-in — rather than two implementations that drift.
+`login()` then reads: call the strategy, apply the break-glass rule, call
+`startSession`. Authentication always precedes policy — checking the rule
+first would let an unauthenticated caller learn which accounts keep a
+password, turning the refusal into an oracle. When an Entra strategy arrives
+it calls the same `startSession`, so there is one place that creates a
+session and one place that records a successful sign-in — rather than two
+implementations that drift.
 
 **No strategy registry.** One interface, one implementation. A registry holding a
 single entry is a guess about the shape of the second one, and adding it later is
