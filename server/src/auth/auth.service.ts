@@ -78,6 +78,13 @@ export class AuthService {
     ip: string,
     via: string,
   ): Promise<{ sessionId: string; user: SessionUser }> {
+    // "May this account have a session at all" belongs here, not in any one
+    // strategy: a future IdP strategy resolving a subject to a user row would
+    // otherwise happily sign in a deactivated account. Matches what the
+    // password path already returned for an inactive user, so this changes
+    // no behaviour today.
+    if (!identity.active) throw new UnauthorizedException('Invalid credentials');
+
     const sessionId = randomBytes(32).toString('base64url');
     await this.db.system(async (_db, client) => {
       await client.query(

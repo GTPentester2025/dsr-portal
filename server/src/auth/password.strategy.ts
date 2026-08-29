@@ -4,7 +4,13 @@ import { DbService } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
 import type { Role } from './permissions';
 
-/** What any authentication strategy returns once it has proved who the caller is. */
+/**
+ * What any authentication strategy returns once it has proved who the caller is.
+ *
+ * A strategy that cannot determine `mustChangePassword` (an IdP has no notion
+ * of a temporary local password) should report `false` — there is nothing to
+ * force the user to change.
+ */
 export interface AuthenticatedIdentity {
   id: string;
   email: string;
@@ -13,6 +19,8 @@ export interface AuthenticatedIdentity {
   zoneId: string | null;
   mustChangePassword: boolean;
   isBreakGlass: boolean;
+  /** May this account have a session at all. Checked by startSession. */
+  active: boolean;
 }
 
 /**
@@ -65,6 +73,7 @@ export class PasswordStrategy {
       zoneId: row.zone_id,
       mustChangePassword: row.must_change_password === true,
       isBreakGlass: row.is_break_glass === true,
+      active: row.active === true,
     };
   }
 }
