@@ -13,7 +13,7 @@ import { GraphProvider } from './graph.provider';
 import { SmtpProvider } from './smtp.provider';
 import { ResendProvider } from './resend.provider';
 import { SettingsService } from '../settings/settings.service';
-import { diagnoseHttpsEndpoint, type DiagnosticStep } from './smtp';
+import { diagnoseHttpsEndpoint, type DiagnosticStep } from './net-diagnostics';
 import { SystemTemplateService } from './system-template.service';
 import { SystemTemplateController } from './system-template.controller';
 import { AuthModule } from '../auth/auth.module';
