@@ -252,8 +252,68 @@ def project_days_until_full(samples: list, free_now: int) -> float:
 
 MANAGED_MARKER = "# managed by dsr_deploy"
 
-_LOOPBACK = ("127.0.0.1/32", "::1/128")
+# Loopback, written every way pg_hba accepts. `localhost` and `samehost` are
+# names postgres resolves itself, and a rule using either is as much the
+# API's connection as 127.0.0.1 is.
+_LOOPBACK_ADDRESSES = ("127.0.0.1", "::1", "localhost", "samehost")
+
+# Every method pg_hba.conf recognises. The list exists so the method can be
+# found by what it is rather than by where it sits: `fields[-1]` is the
+# method only when nothing follows it, and a trailing comment or a
+# `clientcert=verify-full` option both put something there.
+_AUTH_METHODS = (
+    "trust", "reject", "scram-sha-256", "md5", "password", "gss", "sspi",
+    "ident", "peer", "ldap", "radius", "cert", "pam", "bsd",
+)
 _WEAK_METHODS = ("ident", "md5", "trust", "password")
+
+# The address field is index 3; the method is at 4 or later depending on
+# whether the rule uses CIDR or the older `address netmask` pair.
+_ADDRESS_FIELD = 3
+
+
+def _split_comment(line: str) -> tuple:
+    """(code, comment) at the first `#`. pg_hba has no quoting that survives
+    one, so the first is the only one that matters."""
+    index = line.find("#")
+    if index < 0:
+        return line, ""
+    return line[:index], line[index:]
+
+
+def _is_loopback(field: str) -> bool:
+    """Loopback with or without a prefix length: 127.0.0.1, 127.0.0.1/32,
+    ::1, ::1/128, localhost, samehost."""
+    return field.split("/")[0].strip().lower() in _LOOPBACK_ADDRESSES
+
+
+def _method_index(fields: list) -> int:
+    """Index of the auth method, found by name rather than by position.
+
+    Scanning from the address field onward tolerates both the CIDR form
+    (`127.0.0.1/32 ident`) and the netmask pair (`127.0.0.1 255.255.255.255
+    ident`) without needing to know which it is looking at, and it does not
+    mistake a trailing option for the method. Scanning starts past the
+    database and user fields so a database literally named `ident` cannot be
+    read as one.
+    """
+    for index in range(_ADDRESS_FIELD + 1, len(fields)):
+        if fields[index].lower() in _AUTH_METHODS:
+            return index
+    return -1
+
+
+def _replace_field(text: str, index: int, replacement: str) -> str:
+    """Swap the index-th whitespace-separated token, keeping every space."""
+    pieces = re.split(r"(\s+)", text)
+    seen = -1
+    for position, piece in enumerate(pieces):
+        if piece and not piece.isspace():
+            seen += 1
+            if seen == index:
+                pieces[position] = replacement
+                break
+    return "".join(pieces)
 
 
 def rewrite_pg_hba(text: str) -> tuple:
@@ -264,31 +324,61 @@ def rewrite_pg_hba(text: str) -> tuple:
     query fails. Debian's default already allowed password auth, which is why
     this never came up before.
 
+    Every shape of rule this misses fails the same silent way: the rule stays
+    on `ident`, the portal boots, and then it cannot read its own database.
+    So the parsing is deliberately tolerant -- an inline comment is stripped
+    before anything else is read, loopback is recognised by address rather
+    than by an exact string, and the method is found by name rather than by
+    being last on the line.
+
     Replication rows are left alone: they are not how the portal connects,
     and changing them is not this tool's business.
     """
     out = []
     changed = False
     for line in text.splitlines():
-        stripped = line.strip()
-        fields = stripped.split()
+        code, comment = _split_comment(line)
+        fields = code.split()
         if (
-            stripped
-            and not stripped.startswith("#")
-            and len(fields) >= 5
+            code.strip()
+            and len(fields) > _ADDRESS_FIELD + 1
             and fields[0] == "host"
             and fields[1] != "replication"
-            and any(addr in fields for addr in _LOOPBACK)
-            and fields[-1] in _WEAK_METHODS
+            and _is_loopback(fields[_ADDRESS_FIELD])
         ):
-            out.append(line[: line.rindex(fields[-1])] + "scram-sha-256")
-            changed = True
-        else:
-            out.append(line)
+            index = _method_index(fields)
+            if index >= 0 and fields[index].lower() in _WEAK_METHODS:
+                out.append(_replace_field(code, index, "scram-sha-256") + comment)
+                changed = True
+                continue
+        out.append(line)
     result = "\n".join(out)
     if text.endswith("\n"):
         result += "\n"
     return result, changed
+
+
+_SERVER_OPENER = re.compile(r"^server\b")
+
+
+def _opens_server_block(line: str) -> bool:
+    """True for a line that begins an nginx `server { ... }` block.
+
+    Matched on a word boundary rather than on `server` and `{` sharing a
+    line, because `server\\n{` and `server { # default` are both legal and
+    both left RHEL's stock block in place -- and nginx then refuses to start
+    with `duplicate default server`, which names neither file.
+
+    A trailing `;` rules out `server 127.0.0.1:3000;`, which is a directive
+    inside an `upstream` block and not a block opener at all.
+    """
+    stripped = line.strip()
+    if not _SERVER_OPENER.match(stripped):
+        return False
+    remainder = stripped[len("server"):].strip()
+    if remainder.endswith(";"):
+        return False
+    return remainder == "" or remainder.startswith("{")
 
 
 def neutralise_default_server(text: str) -> tuple:
@@ -311,18 +401,22 @@ def neutralise_default_server(text: str) -> tuple:
     i = 0
     changed = False
     while i < len(lines):
-        stripped = lines[i].strip()
-        if stripped.startswith("server") and stripped.endswith("{"):
+        if _opens_server_block(lines[i]):
             depth = 0
+            seen_brace = False
             j = i
             block = []
             while j < len(lines):
                 depth += lines[j].count("{") - lines[j].count("}")
+                if "{" in lines[j]:
+                    seen_brace = True
                 block.append(lines[j])
                 j += 1
-                if depth == 0:
+                # Only balanced once a brace has actually been seen: the
+                # opener and its `{` are allowed to be on separate lines.
+                if seen_brace and depth == 0:
                     break
-            if any("default_server" in b for b in block):
+            if seen_brace and depth == 0 and any("default_server" in b for b in block):
                 indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
                 out.append(
                     indent

@@ -310,6 +310,80 @@ class TestPgHba(unittest.TestCase):
         self.assertTrue(changed)
         self.assertIn("scram-sha-256", new)
 
+    # The five shapes below all failed identically before this was fixed:
+    # the rule stayed on `ident`, the API authenticated against nothing, and
+    # the portal booted and then could not read its own database. Nothing in
+    # the symptom names the file.
+
+    def test_the_plain_cidr_rule_is_rewritten(self):
+        new, changed = dd.rewrite_pg_hba("host all all 127.0.0.1/32 ident\n")
+        self.assertTrue(changed)
+        self.assertEqual(new, "host all all 127.0.0.1/32 scram-sha-256\n")
+
+    def test_a_trailing_comment_does_not_hide_the_method(self):
+        new, changed = dd.rewrite_pg_hba("host all all 127.0.0.1/32 ident  # legacy\n")
+        self.assertTrue(changed)
+        self.assertIn("scram-sha-256", new)
+        self.assertIn("# legacy", new)
+
+    def test_a_trailing_option_does_not_hide_the_method(self):
+        new, changed = dd.rewrite_pg_hba(
+            "host all all 127.0.0.1/32 md5 clientcert=verify-full\n"
+        )
+        self.assertTrue(changed)
+        self.assertIn("scram-sha-256 clientcert=verify-full", new)
+
+    def test_the_address_netmask_form_counts_as_loopback(self):
+        new, changed = dd.rewrite_pg_hba(
+            "host all all 127.0.0.1 255.255.255.255 ident\n"
+        )
+        self.assertTrue(changed)
+        self.assertIn("255.255.255.255 scram-sha-256", new)
+
+    def test_localhost_and_samehost_count_as_loopback(self):
+        for address in ("localhost", "samehost"):
+            new, changed = dd.rewrite_pg_hba("host all all %s ident\n" % address)
+            self.assertTrue(changed, address)
+            self.assertIn("scram-sha-256", new)
+
+    def test_a_non_loopback_rule_is_still_left_alone(self):
+        # Widening what counts as loopback must not widen it to everything:
+        # rewriting a remote rule is not this tool's business.
+        text = "host all all 10.0.0.0/8 md5\n"
+        new, changed = dd.rewrite_pg_hba(text)
+        self.assertFalse(changed)
+        self.assertEqual(new, text)
+
+    def test_the_rewritten_rules_are_still_idempotent(self):
+        text = (
+            "host all all 127.0.0.1/32 ident  # legacy\n"
+            "host all all 127.0.0.1 255.255.255.255 ident\n"
+            "host all all localhost md5 clientcert=verify-full\n"
+        )
+        once, changed = dd.rewrite_pg_hba(text)
+        self.assertTrue(changed)
+        twice, changed_again = dd.rewrite_pg_hba(once)
+        self.assertFalse(changed_again)
+        self.assertEqual(once, twice)
+
+    def test_replication_is_left_alone_in_every_shape(self):
+        for line in (
+            "host replication all 127.0.0.1/32 ident\n",
+            "host replication all 127.0.0.1 255.255.255.255 ident  # standby\n",
+        ):
+            new, changed = dd.rewrite_pg_hba(line)
+            self.assertFalse(changed, line)
+            self.assertEqual(new, line)
+
+    def test_column_alignment_survives_the_rewrite(self):
+        new, _ = dd.rewrite_pg_hba(
+            "host    all             all             127.0.0.1/32            ident\n"
+        )
+        self.assertEqual(
+            new,
+            "host    all             all             127.0.0.1/32            scram-sha-256\n",
+        )
+
 
 NGINX_RHEL_DEFAULT = """user nginx;
 http {
@@ -351,6 +425,59 @@ class TestNginxDefaultServer(unittest.TestCase):
 
     def test_a_file_without_a_default_server_is_untouched(self):
         text = "user nginx;\nhttp {\n    include /etc/nginx/conf.d/*.conf;\n}\n"
+        new, changed = dd.neutralise_default_server(text)
+        self.assertFalse(changed)
+        self.assertEqual(new, text)
+
+    def test_the_brace_may_be_on_the_next_line(self):
+        # `server` and `{` on separate lines is legal nginx, and the old
+        # endswith("{") test left the stock block in place -- so nginx kept
+        # refusing to start with `duplicate default server`.
+        text = "http {\n    server\n    {\n        listen 80 default_server;\n    }\n}\n"
+        new, changed = dd.neutralise_default_server(text)
+        self.assertTrue(changed)
+        self.assertNotIn("default_server", new)
+        self.assertEqual(new.count("{"), new.count("}"))
+
+    def test_a_comment_after_the_brace_does_not_hide_the_opener(self):
+        text = "http {\n    server { # default\n        listen 80 default_server;\n    }\n}\n"
+        new, changed = dd.neutralise_default_server(text)
+        self.assertTrue(changed)
+        self.assertNotIn("default_server", new)
+        self.assertEqual(new.count("{"), new.count("}"))
+
+    def test_an_upstream_server_directive_is_not_mistaken_for_a_block(self):
+        # `server 127.0.0.1:3000;` inside an upstream block starts with the
+        # word server and opens nothing; swallowing it would break the proxy
+        # this whole config exists to set up.
+        text = (
+            "http {\n"
+            "    upstream api {\n"
+            "        server 127.0.0.1:3000;\n"
+            "    }\n"
+            "    server {\n"
+            "        listen 80 default_server;\n"
+            "    }\n"
+            "}\n"
+        )
+        new, changed = dd.neutralise_default_server(text)
+        self.assertTrue(changed)
+        self.assertIn("server 127.0.0.1:3000;", new)
+        self.assertIn("upstream api {", new)
+        self.assertNotIn("default_server", new)
+        self.assertEqual(new.count("{"), new.count("}"))
+
+    def test_server_name_is_not_a_block_opener(self):
+        self.assertFalse(dd._opens_server_block("    server_name _;"))
+        self.assertTrue(dd._opens_server_block("    server {"))
+        self.assertTrue(dd._opens_server_block("server"))
+        self.assertFalse(dd._opens_server_block("        server 127.0.0.1:3000;"))
+
+    def test_a_block_that_never_closes_is_left_alone(self):
+        # A truncated file is a reason to change nothing, not a reason to
+        # write out an unbalanced one and have nginx fail for a second,
+        # more confusing reason.
+        text = "http {\n    server {\n        listen 80 default_server;\n"
         new, changed = dd.neutralise_default_server(text)
         self.assertFalse(changed)
         self.assertEqual(new, text)
