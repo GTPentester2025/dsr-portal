@@ -462,6 +462,33 @@ class TestPlans(unittest.TestCase):
         step = [s for s in dd.provision_steps() if "initdb" in s.name][0]
         self.assertIn("&& systemctl enable --now postgresql", step.command)
 
+    def test_both_rewritten_config_files_are_backed_up_first(self):
+        # Spec provisioning items 5 and 9 promise these two .orig copies.
+        blob = " ".join(s.command for s in dd.provision_steps())
+        self.assertIn("%s.orig" % dd.PG_HBA_REMOTE, blob)
+        self.assertIn("%s.orig" % dd.NGINX_MAIN_CONF_REMOTE, blob)
+
+    def test_the_backup_is_taken_before_the_rewrite_not_after(self):
+        for step in dd.provision_steps():
+            if ".orig" not in step.command:
+                continue
+            self.assertLess(
+                step.command.index(".orig"),
+                step.command.index("dsr_deploy as d"),
+                step.name,
+            )
+
+    def test_a_second_run_cannot_overwrite_the_true_original(self):
+        # Unconditional `cp` on a re-run would replace the pristine copy
+        # with the already-rewritten one, and the backup would then record
+        # nothing at all.
+        for path in (dd.PG_HBA_REMOTE, dd.NGINX_MAIN_CONF_REMOTE):
+            command = dd._backup_once(path)
+            self.assertTrue(command.startswith("test -f %s.orig ||" % path), command)
+
+    def test_the_backup_preserves_mode_and_ownership(self):
+        self.assertIn("cp -p", dd._backup_once("/etc/nginx/nginx.conf"))
+
     def test_every_config_rewrite_is_written_atomically(self):
         # A truncating write is the failure atomic_write exists to remove;
         # a step that reached for p.write_text again would reintroduce it.

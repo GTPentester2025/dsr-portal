@@ -530,6 +530,26 @@ def atomic_write(path: str, text: str) -> None:
         raise
 
 
+def _backup_once(path: str) -> str:
+    """`cp` a file to `<path>.orig`, but only the first time.
+
+    The spec promises a `.orig` of `pg_hba.conf` and of `nginx.conf` -- the
+    copy an operator diffs against when they want to know what this tool
+    changed, and restores from when they want it undone.
+
+    Conditional, because provisioning is meant to be re-run. An
+    unconditional `cp` on the second run would overwrite the true original
+    with the already-rewritten copy, and the backup would then be a record
+    of nothing.
+
+    `cp -p` so the copy carries the original's mode, ownership and
+    timestamps: a `pg_hba.conf.orig` that is world-readable when the file it
+    came from was not would be a small leak of the same kind the rest of
+    this file exists to prevent.
+    """
+    return "test -f %s.orig || cp -p %s %s.orig" % (path, path, path)
+
+
 def _remote_text_fix(path: str, func_name: str) -> str:
     """Apply one of Task 4's pure text transforms to a file already on the box.
 
@@ -615,7 +635,9 @@ def provision_steps() -> list:
             # succeeded, and the step reported success on a box that could
             # no longer authenticate anything. atomic_write removes the
             # truncation; `&&` removes the silence.
-            _remote_text_fix(PG_HBA_REMOTE, "rewrite_pg_hba")
+            _backup_once(PG_HBA_REMOTE)
+            + " && "
+            + _remote_text_fix(PG_HBA_REMOTE, "rewrite_pg_hba")
             + " && systemctl reload postgresql",
         ),
         Step(
@@ -674,7 +696,9 @@ def provision_steps() -> list:
         ),
         Step(
             "nginx: remove RHEL's stock default_server (Task 4's neutralise_default_server)",
-            _remote_text_fix(NGINX_MAIN_CONF_REMOTE, "neutralise_default_server")
+            _backup_once(NGINX_MAIN_CONF_REMOTE)
+            + " && "
+            + _remote_text_fix(NGINX_MAIN_CONF_REMOTE, "neutralise_default_server")
             + " && systemctl enable --now nginx",
         ),
         Step(
