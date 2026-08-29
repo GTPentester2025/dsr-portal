@@ -199,9 +199,14 @@ a rollback — role enforcement falls back to the application layer, where it
 lived before that migration:
 
 ```sql
-CREATE OR REPLACE FUNCTION app_role_may_write(text[]) RETURNS boolean
+CREATE OR REPLACE FUNCTION app_role_may_write(allowed text[]) RETURNS boolean
   AS $$ SELECT true $$ LANGUAGE sql STABLE;
 ```
+
+The parameter name (`allowed`) must match the real function's — `CREATE OR
+REPLACE` errors on a changed or dropped input parameter name rather than
+applying, and the only way past that is `DROP FUNCTION ... CASCADE`, which
+takes all fourteen policies in this migration with it.
 
 Restore the real function from the migration once the predicate is fixed.
 
