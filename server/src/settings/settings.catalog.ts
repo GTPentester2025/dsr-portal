@@ -22,6 +22,12 @@ export interface SettingDef {
   type: SettingType;
   /** Secrets are envelope-encrypted at rest and masked in API responses. */
   secret?: boolean;
+  /**
+   * Resolved from the environment only. A database row is ignored and the
+   * settings API refuses to write one, so the file on the server is the whole
+   * truth for this key.
+   */
+  envOnly?: boolean;
   help?: string;
   placeholder?: string;
   options?: { value: string; label: string }[];

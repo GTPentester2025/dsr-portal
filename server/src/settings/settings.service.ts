@@ -5,6 +5,20 @@ import { CryptoService } from '../crypto/crypto.service';
 import { AuditService } from '../audit/audit.service';
 import { SETTINGS, SETTINGS_BY_KEY, type SettingDef } from './settings.catalog';
 
+export function resolveValue(args: {
+  def?: SettingDef;
+  dbValue?: string;
+  envValue?: string;
+}): { value?: string; source: 'database' | 'environment' | 'default' | 'unset' } {
+  const { def, dbValue, envValue } = args;
+  if (!def?.envOnly && dbValue !== undefined && dbValue !== '') {
+    return { value: dbValue, source: 'database' };
+  }
+  if (envValue !== undefined && envValue !== '') return { value: envValue, source: 'environment' };
+  if (def?.default !== undefined) return { value: def.default, source: 'default' };
+  return { value: undefined, source: 'unset' };
+}
+
 /**
  * Runtime configuration with a database override layer.
  *
@@ -74,13 +88,12 @@ export class SettingsService implements OnModuleInit, OnModuleDestroy {
 
   /** Synchronous read: database value, then env, then catalog default. */
   get<T = string>(key: string, fallback?: T): T {
-    const fromDb = this.cache.get(key);
-    if (fromDb !== undefined && fromDb !== '') return fromDb as unknown as T;
-    const fromEnv = this.env.get<string>(key);
-    if (fromEnv !== undefined && fromEnv !== '') return fromEnv as unknown as T;
-    const def = SETTINGS_BY_KEY[key]?.default;
-    if (def !== undefined) return def as unknown as T;
-    return fallback as T;
+    const { value } = resolveValue({
+      def: SETTINGS_BY_KEY[key],
+      dbValue: this.cache.get(key),
+      envValue: this.env.get<string>(key),
+    });
+    return (value ?? fallback) as T;
   }
 
   getNumber(key: string, fallback: number): number {
@@ -111,9 +124,11 @@ export class SettingsService implements OnModuleInit, OnModuleDestroy {
     return SETTINGS.map((def) => {
       const inDb = this.cache.get(def.key);
       const inEnv = this.env.get<string>(def.key);
-      const source: 'database' | 'environment' | 'default' | 'unset' =
-        inDb ? 'database' : inEnv ? 'environment' : def.default ? 'default' : 'unset';
-      const effective = this.get<string>(def.key, '');
+      const { value: effective, source } = resolveValue({
+        def,
+        dbValue: inDb,
+        envValue: inEnv,
+      });
       return {
         key: def.key,
         value: def.secret ? '' : (effective ?? ''),
@@ -161,6 +176,11 @@ export class SettingsService implements OnModuleInit, OnModuleDestroy {
     for (const [key, rawValue] of Object.entries(patch)) {
       const def = SETTINGS_BY_KEY[key];
       if (!def) throw new BadRequestException(`Unknown setting: ${key}`);
+      if (def.envOnly) {
+        throw new BadRequestException(
+          `${def.label} is set in /etc/dsr/dsr-api.env and cannot be changed here.`,
+        );
+      }
       // App passwords are displayed in groups of four; the transport ignores them.
       const value = def.key === 'GMAIL_APP_PASSWORD' ? rawValue.replace(/\s+/g, '') : rawValue.trim();
       this.validate(def, value);
