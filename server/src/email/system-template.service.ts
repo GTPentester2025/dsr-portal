@@ -67,7 +67,8 @@ export class SystemTemplateService implements OnModuleInit {
   }
 
   async list(): Promise<SystemTemplateView[]> {
-    // Read while rendering outbound mail, where there is no user context.
+    // The admin console lists every system template; system_templates has no
+    // zone column to scope the read by.
     const rows = await this.db.system(async (_db, client) => {
       const res = await client.query('SELECT key, subject, html, updated_at FROM system_templates');
       return res.rows as { key: string; subject: string; html: string; updated_at: Date }[];
