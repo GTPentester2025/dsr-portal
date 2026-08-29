@@ -27,7 +27,7 @@ export class AdminUsersController {
   async listUsers(@Req() req: AuthedRequest, @Query('zone') zone?: string) {
     // Zone managers only see their own zone's team.
     const effectiveZone = req.user.role === 'zone_manager' ? req.user.zoneId : zone;
-    return this.db.system(async (_db, client) => {
+    return this.db.withContext(req.zoneCtx, async (_db, client) => {
       const res = await client.query(
         `SELECT id, email, name, role, zone_id, active, capacity_weight,
                 ooo_from, ooo_to, is_break_glass, created_at,
@@ -61,7 +61,7 @@ export class AdminUsersController {
       body.zoneId ?? null,
     );
     if (refusal) throw new BadRequestException(refusal);
-    const row = await this.db.system(async (_db, client) => {
+    const row = await this.db.withContext(req.zoneCtx, async (_db, client) => {
       const res = await client.query(
         `INSERT INTO users (email, name, role, zone_id, capacity_weight)
          VALUES ($1, $2, $3, $4, $5) RETURNING id`,
@@ -96,7 +96,7 @@ export class AdminUsersController {
     },
   ) {
     if (body?.role && !ROLES.has(body.role)) throw new BadRequestException('bad role');
-    const before = await this.db.system(async (_db, client) => {
+    const before = await this.db.withContext(req.zoneCtx, async (_db, client) => {
       const res = await client.query(`SELECT * FROM users WHERE id = $1`, [id]);
       return res.rows[0];
     });
@@ -112,7 +112,7 @@ export class AdminUsersController {
       body.zoneId !== undefined ? body.zoneId : before.zone_id,
     );
     if (refusal) throw new BadRequestException(refusal);
-    await this.db.system(async (_db, client) => {
+    await this.db.withContext(req.zoneCtx, async (_db, client) => {
       await client.query(
         `UPDATE users SET
            name = COALESCE($2, name),
@@ -154,7 +154,7 @@ export class AdminUsersController {
   @Requires('team.manage')
   getAssignmentConfig(@Req() req: AuthedRequest) {
     const ownZone = req.user.role === 'zone_manager' ? req.user.zoneId : null;
-    return this.db.system(async (_db, client) => {
+    return this.db.withContext(req.zoneCtx, async (_db, client) => {
       const res = ownZone
         ? await client.query(
             `SELECT * FROM assignment_config WHERE zone_id = $1 ORDER BY zone_id`,
@@ -219,7 +219,7 @@ export class AdminUsersController {
       }
       escalationAfterMinutes = value * factor;
     }
-    await this.db.system(async (_db, client) => {
+    await this.db.withContext(req.zoneCtx, async (_db, client) => {
       await client.query(
         `UPDATE assignment_config SET
            strategy = COALESCE($2, strategy),
@@ -245,7 +245,7 @@ export class AdminUsersController {
     @Req() req: AuthedRequest,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const rows = await this.db.system(async (_db, client) => {
+    const rows = await this.db.withContext(req.zoneCtx, async (_db, client) => {
       const q = await client.query(
         `SELECT name, email, role, zone_id, active, capacity_weight, ooo_from, ooo_to, created_at
            FROM users ORDER BY role, name`,
@@ -282,6 +282,8 @@ export class AdminUsersController {
     @Query('entityType') entityType?: string,
     @Query('entityId') entityId?: string,
   ) {
+    // Audit log reads are cross-zone by definition: an auditor's whole job is
+    // to see every zone, and the rows carry no zone column to filter on.
     const rows = await this.db.system(async (_db, client) => {
       const q = await client.query(
         `SELECT a.created_at, a.action, a.entity_type, a.entity_id, a.zone_id,
@@ -323,6 +325,8 @@ export class AdminUsersController {
     @Query('limit') limit?: string,
   ) {
     const n = Math.min(500, Math.max(1, Number(limit) || 100));
+    // Audit log reads are cross-zone by definition: an auditor's whole job is
+    // to see every zone, and the rows carry no zone column to filter on.
     return this.db.system(async (_db, client) => {
       const res = await client.query(
         `SELECT * FROM audit_log
