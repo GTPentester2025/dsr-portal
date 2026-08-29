@@ -181,8 +181,7 @@ export class SettingsService implements OnModuleInit, OnModuleDestroy {
           `${def.label} is set in /etc/dsr/dsr-api.env and cannot be changed here.`,
         );
       }
-      // App passwords are displayed in groups of four; the transport ignores them.
-      const value = def.key === 'GMAIL_APP_PASSWORD' ? rawValue.replace(/\s+/g, '') : rawValue.trim();
+      const value = rawValue.trim();
       this.validate(def, value);
 
       await this.db.system(async (_db, client) => {

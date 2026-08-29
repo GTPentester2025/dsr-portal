@@ -17,7 +17,6 @@ import type { AuthedRequest } from '../auth/auth.guard';
 import { SettingsService } from './settings.service';
 import { SETTINGS, SETTING_GROUPS } from './settings.catalog';
 import { EmailDispatcher } from '../email/email.module';
-import { GmailOauthService } from './gmail-oauth.service';
 
 /**
  * Runtime configuration API (admin only). Secret values are write-only: the
@@ -30,7 +29,6 @@ export class SettingsController {
   constructor(
     private readonly settings: SettingsService,
     private readonly email: EmailDispatcher,
-    private readonly gmailOauth: GmailOauthService,
   ) {}
 
   /** Field catalog plus current values, for rendering the Settings screen. */
@@ -78,25 +76,6 @@ export class SettingsController {
       };
     }
     return { applicable: true, steps, ok: steps.every((s) => s.ok) };
-  }
-
-  /**
-   * Start Gmail authorisation. Returns the Google consent URL for the browser
-   * to visit, plus the redirect address that must be registered on the client.
-   */
-  @Post('email/gmail/authorize')
-  authorizeGmail(@Req() req: AuthedRequest) {
-    return this.gmailOauth.begin(req.user.id);
-  }
-
-  /** The address to register in Google Cloud, shown in the UI before connecting. */
-  @Get('email/gmail/redirect-uri')
-  gmailRedirectUri() {
-    try {
-      return { redirectUri: this.gmailOauth.redirectUri() };
-    } catch (err) {
-      return { redirectUri: '', error: (err as Error).message };
-    }
   }
 
   /** Send a real test message through the active provider. */

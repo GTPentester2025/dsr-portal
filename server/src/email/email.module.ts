@@ -7,7 +7,6 @@ import type {
   SendResult,
   SendTransactionalOptions,
 } from './email-provider.interface';
-import { GmailProvider } from './gmail.provider';
 import { ConsoleProvider } from './console.provider';
 import { GraphProvider } from './graph.provider';
 import { SmtpProvider } from './smtp.provider';
@@ -27,7 +26,6 @@ import { AuthModule } from '../auth/auth.module';
 export class EmailDispatcher implements EmailProvider {
   constructor(
     private readonly settings: SettingsService,
-    private readonly gmail: GmailProvider,
     private readonly graph: GraphProvider,
     private readonly smtp: SmtpProvider,
     private readonly resend: ResendProvider,
@@ -43,18 +41,13 @@ export class EmailDispatcher implements EmailProvider {
     const which = this.activeName();
 
     if (which === 'smtp') return this.smtp.diagnose();
-    if (which === 'gmail' && this.settings.get<string>('GMAIL_AUTH', 'app-password') === 'app-password') {
-      return this.gmail.diagnose();
-    }
 
     const httpsHost =
       which === 'resend'
         ? 'api.resend.com'
         : which === 'graph'
           ? 'graph.microsoft.com'
-          : which === 'gmail'
-            ? 'gmail.googleapis.com'
-            : null;
+          : null;
     if (!httpsHost) return null;
 
     const steps = await diagnoseHttpsEndpoint(httpsHost);
@@ -80,8 +73,6 @@ export class EmailDispatcher implements EmailProvider {
   private active(): EmailProvider {
     const which = this.activeName();
     switch (which) {
-      case 'gmail':
-        return this.gmail;
       case 'graph':
         return this.graph;
       case 'smtp':
@@ -91,7 +82,7 @@ export class EmailDispatcher implements EmailProvider {
       case 'console':
         if (process.env.NODE_ENV === 'production' && process.env.ALLOW_CONSOLE_EMAIL !== 'true') {
           throw new Error(
-            'The console email adapter is not allowed in production. Choose Gmail or Microsoft Graph in Settings.',
+            'The console email adapter is not allowed in production. Set EMAIL_PROVIDER=graph in /etc/dsr/dsr-api.env.',
           );
         }
         return this.consoleProvider;
@@ -126,7 +117,6 @@ export class EmailDispatcher implements EmailProvider {
   imports: [forwardRef(() => AuthModule)],
   controllers: [SystemTemplateController],
   providers: [
-    GmailProvider,
     GraphProvider,
     SmtpProvider,
     ResendProvider,

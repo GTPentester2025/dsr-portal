@@ -84,7 +84,6 @@ export const SETTINGS: SettingDef[] = [
     default: 'gmail',
     help: 'Switching providers takes effect immediately, with no redeploy.',
     options: [
-      { value: 'gmail', label: 'Gmail (SMTP or API)' },
       { value: 'graph', label: 'Microsoft Graph (shared mailbox)' },
       { value: 'resend', label: 'Resend (HTTPS API - works where SMTP is blocked)' },
       { value: 'smtp', label: 'Custom SMTP server' },
@@ -106,90 +105,6 @@ export const SETTINGS: SettingDef[] = [
     type: 'email',
     placeholder: 'privacy@company.com',
     help: 'Address that case responses are sent from. Required for Microsoft Graph.',
-  },
-
-  // gmail
-  {
-    key: 'GMAIL_AUTH',
-    label: 'Gmail authentication',
-    group: 'email',
-    type: 'select',
-    default: 'app-password',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['gmail'] }],
-    options: [
-      { value: 'app-password', label: 'App password (SMTP)' },
-      { value: 'oauth2', label: 'OAuth2 (Gmail API)' },
-    ],
-  },
-  {
-    key: 'GMAIL_USER',
-    label: 'Gmail account',
-    group: 'email',
-    type: 'email',
-    placeholder: 'you@company.com',
-    visibleWhen: [{ key: 'EMAIL_PROVIDER', equals: ['gmail'] }],
-  },
-  {
-    key: 'GMAIL_APP_PASSWORD',
-    label: 'Gmail app password',
-    group: 'email',
-    type: 'password',
-    secret: true,
-    placeholder: 'xxxx xxxx xxxx xxxx',
-    help: 'Google Account, Security, 2-Step Verification, App passwords. Spaces are ignored.',
-    visibleWhen: [
-      { key: 'EMAIL_PROVIDER', equals: ['gmail'] },
-      { key: 'GMAIL_AUTH', equals: ['app-password'] },
-    ],
-  },
-  {
-    key: 'GMAIL_OAUTH_CLIENT_ID',
-    label: 'OAuth client ID',
-    group: 'email',
-    type: 'text',
-    visibleWhen: [
-      { key: 'EMAIL_PROVIDER', equals: ['gmail'] },
-      { key: 'GMAIL_AUTH', equals: ['oauth2'] },
-    ],
-  },
-  {
-    key: 'GMAIL_OAUTH_CLIENT_SECRET',
-    label: 'OAuth client secret',
-    group: 'email',
-    type: 'password',
-    secret: true,
-    visibleWhen: [
-      { key: 'EMAIL_PROVIDER', equals: ['gmail'] },
-      { key: 'GMAIL_AUTH', equals: ['oauth2'] },
-    ],
-  },
-  {
-    key: 'GMAIL_OAUTH_REFRESH_TOKEN',
-    label: 'OAuth refresh token',
-    group: 'email',
-    type: 'password',
-    secret: true,
-    visibleWhen: [
-      { key: 'EMAIL_PROVIDER', equals: ['gmail'] },
-      { key: 'GMAIL_AUTH', equals: ['oauth2'] },
-    ],
-  },
-
-  {
-    key: 'GMAIL_SMTP_PORT',
-    label: 'Gmail SMTP port',
-    group: 'email',
-    type: 'select',
-    default: '465',
-    help: 'This host blocks 25, 465 and 587, and Gmail offers no other port, so app-password sending cannot work here. Use OAuth2 instead, which sends over HTTPS.',
-    visibleWhen: [
-      { key: 'EMAIL_PROVIDER', equals: ['gmail'] },
-      { key: 'GMAIL_AUTH', equals: ['app-password'] },
-    ],
-    options: [
-      { value: '465', label: '465 - implicit TLS' },
-      { value: '587', label: '587 - STARTTLS' },
-    ],
   },
 
   // resend (https)

@@ -1,8 +1,6 @@
 import { Global, Module, forwardRef } from '@nestjs/common';
 import { SettingsService } from './settings.service';
 import { SettingsController } from './settings.controller';
-import { GmailCallbackController } from './gmail-callback.controller';
-import { GmailOauthService } from './gmail-oauth.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { EmailModule } from '../email/email.module';
 import { AuthModule } from '../auth/auth.module';
@@ -15,8 +13,8 @@ import { AuthModule } from '../auth/auth.module';
 @Global()
 @Module({
   imports: [forwardRef(() => EmailModule), forwardRef(() => AuthModule)],
-  controllers: [SettingsController, GmailCallbackController],
-  providers: [SettingsService, CryptoService, GmailOauthService],
+  controllers: [SettingsController],
+  providers: [SettingsService, CryptoService],
   exports: [SettingsService, CryptoService],
 })
 export class SettingsModule {}
