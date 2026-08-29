@@ -99,6 +99,10 @@ def validate_master_key(raw: str) -> None:
             "CRYPTO_MASTER_KEY is not valid base64. Generate one with: "
             "openssl rand -base64 32"
         )
+    # The length check is what catches the documented incident, not the
+    # format check above it: a 64-character hex string is valid base64 and
+    # decodes cleanly to 48 bytes, so it never reaches the binascii.Error
+    # branch. Delete this and the original bug comes back.
     if len(decoded) != 32:
         raise SecretsError(
             "CRYPTO_MASTER_KEY decodes to %d bytes; it must be exactly 32. "

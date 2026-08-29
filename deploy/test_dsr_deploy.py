@@ -149,6 +149,10 @@ DF_SEPARATE = """Filesystem     1B-blocks       Used  Available Capacity Mounted
 /dev/vdc1     10737418240 5368709120 5368709120      50% /home
 """
 
+DF_NUMERIC_FIRST_LINE = """/dev/header    10737418240 5368709120 5368709120      50% /header
+/dev/vda1      10737418240 8589934592 2147483648      80% /
+"""
+
 DF_SINGLE_ROOT = """Filesystem     1B-blocks       Used  Available Capacity Mounted on
 /dev/vda1     10737418240 8589934592 2147483648      80% /
 """
@@ -162,7 +166,17 @@ class TestDf(unittest.TestCase):
         self.assertEqual(mounts[1].total, 10737418240)
 
     def test_ignores_the_header(self):
+        # Weak on its own: df's real header is thrown out by the numeric
+        # filter too, because "1B-blocks" is not an int. The test below is
+        # the one that holds the [1:] slice in place.
         self.assertTrue(all(m.device != "Filesystem" for m in dd.parse_df(DF_SEPARATE)))
+
+    def test_the_first_line_is_dropped_even_when_it_would_parse(self):
+        # A first line whose columns are all numeric: nothing but the [1:]
+        # slice can exclude it. Verified by deleting the slice and watching
+        # this fail with ['/header', '/'] before restoring it.
+        text = DF_NUMERIC_FIRST_LINE
+        self.assertEqual([m.mountpoint for m in dd.parse_df(text)], ["/"])
 
     def test_longest_prefix_wins_not_first_match(self):
         mounts = dd.parse_df(DF_SEPARATE)
