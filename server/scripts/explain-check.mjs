@@ -42,6 +42,32 @@ check(
 );
 check('case list does not fall back to a sequential scan', !listPlan.includes('"Seq Scan"'));
 
+// The export continues from a cursor with a row-value comparison. The planner
+// can only start the scan at the cursor if both columns are in the index, in
+// this order; with created_at alone the comparison becomes a filter and every
+// batch re-walks the rows already exported.
+const keysetPlan = await plan(
+  `SELECT c.id FROM cases c
+     WHERE (c.created_at, c.id) < (now()::timestamptz, gen_random_uuid())
+     ORDER BY c.created_at DESC, c.id DESC LIMIT 1000`,
+);
+check(
+  'export keyset starts the scan at the cursor',
+  keysetPlan.includes('cases_created_ix') && !keysetPlan.includes('"Sort"'),
+  `plan was ${keysetPlan.slice(0, 300)}`,
+);
+
+const auditPlan = await plan(
+  `SELECT a.id FROM audit_log a
+     WHERE (a.created_at, a.id) < (now()::timestamptz, 0::bigint)
+     ORDER BY a.created_at DESC, a.id DESC LIMIT 1000`,
+);
+check(
+  'audit log export keyset uses its own composite index',
+  auditPlan.includes('audit_log_created_id_ix'),
+  `plan was ${auditPlan.slice(0, 300)}`,
+);
+
 const fieldPlan = await plan(
   `SELECT value_json FROM case_fields WHERE case_id = gen_random_uuid() AND field_key = 'country' LIMIT 1`,
 );
