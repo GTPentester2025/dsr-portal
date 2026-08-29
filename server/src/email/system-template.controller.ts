@@ -36,12 +36,12 @@ export class SystemTemplateController {
     @Param('key') key: string,
     @Body() body: { subject: string; html: string },
   ) {
-    return this.templates.save(key, body?.subject ?? '', body?.html ?? '', req.user.id);
+    return this.templates.save(req.zoneCtx, key, body?.subject ?? '', body?.html ?? '', req.user.id);
   }
 
   @Delete(':key')
   reset(@Req() req: AuthedRequest, @Param('key') key: string) {
-    return this.templates.reset(key, req.user.id);
+    return this.templates.reset(req.zoneCtx, key, req.user.id);
   }
 
   /** Fill placeholders with sample values so an edit can be checked safely. */

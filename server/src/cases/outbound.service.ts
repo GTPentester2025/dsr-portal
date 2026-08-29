@@ -65,16 +65,19 @@ export class OutboundService {
     });
   }
 
-  async upsertTemplate(args: {
-    id?: string;
-    zoneId?: string | null;
-    requestType?: string | null;
-    name: string;
-    subject: string;
-    body: string;
-    category?: string;
-    actorId: string;
-  }) {
+  async upsertTemplate(
+    ctx: ZoneContext,
+    args: {
+      id?: string;
+      zoneId?: string | null;
+      requestType?: string | null;
+      name: string;
+      subject: string;
+      body: string;
+      category?: string;
+      actorId: string;
+    },
+  ) {
     if (!args.name?.trim() || !args.subject?.trim() || !args.body?.trim()) {
       throw new BadRequestException('name, subject and body are required');
     }
@@ -82,7 +85,7 @@ export class OutboundService {
     if (!TEMPLATE_CATEGORIES.some((c) => c.value === category)) {
       throw new BadRequestException('Unknown template category');
     }
-    const row = await this.db.system(async (db) => {
+    const row = await this.db.withContext(ctx, async (db) => {
       if (args.id) {
         const existing = await db.query.templates.findFirst({ where: eq(templates.id, args.id) });
         if (!existing) throw new NotFoundException();

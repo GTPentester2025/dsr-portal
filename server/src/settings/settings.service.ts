@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DbService } from '../db/db.module';
+import { DbService, type ZoneContext } from '../db/db.module';
 import { CryptoService } from '../crypto/crypto.service';
 import { AuditService } from '../audit/audit.service';
 import { SETTINGS, SETTINGS_BY_KEY, type SettingDef } from './settings.catalog';
@@ -54,6 +54,7 @@ export class SettingsService implements OnModuleInit, OnModuleDestroy {
   /** Reload the in-memory cache from the database. */
   async refresh(): Promise<void> {
     try {
+      // Boot and timer path: the cache is loaded before any user exists.
       const rows = await this.db.system(async (_db, client) => {
         const res = await client.query(
           'SELECT key, value, value_enc, secret FROM app_settings',
@@ -167,6 +168,7 @@ export class SettingsService implements OnModuleInit, OnModuleDestroy {
    * clears the stored override so the environment value applies again.
    */
   async updateMany(
+    ctx: ZoneContext,
     patch: Record<string, string>,
     actorId: string,
     ip?: string,
@@ -184,7 +186,7 @@ export class SettingsService implements OnModuleInit, OnModuleDestroy {
       const value = rawValue.trim();
       this.validate(def, value);
 
-      await this.db.system(async (_db, client) => {
+      await this.db.withContext(ctx, async (_db, client) => {
         if (value === '') {
           await client.query('DELETE FROM app_settings WHERE key = $1', [key]);
           return;

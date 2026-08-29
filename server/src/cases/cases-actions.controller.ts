@@ -128,7 +128,7 @@ export class CasesActionsController {
       name: string; subject: string; body: string; category?: string;
     },
   ) {
-    return this.outbound.upsertTemplate({ ...body, actorId: req.user.id });
+    return this.outbound.upsertTemplate(req.zoneCtx, { ...body, actorId: req.user.id });
   }
 
   @Get('cases/:id/draft-email')

@@ -51,7 +51,7 @@ export class SettingsController {
     if (!values || typeof values !== 'object' || Array.isArray(values)) {
       throw new BadRequestException('values object is required');
     }
-    const result = await this.settings.updateMany(values, req.user.id, ip);
+    const result = await this.settings.updateMany(req.zoneCtx, values, req.user.id, ip);
     return { ...result, values: await this.settings.describeAll() };
   }
 

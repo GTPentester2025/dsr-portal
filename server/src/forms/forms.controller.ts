@@ -84,7 +84,7 @@ export class FormsController {
     const current = await this.forms.get(key);
     this.assertZone(req, current.schema.zone);
     if (!body || typeof body !== 'object') throw new BadRequestException('A schema body is required');
-    return this.forms.publish(key, body, req.user.id, ip);
+    return this.forms.publish(req.zoneCtx, key, body, req.user.id, ip);
   }
 
   @Post(':key/restore/:version')
@@ -99,7 +99,7 @@ export class FormsController {
     this.assertZone(req, current.schema.zone);
     const n = Number(version);
     if (!Number.isInteger(n) || n < 1) throw new BadRequestException('bad version');
-    return this.forms.restore(key, n, req.user.id, ip);
+    return this.forms.restore(req.zoneCtx, key, n, req.user.id, ip);
   }
 }
 

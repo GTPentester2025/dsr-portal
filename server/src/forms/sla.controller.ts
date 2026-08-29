@@ -69,6 +69,8 @@ export class SlaPolicyController {
   @Get()
   @Requires('config.manage')
   async list(@Req() req: AuthedRequest) {
+    // The SLA matrix lists every zone's policies for an administrator; these
+    // rows are configuration, not case data.
     const rows = await this.db.system(async (_db, client) => {
       const res = await client.query(
         `SELECT id, zone_id, request_type, target_minutes, business_days, timezone,
@@ -119,7 +121,7 @@ export class SlaPolicyController {
       throw new BadRequestException('Holidays must be ISO dates such as 2026-12-25');
     }
 
-    const before = await this.db.system(async (_db, client) => {
+    const before = await this.db.withContext(req.zoneCtx, async (_db, client) => {
       const res = await client.query(
         'SELECT * FROM sla_policies WHERE zone_id = $1 AND request_type = $2',
         [zone, requestType],
@@ -127,7 +129,7 @@ export class SlaPolicyController {
       return res.rows[0];
     });
 
-    await this.db.system(async (_db, client) => {
+    await this.db.withContext(req.zoneCtx, async (_db, client) => {
       await client.query(
         `INSERT INTO sla_policies
            (zone_id, request_type, target_minutes, business_days, timezone, holidays,
@@ -186,7 +188,7 @@ export class SlaPolicyController {
     if (requestType === '*') {
       throw new BadRequestException('The fallback policy for a zone cannot be removed');
     }
-    await this.db.system(async (_db, client) => {
+    await this.db.withContext(req.zoneCtx, async (_db, client) => {
       await client.query('DELETE FROM sla_policies WHERE zone_id = $1 AND request_type = $2', [
         zone,
         requestType,

@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { DbService } from '../db/db.module';
+import { DbService, type ZoneContext } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
 
 /** Component types the public renderer knows how to draw. */
@@ -94,6 +94,8 @@ export class FormsService {
       updatedAt: string;
     }[]
   > {
+    // The forms screen lists every zone's schema for an administrator; these
+    // rows are configuration, not case data.
     return this.db.system(async (_db, client) => {
       const res = await client.query(`
         SELECT DISTINCT ON (form_key) form_key, zone_id, version, schema, imported_at
@@ -116,6 +118,8 @@ export class FormsService {
   /** Latest published schema for one form. */
   async get(key: string): Promise<{ version: number; schema: FormSchemaDoc }> {
     if (!/^[a-z0-9-]{1,50}$/.test(key)) throw new BadRequestException('bad form key');
+    // The forms screen lists every zone's schema for an administrator; these
+    // rows are configuration, not case data.
     return this.db.system(async (_db, client) => {
       const res = await client.query(
         'SELECT version, schema FROM form_versions WHERE form_key = $1 ORDER BY version DESC LIMIT 1',
@@ -130,6 +134,8 @@ export class FormsService {
 
   /** Version history, so an operator can see when a form changed. */
   async history(key: string) {
+    // The forms screen lists every zone's schema for an administrator; these
+    // rows are configuration, not case data.
     return this.db.system(async (_db, client) => {
       const res = await client.query(
         `SELECT version, imported_at FROM form_versions WHERE form_key = $1 ORDER BY version DESC LIMIT 30`,
@@ -144,6 +150,7 @@ export class FormsService {
    * the version they were submitted under, so history always renders correctly.
    */
   async publish(
+    ctx: ZoneContext,
     key: string,
     incoming: Partial<FormSchemaDoc>,
     actorId: string,
@@ -159,7 +166,7 @@ export class FormsService {
     };
     validateSchema(next);
 
-    const version = await this.db.system(async (_db, client) => {
+    const version = await this.db.withContext(ctx, async (_db, client) => {
       const res = await client.query(
         `INSERT INTO form_versions (form_key, zone_id, version, schema)
          VALUES ($1, $2, (SELECT COALESCE(MAX(version), 0) + 1 FROM form_versions WHERE form_key = $1), $3)
@@ -185,7 +192,9 @@ export class FormsService {
   }
 
   /** Roll back by re-publishing an older version as the newest one. */
-  async restore(key: string, version: number, actorId: string, ip?: string) {
+  async restore(ctx: ZoneContext, key: string, version: number, actorId: string, ip?: string) {
+    // The forms screen lists every zone's schema for an administrator; these
+    // rows are configuration, not case data.
     const schema = await this.db.system(async (_db, client) => {
       const res = await client.query(
         'SELECT schema FROM form_versions WHERE form_key = $1 AND version = $2',
@@ -194,7 +203,7 @@ export class FormsService {
       if (res.rowCount === 0) throw new NotFoundException('Version not found');
       return res.rows[0].schema as FormSchemaDoc;
     });
-    const result = await this.publish(key, schema, actorId, ip);
+    const result = await this.publish(ctx, key, schema, actorId, ip);
     await this.audit.record({
       actorId,
       actorType: 'user',

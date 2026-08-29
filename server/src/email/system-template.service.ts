@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { DbService } from '../db/db.module';
+import { DbService, type ZoneContext } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
 import {
   TEMPLATE_LABELS,
@@ -47,6 +47,7 @@ export class SystemTemplateService implements OnModuleInit {
 
   async refresh(): Promise<void> {
     try {
+      // Read while rendering outbound mail, where there is no user context.
       const rows = await this.db.system(async (_db, client) => {
         const res = await client.query('SELECT key, subject, html FROM system_templates');
         return res.rows as { key: string; subject: string; html: string }[];
@@ -66,6 +67,7 @@ export class SystemTemplateService implements OnModuleInit {
   }
 
   async list(): Promise<SystemTemplateView[]> {
+    // Read while rendering outbound mail, where there is no user context.
     const rows = await this.db.system(async (_db, client) => {
       const res = await client.query('SELECT key, subject, html, updated_at FROM system_templates');
       return res.rows as { key: string; subject: string; html: string; updated_at: Date }[];
@@ -92,6 +94,7 @@ export class SystemTemplateService implements OnModuleInit {
   }
 
   async save(
+    ctx: ZoneContext,
     key: string,
     subject: string,
     html: string,
@@ -111,7 +114,7 @@ export class SystemTemplateService implements OnModuleInit {
       );
     }
 
-    await this.db.system(async (_db, client) => {
+    await this.db.withContext(ctx, async (_db, client) => {
       await client.query(
         `INSERT INTO system_templates (key, subject, html, updated_by, updated_at)
          VALUES ($1, $2, $3, $4, now())
@@ -135,9 +138,9 @@ export class SystemTemplateService implements OnModuleInit {
   }
 
   /** Drop the override so the built-in applies again. */
-  async reset(key: string, actorId: string): Promise<{ ok: true }> {
+  async reset(ctx: ZoneContext, key: string, actorId: string): Promise<{ ok: true }> {
     if (!defaultTemplate(key)) throw new BadRequestException('Unknown template');
-    await this.db.system(async (_db, client) => {
+    await this.db.withContext(ctx, async (_db, client) => {
       await client.query('DELETE FROM system_templates WHERE key = $1', [key]);
     });
     await this.refresh();
