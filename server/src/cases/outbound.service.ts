@@ -45,7 +45,15 @@ export class OutboundService {
   static readonly CATEGORIES = TEMPLATE_CATEGORIES;
 
   listTemplates(ctx: ZoneContext, zone?: string, requestType?: string) {
-    return this.db.system(async (_db, client) => {
+    // The caller's own context, not system(). This route takes a ?zone=
+    // parameter, so running it unrestricted returned any zone's templates to
+    // any signed-in caller who asked for them by name. Under 0013's templates
+    // policy the same query gives a zone manager or an approver their own zone
+    // plus the global (zone_id IS NULL) templates, and ?zone= narrows within
+    // that instead of reaching outside it; a '*' context still sees them all.
+    // templates carries no RLS until 0013 runs, so this is the context being
+    // threaded ahead of the policy that will act on it.
+    return this.db.withContext(ctx, async (_db, client) => {
       const res = await client.query(
         `SELECT * FROM templates
           WHERE active

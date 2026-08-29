@@ -94,8 +94,11 @@ export class FormsService {
       updatedAt: string;
     }[]
   > {
-    // The forms screen lists every zone's schema for an administrator; these
-    // rows are configuration, not case data.
+    // system() because the two callers need opposite things and neither can
+    // supply a zone context: PublicFormsController.manifest is unauthenticated
+    // and has no session at all, and FormsController.list filters the result
+    // to the caller's own zone afterwards. These rows are configuration, not
+    // case data.
     return this.db.system(async (_db, client) => {
       const res = await client.query(`
         SELECT DISTINCT ON (form_key) form_key, zone_id, version, schema, imported_at
@@ -118,8 +121,12 @@ export class FormsService {
   /** Latest published schema for one form. */
   async get(key: string): Promise<{ version: number; schema: FormSchemaDoc }> {
     if (!/^[a-z0-9-]{1,50}$/.test(key)) throw new BadRequestException('bad form key');
-    // The forms screen lists every zone's schema for an administrator; these
-    // rows are configuration, not case data.
+    // system() because the dominant caller is unauthenticated: every data
+    // subject fetches their form's schema through PublicFormsController before
+    // any session, user or zone context exists. Tightening this to
+    // withContext(req.zoneCtx) would take the public intake form offline for
+    // everyone. The admin path checks the form's own zone in the controller
+    // (assertZone) instead.
     return this.db.system(async (_db, client) => {
       const res = await client.query(
         'SELECT version, schema FROM form_versions WHERE form_key = $1 ORDER BY version DESC LIMIT 1',
@@ -134,8 +141,12 @@ export class FormsService {
 
   /** Version history, so an operator can see when a form changed. */
   async history(key: string) {
-    // The forms screen lists every zone's schema for an administrator; these
-    // rows are configuration, not case data.
+    // One form's version list, not a listing across zones. system() because
+    // the method takes no ZoneContext: its only caller has already resolved
+    // the form and checked its zone (assertZone) before getting here, and
+    // these rows carry no case data -- just which version was published when.
+    // Give it a ZoneContext rather than widening anything here if it ever
+    // gains a caller that has not already made that check.
     return this.db.system(async (_db, client) => {
       const res = await client.query(
         `SELECT version, imported_at FROM form_versions WHERE form_key = $1 ORDER BY version DESC LIMIT 30`,
@@ -193,8 +204,11 @@ export class FormsService {
 
   /** Roll back by re-publishing an older version as the newest one. */
   async restore(ctx: ZoneContext, key: string, version: number, actorId: string, ip?: string) {
-    // The forms screen lists every zone's schema for an administrator; these
-    // rows are configuration, not case data.
+    // A single-key lookup of the payload to be re-published, not a listing.
+    // system() reads it; nothing is authorized here. The write that follows
+    // goes through publish() under the caller's own ctx, which is where the
+    // zone and the role are enforced -- and the controller has already checked
+    // the form's zone before calling.
     const schema = await this.db.system(async (_db, client) => {
       const res = await client.query(
         'SELECT schema FROM form_versions WHERE form_key = $1 AND version = $2',
