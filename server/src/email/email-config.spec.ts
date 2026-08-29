@@ -1,4 +1,10 @@
-import { REQUIRED_GRAPH_KEYS, missingEmailKeys, assertEmailConfig } from './email-config';
+import {
+  EMAIL_PROVIDERS,
+  REQUIRED_GRAPH_KEYS,
+  assertEmailConfig,
+  missingEmailKeys,
+  unknownEmailProvider,
+} from './email-config';
 
 const full: Record<string, string> = {
   EMAIL_PROVIDER: 'graph',
@@ -50,5 +56,62 @@ describe('assertEmailConfig', () => {
     const output = log.error.mock.calls.flat().join('\n');
     for (const key of REQUIRED_GRAPH_KEYS) expect(output).toContain(key);
     expect(output).toContain('/opt/dsr/server/.env');
+  });
+});
+
+describe('unknownEmailProvider', () => {
+  it.each([...EMAIL_PROVIDERS])('accepts %s', (provider) => {
+    expect(unknownEmailProvider(reader({ EMAIL_PROVIDER: provider }))).toBeNull();
+  });
+
+  it('accepts an unset provider, which means the graph default', () => {
+    expect(unknownEmailProvider(reader({}))).toBeNull();
+    expect(unknownEmailProvider(reader({ EMAIL_PROVIDER: '' }))).toBeNull();
+  });
+
+  // The shapes a hand-edited env file actually produces. Every one of these
+  // used to pass boot validation and then throw on the first send.
+  it.each([
+    ['wrong case', 'Graph'],
+    ['a trailing space', 'graph '],
+    ['a leading space', ' graph'],
+    ['whitespace only', '   '],
+    ['a provider removed from this branch', 'smtp'],
+    ['a typo', 'grahp'],
+  ])('rejects %s', (_label, value) => {
+    expect(unknownEmailProvider(reader({ EMAIL_PROVIDER: value }))).toBe(value);
+  });
+});
+
+describe('assertEmailConfig on an unrecognised provider', () => {
+  const badGraph = { EMAIL_PROVIDER: 'Graph' };
+
+  it('refuses to boot even though no Graph key is required', () => {
+    expect(missingEmailKeys(reader(badGraph))).toEqual([]);
+    expect(() => assertEmailConfig(reader(badGraph), { error: jest.fn() })).toThrow(
+      /Unknown email provider: Graph/,
+    );
+  });
+
+  it('reports the bad value and the legal ones, not a list of missing keys', () => {
+    const log = { error: jest.fn() };
+    expect(() => assertEmailConfig(reader(badGraph), log)).toThrow();
+    const output = log.error.mock.calls.flat().join('\n');
+    expect(output).toContain('"Graph"');
+    for (const provider of EMAIL_PROVIDERS) expect(output).toContain(provider);
+    expect(output).toContain('/opt/dsr/server/.env');
+    for (const key of REQUIRED_GRAPH_KEYS) expect(output).not.toContain(key);
+  });
+
+  it('quotes the value so a trailing space is visible', () => {
+    const log = { error: jest.fn() };
+    expect(() =>
+      assertEmailConfig(reader({ ...full, EMAIL_PROVIDER: 'graph ' }), log),
+    ).toThrow();
+    expect(log.error.mock.calls.flat().join('\n')).toContain('"graph "');
+  });
+
+  it('still passes a complete, correctly spelled configuration', () => {
+    expect(() => assertEmailConfig(reader(full), { error: jest.fn() })).not.toThrow();
   });
 });

@@ -281,7 +281,7 @@ caller ─► EMAIL_PROVIDER (EmailDispatcher)
 """)
 bullets(doc, [
     "Graph and console are the only adapters. Provider choice and every Graph credential are `envOnly` catalog entries (§4.6): `EMAIL_PROVIDER`, `PRIVACY_MAILBOX`, `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`. A database row can never shadow the value in `/opt/dsr/server/.env`, and `PUT /internal/admin/settings` returns `400` for any of the five. There is no sender-name key: the display name on outgoing mail comes from the shared mailbox's properties in Exchange, and no adapter reads one.",
-    "`assertEmailConfig()` (`email-config.ts`) runs in `main.ts` before `app.listen()`. When `EMAIL_PROVIDER=graph`, all four required keys must be non-empty or the process exits non-zero, naming every missing key and the env file path in the log.",
+    "`assertEmailConfig()` (`email-config.ts`) runs in `main.ts` before `app.listen()`. `EMAIL_PROVIDER` must be exactly `graph` or `console` — `Graph`, `graph ` and a leftover `smtp` are rejected by name, rather than passing a check that requires nothing of them and then throwing on the first send. When it is `graph`, all four required keys must be non-empty. Either failure exits non-zero, naming the offending value or every missing key, and the env file path.",
     "`net-diagnostics.ts` (`diagnoseHttpsEndpoint`) checks DNS then a TCP connect to `graph.microsoft.com:443`; `EmailDispatcher.diagnose()` appends an authenticated `verifyConnection()` call as a third stage, so a failure names DNS, transport or credentials rather than one opaque timeout.",
 ])
 
