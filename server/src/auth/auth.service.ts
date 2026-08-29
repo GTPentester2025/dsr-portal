@@ -5,6 +5,8 @@ import { DbService, ZoneContext } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
 import { SettingsService } from '../settings/settings.service';
 import { seesEveryZone } from './permissions';
+import { PasswordStrategy, type AuthenticatedIdentity } from './password.strategy';
+import { canUsePassword } from './break-glass';
 
 const DEFAULT_IDLE_TIMEOUT_MIN = 30;
 const DEFAULT_ABSOLUTE_LIFETIME_H = 8;
@@ -41,6 +43,7 @@ export class AuthService {
     private readonly db: DbService,
     private readonly audit: AuditService,
     private readonly settings: SettingsService,
+    private readonly password: PasswordStrategy,
   ) {}
 
   /** Session lifetimes are operator-configurable from the Settings screen. */
@@ -64,53 +67,67 @@ export class AuthService {
     return argon2.hash(password, { type: argon2.argon2id, memoryCost: 65536, timeCost: 3 });
   }
 
-  async login(email: string, password: string, ip: string): Promise<{ sessionId: string; user: SessionUser }> {
-    const norm = email.trim().toLowerCase();
-    const row = await this.db.system(async (_db, client) => {
-      const res = await client.query(
-        `SELECT id, email, name, role, zone_id, active, password_hash, must_change_password
-           FROM users WHERE lower(email) = $1`,
-        [norm],
-      );
-      return res.rows[0];
-    });
-
-    // Verify against a dummy hash when the user is unknown → no timing oracle.
-    const hash =
-      row?.password_hash ??
-      '$argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$5vEDiXTDJWjhAfXpNZ92K2wZG2I5PpP0S3RTZ2VNjHY';
-    const valid = await argon2.verify(hash, password).catch(() => false);
-    if (!row || !row.active || !row.password_hash || !valid) {
-      await this.audit.record({
-        actorType: 'user',
-        action: 'auth.login_failed',
-        entityType: 'user',
-        entityId: row?.id,
-        sourceIp: ip,
-      });
-      throw new UnauthorizedException('Invalid credentials');
-    }
-
+  /**
+   * Everything that happens after a strategy has proved who the caller is.
+   * Provider-agnostic on purpose: an identity-provider strategy calls this with
+   * its own `via`, so there is one place that creates a session and one place
+   * that records a successful sign-in.
+   */
+  async startSession(
+    identity: AuthenticatedIdentity,
+    ip: string,
+    via: string,
+  ): Promise<{ sessionId: string; user: SessionUser }> {
     const sessionId = randomBytes(32).toString('base64url');
     await this.db.system(async (_db, client) => {
       await client.query(
         `INSERT INTO internal_sessions (id, user_id, absolute_expires_at, source_ip)
          VALUES ($1, $2, now() + interval '${this.absoluteHours} hours', $3)`,
-        [sessionId, row.id, ip],
+        [sessionId, identity.id, ip],
       );
     });
     await this.audit.record({
-      actorId: row.id,
+      actorId: identity.id,
       actorType: 'user',
       action: 'auth.login',
       entityType: 'user',
-      entityId: row.id,
+      entityId: identity.id,
+      after: { via },
       sourceIp: ip,
     });
     return {
       sessionId,
-      user: { id: row.id, email: row.email, name: row.name, role: row.role, zoneId: row.zone_id },
+      user: {
+        id: identity.id,
+        email: identity.email,
+        name: identity.name,
+        role: identity.role,
+        zoneId: identity.zoneId,
+      },
     };
+  }
+
+  async login(email: string, password: string, ip: string): Promise<{ sessionId: string; user: SessionUser }> {
+    const identity = await this.password.authenticate(email, password, ip);
+    if (!identity) throw new UnauthorizedException('Invalid credentials');
+
+    // Policy AFTER authentication, never before: checking first would tell an
+    // unauthenticated caller which accounts keep a password.
+    const ssoEnabled = this.settings.get<string>('SSO_ENABLED', 'false') === 'true';
+    const refusal = canUsePassword(identity, ssoEnabled);
+    if (refusal) {
+      await this.audit.record({
+        actorId: identity.id,
+        actorType: 'user',
+        action: 'auth.login_refused_sso',
+        entityType: 'user',
+        entityId: identity.id,
+        sourceIp: ip,
+      });
+      throw new UnauthorizedException(refusal);
+    }
+
+    return this.startSession(identity, ip, 'password');
   }
 
   /** Validates idle + absolute timeouts, touches last_seen, returns the user. */

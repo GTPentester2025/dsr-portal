@@ -108,7 +108,11 @@ confirms (§14.3/.4), including business-day calendars and holiday lists.
 - SSO: internal auth is session-based with an OIDC-shaped user model; local
   break-glass credentials exist only via `scripts/create-user.mjs`
   (argon2id, 14+ char policy, rate-limited login, idle + absolute timeouts).
-  Wire your IdP before go-live and enforce MFA there.
+  Wire your IdP before go-live and enforce MFA there. `SSO_ENABLED`
+  (environment-only, default `false`) is the enforcement switch: once true,
+  password sign-in is refused for everyone except super admins and accounts
+  flagged `is_break_glass`. Turning it on before an identity provider is
+  actually wired locks out every other account with no way back in.
 - Azure for Graph: app registration + `Mail.Send` **application** permission
   + admin consent + an application access policy restricting the app to the
   privacy shared mailbox. Config: `GRAPH_TENANT_ID/CLIENT_ID/CLIENT_SECRET`,

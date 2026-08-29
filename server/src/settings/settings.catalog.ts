@@ -159,6 +159,18 @@ export const SETTINGS: SettingDef[] = [
     secret: true,
   },
   {
+    key: 'SSO_ENABLED',
+    label: 'Single sign-on enforced',
+    group: 'security',
+    type: 'boolean',
+    default: 'false',
+    envOnly: true,
+    help:
+      'When true, password sign-in is refused for everyone except super admins ' +
+      'and break-glass accounts. Set in /opt/dsr/server/.env. Leave false until ' +
+      'an identity provider is actually configured.',
+  },
+  {
     key: 'SESSION_IDLE_MINUTES',
     label: 'Session idle timeout',
     group: 'security',
