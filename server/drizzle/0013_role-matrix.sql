@@ -128,10 +128,25 @@ CREATE POLICY email_log_delete_role ON email_log AS RESTRICTIVE FOR DELETE
 -- zone manager cannot mint one (app_role_may_write below separately excludes
 -- auditor from the write array regardless of zone).
 --
--- Do NOT add `OR zone_id IS NULL` to this policy: that disjunct is correct
--- for the zone-scoped config tables below, whose zone_id is nullable for
--- legitimate global rows, but here it would let a zone manager write a
--- global (cross-zone) account -- a privilege escalation.
+-- The `OR zone_id IS NULL` disjunct below is deliberate in USING and
+-- deliberately absent from WITH CHECK. Do not move it across: the two clauses
+-- answer different questions.
+--
+--   USING: it must stay. A global (zone-less) account has to remain readable
+--   from a single-zone context, because assignment.service.ts accepts a
+--   null-zone user as a case assignee -- drop the disjunct and a zone manager
+--   can no longer assign a case to an admin.
+--
+--   WITH CHECK: it must not appear. There it describes the row that ends up
+--   stored, so it would let a zone manager create an account belonging to no
+--   zone, or move one of theirs out of every zone -- a privilege escalation.
+--
+-- USING is not only a read predicate, though: for UPDATE it also selects the
+-- row to be modified. The disjunct alone would therefore let a zone manager
+-- pinned to EUR pick up a global admin account and rewrite it to
+-- zone_id = 'EUR', which then satisfies WITH CHECK. users_update_zone below
+-- puts the zone term back for UPDATE, exactly as users_delete_role does for
+-- DELETE.
 
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 --> statement-breakpoint
@@ -147,6 +162,21 @@ CREATE POLICY users_zone_role ON users
 CREATE POLICY users_delete_role ON users AS RESTRICTIVE FOR DELETE
   USING (app_zone_allows(zone_id)
     AND app_role_may_write(ARRAY['system','super_admin','admin','zone_manager']));
+--> statement-breakpoint
+-- The same zone term, restored for UPDATE. app_zone_allows(NULL) is NULL for a
+-- zone manager pinned to one zone, and a RESTRICTIVE policy treats anything
+-- but true as failure, so a global account is simply not there to be updated
+-- from inside a zone. A zone = '*' context passes on app_zone_allows's first
+-- disjunct whatever zone_id holds, which covers admin and super_admin
+-- sessions and also auth.service.ts -- it writes users under system(), which
+-- belongs to no zone but runs at '*'.
+--
+-- Deliberately no WITH CHECK: Postgres then reuses this USING as the UPDATE's
+-- WITH CHECK, and that is the predicate users_zone_role already applies to the
+-- stored row, so this restricts which row may be picked up without restricting
+-- what it may become.
+CREATE POLICY users_update_zone ON users AS RESTRICTIVE FOR UPDATE
+  USING (app_zone_allows(zone_id));
 --> statement-breakpoint
 
 -- form_versions, sla_policies, templates and assignment_config are all
