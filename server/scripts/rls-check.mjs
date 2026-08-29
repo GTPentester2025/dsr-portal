@@ -13,6 +13,19 @@ await admin.query(`
          ('DSR-MAZ-2026-00001','MAZ','maz-mexico',23,'enc','h2','new')
 `);
 
+// seed users for the --roles matrix: one zone-scoped, one global (zone_id
+// IS NULL) -- both inserted as the owner role, which bypasses RLS.
+await admin.query(`
+  INSERT INTO users (email, name, role, zone_id)
+  VALUES ('rls-probe@example.com','RLS Probe','approver','EUR')
+  ON CONFLICT (email) DO NOTHING
+`);
+await admin.query(`
+  INSERT INTO users (email, name, role, zone_id)
+  VALUES ('rls-probe-global@example.com','RLS Probe Global','admin',NULL)
+  ON CONFLICT (email) DO NOTHING
+`);
+
 const app = new pg.Client(process.env.DATABASE_URL_APP ?? 'postgres://dsr_app:dsr_app@127.0.0.1:5433/dsr');
 await app.connect();
 
@@ -64,6 +77,80 @@ await admin.query(`INSERT INTO audit_log (action, entity_type) VALUES ('test','x
 let blocked = false;
 try { await admin.query(`DELETE FROM audit_log`); } catch { blocked = true; }
 check('audit_log DELETE blocked even for owner', blocked);
+
+// --roles: prove the write matrix from 0013_role-matrix.sql. Zone isolation is
+// covered above; this asserts who may write, per role, per table.
+if (process.argv.includes('--roles')) {
+  const tryWrite = async (role, zone, sql) => {
+    try {
+      await app.query('BEGIN');
+      await app.query(
+        `SELECT set_config('app.current_role', $1, true), set_config('app.current_zone', $2, true)`,
+        [role, zone],
+      );
+      await app.query(sql);
+      await app.query('ROLLBACK');
+      return true;
+    } catch {
+      await app.query('ROLLBACK');
+      return false;
+    }
+  };
+
+  // DELETE is governed by a RESTRICTIVE USING-only policy (0013): a role that
+  // fails it does not raise, it just leaves the row unmatched, so rowCount
+  // (not a thrown error) is what distinguishes "blocked" from "allowed".
+  const tryDelete = async (role, zone, sql) => {
+    await app.query('BEGIN');
+    await app.query(
+      `SELECT set_config('app.current_role', $1, true), set_config('app.current_zone', $2, true)`,
+      [role, zone],
+    );
+    let deleted = 0;
+    try {
+      const r = await app.query(sql);
+      deleted = r.rowCount;
+    } catch {
+      deleted = 0;
+    } finally {
+      await app.query('ROLLBACK');
+    }
+    return deleted > 0;
+  };
+
+  const CASE_WRITE = `UPDATE cases SET status = 'in_progress' WHERE zone_id = 'EUR'`;
+  const USER_WRITE = `UPDATE users SET capacity_weight = capacity_weight WHERE zone_id = 'EUR'`;
+  const SETTING_WRITE = `INSERT INTO app_settings (key, value) VALUES ('rls_probe','x')
+                         ON CONFLICT (key) DO UPDATE SET value = 'x'`;
+  const CASE_DELETE = `DELETE FROM cases WHERE zone_id = 'EUR'`;
+  const GLOBAL_USER_DELETE = `DELETE FROM users WHERE email = 'rls-probe-global@example.com'`;
+
+  for (const role of ['super_admin', 'admin', 'zone_manager', 'approver']) {
+    check(`${role} may write a case`, await tryWrite(role, 'EUR', CASE_WRITE));
+  }
+  check('auditor may not write a case', !(await tryWrite('auditor', '*', CASE_WRITE)));
+
+  for (const role of ['super_admin', 'admin', 'zone_manager']) {
+    check(`${role} may write a user`, await tryWrite(role, role === 'zone_manager' ? 'EUR' : '*', USER_WRITE));
+  }
+  check('approver may not write a user', !(await tryWrite('approver', 'EUR', USER_WRITE)));
+  check('auditor may not write a user', !(await tryWrite('auditor', '*', USER_WRITE)));
+
+  check('super_admin may write a setting', await tryWrite('super_admin', '*', SETTING_WRITE));
+  check('admin may not write a setting', !(await tryWrite('admin', '*', SETTING_WRITE)));
+  check('zone_manager may not write a setting', !(await tryWrite('zone_manager', 'EUR', SETTING_WRITE)));
+
+  // DELETE coverage (spec: 0013's users_delete_role hole, closed in Task 7).
+  check('auditor may not delete a case', !(await tryDelete('auditor', '*', CASE_DELETE)));
+  check(
+    'zone_manager may not delete a global user (zone_id IS NULL)',
+    !(await tryDelete('zone_manager', 'EUR', GLOBAL_USER_DELETE)),
+  );
+  check(
+    'admin may delete a global user (zone_id IS NULL)',
+    await tryDelete('admin', '*', GLOBAL_USER_DELETE),
+  );
+}
 
 // clean up seeded rows so other tests never collide with them
 await admin.query(`DELETE FROM email_log; DELETE FROM case_fields; DELETE FROM sla_clocks; DELETE FROM case_status_history; DELETE FROM cases;`);
