@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import collections
 import hashlib
 import sys
 
@@ -123,6 +124,90 @@ def validate_email_config(env: dict) -> list:
             "offline." % " ".join(missing)
         )
     return []
+
+
+Mount = collections.namedtuple("Mount", "device mountpoint total free")
+
+
+def parse_df(text: str) -> list:
+    """Parse `df -PB1` output. -P guarantees one record per line."""
+    mounts = []
+    for line in text.splitlines()[1:]:
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        try:
+            total, _used, free = int(parts[1]), int(parts[2]), int(parts[3])
+        except ValueError:
+            continue
+        mounts.append(Mount(parts[0], parts[5].strip(), total, free))
+    return mounts
+
+
+def mount_for(path: str, mounts: list) -> Mount:
+    """The filesystem a path lives on: longest matching mountpoint wins.
+
+    Matching is on path components, so /vary is not inside /var.
+    """
+    best = None
+    for m in mounts:
+        if path == m.mountpoint or path.startswith(m.mountpoint.rstrip("/") + "/"):
+            if best is None or len(m.mountpoint) > len(best.mountpoint):
+                best = m
+    return best
+
+
+def human_bytes(n: int) -> str:
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if unit == "B":
+            if value < 1024:
+                return "%d B" % int(value)
+        elif value < 1024:
+            return "%.1f %s" % (value, unit)
+        value /= 1024.0
+    return "%.1f PB" % value
+
+
+def check_budget(mounts: list, needs: dict) -> list:
+    """Refuse before acting, naming the mount and both numbers.
+
+    Two paths on the same filesystem compete for the same free space, so
+    their requirements are summed rather than checked one at a time.
+    """
+    per_mount = {}
+    for path, wanted in needs.items():
+        m = mount_for(path, mounts)
+        if m is None:
+            continue
+        per_mount.setdefault(m.mountpoint, [m, 0])[1] += wanted
+    refusals = []
+    for mountpoint in sorted(per_mount):
+        m, wanted = per_mount[mountpoint]
+        if wanted > m.free:
+            refusals.append(
+                "%s has %s free; this step needs about %s"
+                % (mountpoint, human_bytes(m.free), human_bytes(wanted))
+            )
+    return refusals
+
+
+def project_days_until_full(samples: list, free_now: int) -> float:
+    """Days until this filesystem fills, from the first and last samples.
+
+    Returns None when there is no baseline, when usage is flat or falling,
+    or when two samples share a timestamp -- all of which are honest answers
+    rather than a fabricated number.
+    """
+    if len(samples) < 2:
+        return None
+    (t0, used0), (t1, used1) = samples[0], samples[-1]
+    elapsed = t1 - t0
+    grown = used1 - used0
+    if elapsed <= 0 or grown <= 0:
+        return None
+    per_day = grown * 86400.0 / elapsed
+    return free_now / per_day
 
 
 def build_parser() -> argparse.ArgumentParser:

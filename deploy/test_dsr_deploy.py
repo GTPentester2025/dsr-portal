@@ -137,5 +137,98 @@ class TestEmailConfig(unittest.TestCase):
             dd.validate_email_config({})
 
 
+DF_SEPARATE = """Filesystem     1B-blocks       Used  Available Capacity Mounted on
+/dev/vda1     10737418240 8589934592 2147483648      80% /
+/dev/vdb1     10737418240 9663676416 1073741824      90% /var
+/dev/vdc1     10737418240 5368709120 5368709120      50% /home
+"""
+
+DF_SINGLE_ROOT = """Filesystem     1B-blocks       Used  Available Capacity Mounted on
+/dev/vda1     10737418240 8589934592 2147483648      80% /
+"""
+
+
+class TestDf(unittest.TestCase):
+    def test_parses_every_row(self):
+        mounts = dd.parse_df(DF_SEPARATE)
+        self.assertEqual([m.mountpoint for m in mounts], ["/", "/var", "/home"])
+        self.assertEqual(mounts[1].free, 1073741824)
+        self.assertEqual(mounts[1].total, 10737418240)
+
+    def test_ignores_the_header(self):
+        self.assertTrue(all(m.device != "Filesystem" for m in dd.parse_df(DF_SEPARATE)))
+
+    def test_longest_prefix_wins_not_first_match(self):
+        mounts = dd.parse_df(DF_SEPARATE)
+        # /var/lib/pgsql must resolve to /var, not to /
+        self.assertEqual(dd.mount_for("/var/lib/pgsql", mounts).mountpoint, "/var")
+        self.assertEqual(dd.mount_for("/opt/dsr", mounts).mountpoint, "/")
+        self.assertEqual(dd.mount_for("/home/x", mounts).mountpoint, "/home")
+
+    def test_prefix_match_respects_component_boundaries(self):
+        mounts = dd.parse_df(DF_SEPARATE)
+        # /vary is not inside /var
+        self.assertEqual(dd.mount_for("/vary/thing", mounts).mountpoint, "/")
+
+    def test_single_root_resolves_everything_to_root(self):
+        mounts = dd.parse_df(DF_SINGLE_ROOT)
+        for path in ("/opt/dsr", "/var/lib/pgsql", "/home/x"):
+            self.assertEqual(dd.mount_for(path, mounts).mountpoint, "/")
+
+
+class TestBudget(unittest.TestCase):
+    def test_enough_room_returns_no_refusals(self):
+        mounts = dd.parse_df(DF_SEPARATE)
+        self.assertEqual(dd.check_budget(mounts, {"/home": 1024}), [])
+
+    def test_too_little_room_names_the_mount_and_both_numbers(self):
+        mounts = dd.parse_df(DF_SEPARATE)
+        refusals = dd.check_budget(mounts, {"/var": 4_000_000_000})
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("/var", refusals[0])
+        self.assertIn("1.0 GB", refusals[0])
+        self.assertIn("3.7 GB", refusals[0])
+
+    def test_two_paths_on_one_mount_are_summed_not_checked_separately(self):
+        # 700MB + 700MB both land on /var, which has 1.0GB free: one refusal.
+        mounts = dd.parse_df(DF_SEPARATE)
+        refusals = dd.check_budget(
+            mounts, {"/var/lib/pgsql": 700_000_000, "/var/cache": 700_000_000}
+        )
+        self.assertEqual(len(refusals), 1)
+
+
+class TestHumanBytes(unittest.TestCase):
+    def test_scales_and_rounds(self):
+        self.assertEqual(dd.human_bytes(0), "0 B")
+        self.assertEqual(dd.human_bytes(512), "512 B")
+        self.assertEqual(dd.human_bytes(1024), "1.0 KB")
+        self.assertEqual(dd.human_bytes(1073741824), "1.0 GB")
+
+
+class TestProjection(unittest.TestCase):
+    DAY = 86400
+
+    def test_no_baseline_returns_none(self):
+        self.assertIsNone(dd.project_days_until_full([], 1000))
+        self.assertIsNone(dd.project_days_until_full([(0, 100)], 1000))
+
+    def test_steady_growth_projects_the_obvious_answer(self):
+        samples = [(0, 0), (self.DAY, 100)]
+        self.assertAlmostEqual(dd.project_days_until_full(samples, 1000), 10.0, places=3)
+
+    def test_flat_or_shrinking_usage_returns_none(self):
+        self.assertIsNone(dd.project_days_until_full([(0, 100), (self.DAY, 100)], 1000))
+        self.assertIsNone(dd.project_days_until_full([(0, 200), (self.DAY, 100)], 1000))
+
+    def test_uses_the_full_span_not_just_the_last_pair(self):
+        samples = [(0, 0), (self.DAY, 500), (2 * self.DAY, 200)]
+        # 200 bytes over 2 days = 100/day, so 1000 free lasts 10 days.
+        self.assertAlmostEqual(dd.project_days_until_full(samples, 1000), 10.0, places=3)
+
+    def test_identical_timestamps_do_not_divide_by_zero(self):
+        self.assertIsNone(dd.project_days_until_full([(5, 10), (5, 90)], 1000))
+
+
 if __name__ == "__main__":
     unittest.main()
