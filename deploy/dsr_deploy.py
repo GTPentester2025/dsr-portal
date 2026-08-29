@@ -39,6 +39,11 @@ ENV_PATH = "/opt/dsr/server/.env"
 # where /opt/dsr and the dsr user do not exist yet, and .target.env already
 # assumes a root@host ssh target.
 REMOTE_SELF = "/root/dsr_deploy.py"
+# Where the secret values a step needs are staged on the box, mode 0600 and
+# deleted when the run ends. A file rather than a `DB_PASS=... command`
+# prefix because the second form puts the password in the box's process
+# table for anyone with `ps` to read.
+REMOTE_SECRETS = "/root/.dsr-secrets.env"
 STATE_PATH = "/var/lib/dsr-deploy/state.json"
 SERVICE = "dsr-api"
 APP_PORT = 3000
@@ -59,7 +64,16 @@ UNIT_REMOTE = "/etc/systemd/system/%s.service" % SERVICE
 MIN_PYTHON = (3, 9)
 
 
-class SecretsError(Exception):
+class Refusal(Exception):
+    """A precondition that stops a run, ideally before anything is pushed.
+
+    Refusing with the numbers -- which mount, how much free, how much
+    needed, which fingerprint -- is the difference between a five minute
+    fix and an afternoon. Failing halfway through a deployment is not.
+    """
+
+
+class SecretsError(Refusal):
     """A secrets or target file that would break the portal if deployed."""
 
 
@@ -437,6 +451,26 @@ class Ssh:
                 % (remote, result.stderr.decode(errors="replace"))
             )
 
+    def push_text(self, text: str, remote: str, mode: str = "") -> None:
+        """Write text to a remote path, fed over stdin.
+
+        The bytes travel on the pipe, never in the command. That matters
+        for REMOTE_SECRETS: a heredoc carrying a password would put it in
+        the argv of the remote shell, where `ps` on the box can read it for
+        as long as the connection lasts.
+        """
+        command = "cat > '%s'" % remote
+        if mode:
+            command = "umask 077 && %s && chmod %s '%s'" % (command, mode, remote)
+        result = subprocess.run(
+            self.argv(command), input=text.encode(), capture_output=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "push_text failed for %s: %s"
+                % (remote, result.stderr.decode(errors="replace"))
+            )
+
     def push_dir(self, local: str, remote: str) -> None:
         """Mirror a directory: `tar -czf - -C local .` piped into a remote
         `rm -rf dest && mkdir -p dest && tar -xzf - -C dest`, exactly what
@@ -463,16 +497,24 @@ class Ssh:
             )
 
 
-def _cat_heredoc_command(remote_path: str, content: str, marker: str = "DSR_EOF") -> str:
-    """A `cat > remote_path <<'MARKER'` fragment carrying literal file content.
+def _cat_heredoc_command(
+    remote_path: str, content: str, marker: str = "DSR_EOF", expand: bool = False
+) -> str:
+    """A `cat > remote_path <<MARKER` fragment carrying file content.
 
-    The heredoc delimiter is quoted, so the remote shell does not expand
-    anything inside -- the content lands byte-for-byte without a second SSH
-    round trip for what push_file would otherwise do.
+    The delimiter is quoted by default, so the remote shell expands nothing
+    inside and the content lands byte-for-byte without a second SSH round
+    trip for what push_file would otherwise do.
+
+    `expand=True` unquotes it, which is how the service .env is written:
+    the body holds `${DB_PASS}` rather than the password itself, and the
+    remote shell substitutes values it read from REMOTE_SECRETS. That is
+    what keeps a secret out of every Step, and so out of `--dry-run`.
     """
     if not content.endswith("\n"):
         content += "\n"
-    return "cat > %s <<'%s'\n%s%s" % (remote_path, marker, content, marker)
+    opener = marker if expand else "'%s'" % marker
+    return "cat > %s <<%s\n%s%s" % (remote_path, opener, content, marker)
 
 
 def atomic_write(path: str, text: str) -> None:
@@ -528,6 +570,17 @@ def atomic_write(path: str, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _source_secrets() -> str:
+    """Prelude that brings REMOTE_SECRETS into a step's environment.
+
+    `set -e` first, so a missing or unreadable secrets file stops the step
+    instead of letting `${DB_PASS:?}` decide the outcome three lines later,
+    and left on: both steps that source this are multi-line ones whose own
+    statements must not mask each other either.
+    """
+    return "set -e\nset -a\n. %s\nset +a\n" % REMOTE_SECRETS
 
 
 def _backup_once(path: str) -> str:
@@ -642,13 +695,17 @@ def provision_steps() -> list:
         ),
         Step(
             "create the dsr and dsr_app roles and database",
+            # DB_PASS and APP_PASS come from REMOTE_SECRETS, a 0600 file
+            # pushed over stdin, so no password is ever an argv element on
+            # the box or a character of this Step.
+            #
             # `set -e` rather than `&&` between these: a heredoc terminator
             # cannot be followed by `&&` without hiding the operator that
             # matters at the end of the line above it. `set -e` gives the
             # same guarantee -- the first failure stops the step -- across
             # all four statements.
-            "set -e\n"
-            "sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL\n"
+            _source_secrets()
+            + "sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL\n"
             "DO \\$\\$\n"
             "BEGIN\n"
             "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'dsr') THEN\n"
@@ -728,23 +785,33 @@ def provision_steps() -> list:
     ]
 
 
-def _env_file_content(env: dict) -> str:
+def _env_file_content() -> str:
     """The service .env, in the same shape deploy.sh writes -- see its
     comments on why EMAIL_PROVIDER and COOKIE_SECURE live here rather than
     in app_settings.
+
+    Every value is a shell reference, not a value. The remote shell expands
+    them from REMOTE_SECRETS through an unquoted heredoc, exactly as
+    deploy.sh's `<<ENV` does. That is deliberate: it means no Step ever
+    contains a password, so `--dry-run` can print the entire plan and
+    nothing sensitive is on the screen or in the box's process table.
+
+    The `:-` defaults are deploy.sh's, and they matter: `${COOKIE_SECURE:-true}`
+    treats an empty value as unset, so a secrets file that omits the key
+    still produces a Secure cookie rather than an empty setting.
     """
     lines = [
         "NODE_ENV=production",
         "PORT=%d" % APP_PORT,
-        "DATABASE_URL=postgres://dsr:%s@127.0.0.1:5432/dsr" % env.get("DB_PASS", ""),
-        "DATABASE_URL_APP=postgres://dsr_app:%s@127.0.0.1:5432/dsr" % env.get("APP_PASS", ""),
-        "CRYPTO_MASTER_KEY=%s" % env.get("CRYPTO_MASTER_KEY", ""),
-        "COOKIE_SECURE=%s" % env.get("COOKIE_SECURE", "true"),
-        "EMAIL_PROVIDER=%s" % env.get("EMAIL_PROVIDER", "graph"),
-        "PRIVACY_MAILBOX=%s" % env.get("PRIVACY_MAILBOX", ""),
-        "GRAPH_TENANT_ID=%s" % env.get("GRAPH_TENANT_ID", ""),
-        "GRAPH_CLIENT_ID=%s" % env.get("GRAPH_CLIENT_ID", ""),
-        "GRAPH_CLIENT_SECRET=%s" % env.get("GRAPH_CLIENT_SECRET", ""),
+        "DATABASE_URL=postgres://dsr:${DB_PASS}@127.0.0.1:5432/dsr",
+        "DATABASE_URL_APP=postgres://dsr_app:${APP_PASS}@127.0.0.1:5432/dsr",
+        "CRYPTO_MASTER_KEY=${CRYPTO_MASTER_KEY}",
+        "COOKIE_SECURE=${COOKIE_SECURE:-true}",
+        "EMAIL_PROVIDER=${EMAIL_PROVIDER:-graph}",
+        "PRIVACY_MAILBOX=${PRIVACY_MAILBOX:-}",
+        "GRAPH_TENANT_ID=${GRAPH_TENANT_ID:-}",
+        "GRAPH_CLIENT_ID=${GRAPH_CLIENT_ID:-}",
+        "GRAPH_CLIENT_SECRET=${GRAPH_CLIENT_SECRET:-}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -831,6 +898,13 @@ def deploy_steps(env: dict) -> list:
     everything that happens once those bytes are already on the box.
     Migration must precede the restart -- an old process serving a schema
     it does not understand is worse than a few extra seconds of downtime.
+
+    `env` is accepted because callers hold the parsed secrets by the time
+    they get here, and deliberately not read: no secret value belongs in a
+    Step, because a Step is what `--dry-run` prints. The values reach the
+    box in REMOTE_SECRETS instead, and the steps that need them source it.
+    A test pins that -- pass a password in and it must not appear in any
+    command.
     """
     return [
         Step(
@@ -838,9 +912,9 @@ def deploy_steps(env: dict) -> list:
             # `set -e`: without it, a heredoc that ran out of disk halfway
             # left a truncated .env, `chmod 600` succeeded, and the step
             # reported success on a service that will not start.
-            "set -e\n"
+            _source_secrets()
             + ("test -f %s && cp %s %s.bak || true\n" % (ENV_PATH, ENV_PATH, ENV_PATH))
-            + _cat_heredoc_command(ENV_PATH, _env_file_content(env), "ENV")
+            + _cat_heredoc_command(ENV_PATH, _env_file_content(), "ENV", expand=True)
             + ("\nchmod 600 %s" % ENV_PATH),
         ),
         Step(
@@ -925,6 +999,274 @@ def deploy_steps(env: dict) -> list:
             "systemctl reload nginx",
         ),
     ]
+
+
+# ---------------------------------------------------------------------------
+# provision and deploy: the decisions, separated from the side effects
+#
+# Everything below that carries a judgement -- what the disk budget is, which
+# paths get pushed where, whether two fingerprints may differ, when the health
+# poll gives up -- is a pure function with a test. The functions further down
+# that shell out hold no logic beyond calling these in order, because a
+# decision buried inside a function that opens an SSH connection is a decision
+# nobody can test without a server.
+# ---------------------------------------------------------------------------
+
+# deploy.sh's default, and its reason: each droplet has its own secrets file
+# and writing the wrong one is not a recoverable mistake.
+DEFAULT_SECRETS_NAME = ".secrets.blr.env"
+
+# What deploy actually spends under the install prefix. Numbers from the
+# spec's refusal example; the host has ~10 GB and is mostly full, so this
+# refusal is a path an operator will really take.
+DEPLOY_NODE_MODULES_BYTES = 310 * 1000 * 1000
+DEPLOY_DIST_BYTES = 40 * 1000 * 1000
+DEPLOY_TRANSFER_HEADROOM_BYTES = 70 * 1000 * 1000
+DEPLOY_BYTES = (
+    DEPLOY_NODE_MODULES_BYTES + DEPLOY_DIST_BYTES + DEPLOY_TRANSFER_HEADROOM_BYTES
+)
+
+# Provisioning installs nginx, Node 22, PostgreSQL 16 and the SELinux tooling,
+# and fills the dnf cache doing it (the steps clean it afterwards, not during).
+# An estimate, and labelled as one: being roughly right before the fact beats
+# being exactly right halfway through a failed `dnf install`.
+PROVISION_PACKAGE_BYTES = 900 * 1000 * 1000
+
+# The keys each command stages on the box. Provisioning only ever needs the
+# two role passwords; nothing else it does touches a secret.
+PROVISION_SECRET_KEYS = ("DB_PASS", "APP_PASS")
+DEPLOY_SECRET_KEYS = (
+    "DB_PASS",
+    "APP_PASS",
+    "CRYPTO_MASTER_KEY",
+    "COOKIE_SECURE",
+    "EMAIL_PROVIDER",
+    "PRIVACY_MAILBOX",
+    "GRAPH_TENANT_ID",
+    "GRAPH_CLIENT_ID",
+    "GRAPH_CLIENT_SECRET",
+)
+
+# deploy.sh's numbers, and its reason, quoted because it is the whole
+# justification for polling at all: "on a single-vCPU box Nest can take well
+# over four seconds to bind, and a one-shot probe reports a false failure on a
+# deploy that actually succeeded."
+HEALTH_ATTEMPTS = 20
+HEALTH_INTERVAL_SECONDS = 3
+
+JOURNAL_TAIL_COMMAND = "journalctl -u %s -n 25 --no-pager" % SERVICE
+
+# Asks the pushed copy of this tool for the fingerprint of the key already on
+# the box. Both sides of the comparison therefore run key_fingerprint over a
+# value parse_env_text extracted -- the same function, the same normalisation.
+#
+# deploy.sh does this with an `md5sum | cut -c1-8` shell one-liner. This tool
+# must not: key_fingerprint is sha256, so a shell fingerprint would never
+# equal a local one and the guard would refuse every deployment. The only
+# reason a sha256 fingerprint is safe here is that the tool computes both
+# sides. An empty result means the box has no .env yet, which is a first
+# deployment rather than a mismatch, so an absent key prints nothing at all
+# instead of the hash of an empty string.
+REMOTE_FINGERPRINT_COMMAND = (
+    "python3 -c \""
+    "import sys; sys.path.insert(0, '%s'); import dsr_deploy as d, pathlib; "
+    "p = pathlib.Path('%s'); "
+    "k = d.parse_env_text(p.read_text()).get('CRYPTO_MASTER_KEY', '') if p.exists() else ''; "
+    "print(d.key_fingerprint(k) if k.strip() else '')\""
+) % (REMOTE_SELF.rsplit("/", 1)[0], ENV_PATH)
+
+PayloadItem = collections.namedtuple("PayloadItem", "kind local remote")
+
+# Directories the operator builds before anything is pushed.
+BUILD_DIRS = ("server", "apps/admin", "apps/public-form")
+
+
+def shell_quote(value: str) -> str:
+    """Single-quote a value for a shell, closing and reopening around quotes.
+
+    A DB_PASS containing an apostrophe is not exotic, and unquoted it turns
+    REMOTE_SECRETS into a syntax error at best and a truncated password at
+    worst -- which would then be written into .env and into the role, and
+    the portal would fail to authenticate with no clue why.
+    """
+    return "'" + str(value if value is not None else "").replace("'", "'\\''") + "'"
+
+
+def remote_secrets_content(env: dict, keys) -> str:
+    """The 0600 file staged at REMOTE_SECRETS: one quoted KEY=value per key.
+
+    Absent keys are written empty rather than omitted, so `${X:-default}` in
+    the .env body sees an empty value and applies its default, instead of
+    the step dying on an unset variable.
+    """
+    return "".join("%s=%s\n" % (key, shell_quote(env.get(key, ""))) for key in keys)
+
+
+def validate_secrets(env: dict) -> list:
+    """Both of deploy.sh's local guards, in its order. Returns warnings.
+
+    Raises SecretsError on anything that would not boot. Running this before
+    a single byte is pushed is the whole point: the alternative is finding
+    out from journalctl on a box already serving the public intake form to
+    a dead API.
+    """
+    validate_master_key(env.get("CRYPTO_MASTER_KEY", ""))
+    return validate_email_config(env)
+
+
+def fingerprint_refusal(
+    local_fp: str, remote_fp: str, secrets_file: str, host: str
+) -> str:
+    """"" when it is safe to write this .env; the refusal text otherwise.
+
+    An empty remote fingerprint is a box with no .env yet -- a first
+    deployment, not a mismatch. Neither key is ever printed; only the two
+    eight-character fingerprints, which is enough for an operator to tell
+    which secrets file they meant.
+    """
+    remote_fp = (remote_fp or "").strip()
+    local_fp = (local_fp or "").strip()
+    if not remote_fp or remote_fp == local_fp:
+        return ""
+    return (
+        "FATAL: %s does not belong to %s.\n"
+        "       Its CRYPTO_MASTER_KEY (%s) differs from the one already on the\n"
+        "       box (%s); deploying would orphan every encrypted setting in\n"
+        "       app_settings -- they are encrypted with the key on the box and\n"
+        "       nothing can decrypt them afterwards.\n"
+        "       Choose the right one with SECRETS_FILE=deploy/.secrets.<host>.env"
+        % (secrets_file, host, local_fp, remote_fp)
+    )
+
+
+def deploy_needs() -> dict:
+    """Bytes required per path for a deployment."""
+    return {INSTALL_PREFIX: DEPLOY_BYTES}
+
+
+def provision_needs() -> dict:
+    """Bytes required per path for a provisioning run."""
+    return {"/usr": PROVISION_PACKAGE_BYTES}
+
+
+def budget_refusal(refusals: list, breakdown: str = "") -> str:
+    """Turn check_budget's strings into the refusal an operator can act on.
+
+    "" when there is room. Otherwise the mount, both numbers, where the
+    space goes, and where to look for space to reclaim -- because a refusal
+    that names none of those is just a slower failure.
+    """
+    if not refusals:
+        return ""
+    lines = ["FATAL: " + refusals[0]]
+    for extra in refusals[1:]:
+        lines.append("       " + extra)
+    if breakdown:
+        lines.append("       (%s)" % breakdown)
+    lines.append("       See: python3 deploy/dsr_deploy.py doctor --disk")
+    return "\n".join(lines)
+
+
+def deploy_breakdown() -> str:
+    return "node_modules ~%s, dist ~%s, transfer headroom ~%s" % (
+        human_bytes(DEPLOY_NODE_MODULES_BYTES),
+        human_bytes(DEPLOY_DIST_BYTES),
+        human_bytes(DEPLOY_TRANSFER_HEADROOM_BYTES),
+    )
+
+
+def build_commands(root: str) -> list:
+    """(directory, command) for each bundle built before anything is pushed.
+
+    A string rather than an argv list because on Windows -- where this tool
+    is run from Git Bash today -- `npm` is a `.cmd` shim that only a shell
+    resolves. Nothing operator-supplied is interpolated into it.
+    """
+    return [(os.path.join(root, name), "npm run build") for name in BUILD_DIRS]
+
+
+def deploy_payload(root: str) -> list:
+    """Every local path pushed to the box, and where it lands.
+
+    The same set deploy.sh syncs, in the same order. Note what is not here:
+    UPLOADS_DIR is never a destination. push_dir mirrors a directory by
+    removing it first, so listing the uploads directory here would delete
+    identity documents held as regulatory records -- which is why the
+    destinations are a data structure a test can walk rather than a
+    sequence of calls buried in cmd_deploy.
+    """
+    def local(*parts):
+        return os.path.join(root, *parts)
+
+    return [
+        PayloadItem("dir", local("server", "dist"), "%s/server/dist" % INSTALL_PREFIX),
+        PayloadItem(
+            "dir", local("server", "drizzle"), "%s/server/drizzle" % INSTALL_PREFIX
+        ),
+        PayloadItem(
+            "dir", local("server", "scripts"), "%s/server/scripts" % INSTALL_PREFIX
+        ),
+        PayloadItem("dir", local("form-schema"), "%s/form-schema" % INSTALL_PREFIX),
+        PayloadItem(
+            "dir", local("apps", "public-form", "dist"), "%s/public-form" % WEB_ROOT
+        ),
+        PayloadItem("dir", local("apps", "admin", "dist"), "%s/admin" % WEB_ROOT),
+        PayloadItem(
+            "file",
+            local("server", "package.json"),
+            "%s/server/package.json" % INSTALL_PREFIX,
+        ),
+        PayloadItem(
+            "file",
+            local("server", "package-lock.json"),
+            "%s/server/package-lock.json" % INSTALL_PREFIX,
+        ),
+    ]
+
+
+def health_command() -> str:
+    """One probe: the unit is up *and* the port answers.
+
+    `is-active` alone passes while Nest is still binding, and curl alone
+    passes against a stale process, so both.
+    """
+    return "systemctl is-active --quiet %s && curl -sf -o /dev/null http://127.0.0.1:%d/" % (
+        SERVICE,
+        APP_PORT,
+    )
+
+
+def poll_delay(attempt: int, attempts: int = HEALTH_ATTEMPTS,
+               interval: int = HEALTH_INTERVAL_SECONDS):
+    """Seconds to wait before the next probe, or None when that was the last.
+
+    `attempt` is 1-based. Returning None is the give-up condition, and it is
+    a separate function because it is the part that is easy to get wrong in
+    two directions at once: an off-by-one that probes nineteen times, and a
+    final sleep of three seconds after a result nobody is waiting for.
+    """
+    if attempt >= attempts:
+        return None
+    return interval
+
+
+def step_failure_message(name: str, returncode: int, stderr: str, stdout: str = "") -> str:
+    """What a failed step prints: which step, which exit code, what it said.
+
+    Falls back to the tail of stdout when stderr is empty, because `dnf`,
+    `psql` and `nginx -t` all say the useful thing on stdout and a refusal
+    that names only an exit code sends the operator to the box to find out
+    what this already knew.
+    """
+    lines = ["FATAL: step failed: %s (exit %d)" % (name, returncode)]
+    detail = (stderr or "").strip()
+    if not detail:
+        detail = "\n".join((stdout or "").strip().splitlines()[-5:])
+    if not detail:
+        detail = "the command printed nothing; try it by hand over ssh"
+    for line in detail.splitlines():
+        lines.append("       " + line)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -2164,10 +2506,8 @@ def cmd_doctor(args, runner, now_epoch=None) -> int:
 TARGET_ENV_LOCAL = _DEPLOY_DIR / ".target.env"
 
 
-def doctor_runner(args):
-    """Local when already on the box, ssh otherwise. Evaluation is always local."""
-    if getattr(args, "remote", False):
-        return LocalRunner()
+def target_ssh():
+    """(Ssh, host) from deploy/.target.env, or a refusal naming the file."""
     if not TARGET_ENV_LOCAL.exists():
         raise SecretsError(
             "No ssh target. Copy deploy/target.example.env to deploy/.target.env, "
@@ -2178,7 +2518,203 @@ def doctor_runner(args):
     if not host:
         raise SecretsError("deploy/.target.env has no HOST (or DEPLOY_HOST).")
     key = (target.get("SSH_KEY") or "").strip() or os.path.expanduser("~/.ssh/id_ed25519")
-    return SshRunner(Ssh(host, key))
+    return Ssh(host, os.path.expanduser(key)), host
+
+
+def doctor_runner(args):
+    """Local when already on the box, ssh otherwise. Evaluation is always local."""
+    if getattr(args, "remote", False):
+        return LocalRunner()
+    ssh, _host = target_ssh()
+    return SshRunner(ssh)
+
+
+def secrets_path() -> pathlib.Path:
+    """Which secrets file to read. SECRETS_FILE overrides, as deploy.sh."""
+    override = (os.environ.get("SECRETS_FILE") or "").strip()
+    if override:
+        return pathlib.Path(override)
+    return _DEPLOY_DIR / DEFAULT_SECRETS_NAME
+
+
+def read_secrets(path) -> dict:
+    """Parse a secrets file. Nothing in it is ever printed or logged."""
+    candidate = pathlib.Path(path)
+    if not candidate.is_file():
+        raise SecretsError(
+            "No secrets file at %s. Point SECRETS_FILE at the one for this "
+            "host: SECRETS_FILE=deploy/.secrets.<host>.env" % candidate
+        )
+    return parse_env_text(candidate.read_text())
+
+
+def local_preflight(secrets: dict, err=None) -> None:
+    """The guards that run on the operator's machine, before anything moves."""
+    if err is None:
+        err = sys.stderr
+    for warning in validate_secrets(secrets):
+        err.write("WARNING: %s\n" % warning)
+
+
+def push_self(ssh, out) -> None:
+    """Copy this file to the box. The first act of every command.
+
+    Everything afterwards that reads machine state -- the fingerprint of
+    the key already installed, the pg_hba and nginx rewrites -- runs through
+    this copy, so both halves of every comparison come from the same code.
+    """
+    out.write("==> pushing the deployer to %s\n" % REMOTE_SELF)
+    ssh.push_file(str(pathlib.Path(__file__).resolve()), REMOTE_SELF)
+
+
+def check_remote_budget(ssh, needs: dict, breakdown: str = "") -> None:
+    """Measure the box's filesystems and refuse with the numbers, not halfway."""
+    mounts = parse_df(ssh.run("df -PB1", check=False).stdout)
+    if not mounts:
+        # Better a warning than a refusal: a box whose df cannot be read is
+        # not a box that is known to be full.
+        sys.stderr.write("WARNING: could not read `df -PB1`; skipping the disk budget\n")
+        return
+    refusal = budget_refusal(check_budget(mounts, needs), breakdown)
+    if refusal:
+        raise Refusal(refusal)
+
+
+def run_steps(ssh, steps: list, out) -> None:
+    """Execute a plan, naming each step, stopping at the first failure."""
+    total = len(steps)
+    for index, step in enumerate(steps, 1):
+        out.write("==> [%d/%d] %s\n" % (index, total, step.name))
+        out.flush()
+        result = ssh.run(step.command, check=False)
+        if result.returncode != 0:
+            raise Refusal(
+                step_failure_message(
+                    step.name, result.returncode, result.stderr, result.stdout
+                )
+            )
+
+
+def poll_health(ssh, out, sleep=None) -> bool:
+    """Poll for the API, twenty times, three seconds apart.
+
+    One probe is not enough: on a 1-vCPU box Nest can take well over four
+    seconds to bind, and a single check reports a false failure on a
+    deployment that actually worked. deploy.sh records exactly that.
+    """
+    if sleep is None:
+        sleep = time.sleep
+    for attempt in range(1, HEALTH_ATTEMPTS + 1):
+        if ssh.run(health_command(), check=False).returncode == 0:
+            out.write("==> healthy after %d probe%s\n" % (attempt, "" if attempt == 1 else "s"))
+            return True
+        delay = poll_delay(attempt)
+        if delay is None:
+            return False
+        sleep(delay)
+    return False
+
+
+def cmd_provision(args, out=None) -> int:
+    """Take a bare RHEL 9 host to one ready to receive a deployment."""
+    if out is None:
+        out = sys.stdout
+    steps = provision_steps()
+    if args.dry_run:
+        out.write(render_plan(steps))
+        return 0
+
+    # Local first, so a secrets file that cannot deploy never gets as far as
+    # creating roles from it.
+    path = secrets_path()
+    secrets = read_secrets(path)
+    local_preflight(secrets)
+
+    ssh, host = target_ssh()
+    out.write("==> provisioning %s\n" % host)
+    push_self(ssh, out)
+    check_remote_budget(
+        ssh,
+        provision_needs(),
+        "nginx, Node 22, PostgreSQL 16, SELinux tooling and the dnf cache",
+    )
+
+    ssh.push_text(
+        remote_secrets_content(secrets, PROVISION_SECRET_KEYS), REMOTE_SECRETS, mode="600"
+    )
+    try:
+        run_steps(ssh, steps, out)
+    finally:
+        ssh.run("rm -f %s" % REMOTE_SECRETS, check=False)
+    out.write("PROVISION_OK\n")
+    return 0
+
+
+def cmd_deploy(args, out=None) -> int:
+    """Build, push, migrate, restart and verify."""
+    if out is None:
+        out = sys.stdout
+    if args.dry_run:
+        out.write(render_plan(deploy_steps({})))
+        return 0
+
+    root = str(_DEPLOY_DIR.parent)
+    path = secrets_path()
+    secrets = read_secrets(path)
+    local_preflight(secrets)
+
+    ssh, host = target_ssh()
+    out.write("==> deploying to %s\n" % host)
+    push_self(ssh, out)
+
+    # Fingerprints, before the payload rather than after: writing this .env
+    # over a different key orphans every encrypted row in app_settings, and
+    # nothing recovers them. Both fingerprints come from key_fingerprint --
+    # the local one here, the remote one from the copy just pushed.
+    refusal = fingerprint_refusal(
+        key_fingerprint(secrets.get("CRYPTO_MASTER_KEY", "")),
+        ssh.run(REMOTE_FINGERPRINT_COMMAND, check=False).stdout,
+        str(path),
+        host,
+    )
+    if refusal:
+        raise Refusal(refusal)
+
+    check_remote_budget(ssh, deploy_needs(), deploy_breakdown())
+
+    out.write("==> building\n")
+    for directory, command in build_commands(root):
+        result = subprocess.run(command, cwd=directory, shell=True)
+        if result.returncode != 0:
+            raise Refusal(
+                "FATAL: `%s` failed in %s (exit %d). Nothing was pushed."
+                % (command, directory, result.returncode)
+            )
+
+    out.write("==> syncing\n")
+    for item in deploy_payload(root):
+        if item.kind == "dir":
+            ssh.push_dir(item.local, item.remote)
+        else:
+            ssh.push_file(item.local, item.remote)
+
+    ssh.push_text(
+        remote_secrets_content(secrets, DEPLOY_SECRET_KEYS), REMOTE_SECRETS, mode="600"
+    )
+    try:
+        run_steps(ssh, deploy_steps(secrets), out)
+        out.write("==> health\n")
+        if not poll_health(ssh, out):
+            sys.stderr.write(
+                "FATAL: the API did not come up within %ds. Last log lines:\n"
+                % (HEALTH_ATTEMPTS * HEALTH_INTERVAL_SECONDS)
+            )
+            sys.stderr.write(ssh.run(JOURNAL_TAIL_COMMAND, check=False).stdout)
+            return 1
+    finally:
+        ssh.run("rm -f %s" % REMOTE_SECRETS, check=False)
+    out.write("DEPLOY_OK\n")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2226,20 +2762,18 @@ def main(argv: list) -> int:
         return 2
     args = build_parser().parse_args(argv)
 
-    # Executing provision/deploy steps for real -- pushing this file to the
-    # box, running Ssh.run over each Step -- is the next task's job. What is
-    # already true is that the plan is data, so a dry run can print it now
-    # without touching a host.
     if args.command in ("provision", "deploy"):
-        steps = provision_steps() if args.command == "provision" else deploy_steps({})
-        if args.dry_run:
-            sys.stdout.write(render_plan(steps))
-            return 0
-        sys.stderr.write(
-            "%s does not run against a live host yet in this build; "
-            "use --dry-run to see the plan.\n" % args.command
-        )
-        return 1
+        command = cmd_provision if args.command == "provision" else cmd_deploy
+        try:
+            return command(args)
+        except Refusal as exc:
+            # Refusals already read as the operator-facing message they are;
+            # anything else is a bug and should keep its traceback.
+            sys.stderr.write("%s\n" % exc)
+            return 1
+        except RuntimeError as exc:
+            sys.stderr.write("FATAL: %s\n" % exc)
+            return 1
 
     if args.dry_run:
         sys.stdout.write(

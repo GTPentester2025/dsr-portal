@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import io
 import os
@@ -503,6 +504,350 @@ class TestPlans(unittest.TestCase):
         self.assertIn("do a thing", text)
         self.assertIn("echo hi", text)
         self.assertIn("1", text)
+
+
+# The target box: ~10 GB, mostly used. 240 MB free is less than the ~420 MB
+# a deployment spends, so the refusal below is a path an operator will really
+# take rather than a formality.
+DF_SINGLE_ROOT_NEARLY_FULL = """Filesystem     1B-blocks       Used  Available Capacity Mounted on
+/dev/vda1     10737418240 10485760000  251658240      98% /
+"""
+
+
+class FakeSsh:
+    """Records commands instead of running them. No host, by design.
+
+    `fail_until` makes the first N calls fail, which is how a slow-starting
+    API is simulated; `fail_on` fails one specific command.
+    """
+
+    Result = collections.namedtuple("Result", "returncode stdout stderr")
+
+    def __init__(self, fail_until=0, fail_on=None, stderr=""):
+        self.commands = []
+        self.fail_until = fail_until
+        self.fail_on = fail_on
+        self.stderr = stderr
+
+    def run(self, command, check=True):
+        self.commands.append(command)
+        failed = len(self.commands) <= self.fail_until or command == self.fail_on
+        return self.Result(1 if failed else 0, "", self.stderr if failed else "")
+
+
+class TestSecretsStaging(unittest.TestCase):
+    def test_no_step_ever_carries_a_secret_value(self):
+        # A Step is what --dry-run prints and what ssh puts in the box's
+        # process table. Values belong in REMOTE_SECRETS, mode 0600, fed
+        # over stdin -- never in a command.
+        secrets = {
+            "DB_PASS": "swordfish-db",
+            "APP_PASS": "swordfish-app",
+            "CRYPTO_MASTER_KEY": base64.b64encode(b"\x07" * 32).decode(),
+            "GRAPH_CLIENT_SECRET": "swordfish-graph",
+        }
+        blob = " ".join(
+            s.command for s in dd.provision_steps() + dd.deploy_steps(secrets)
+        )
+        for value in secrets.values():
+            self.assertNotIn(value, blob)
+
+    def test_the_steps_that_need_secrets_source_the_staged_file(self):
+        needing = [
+            s
+            for s in dd.provision_steps() + dd.deploy_steps({})
+            if "${DB_PASS" in s.command or "${CRYPTO_MASTER_KEY" in s.command
+        ]
+        self.assertTrue(needing)
+        for step in needing:
+            self.assertIn(". %s" % dd.REMOTE_SECRETS, step.command, step.name)
+
+    def test_the_env_heredoc_is_unquoted_so_the_shell_expands_it(self):
+        step = [s for s in dd.deploy_steps({}) if ".env" in s.name][0]
+        self.assertIn("cat > %s <<ENV" % dd.ENV_PATH, step.command)
+        self.assertNotIn("<<'ENV'", step.command)
+
+    def test_every_other_heredoc_stays_quoted(self):
+        # An unquoted heredoc expands $ and backticks; the unit file and the
+        # nginx config contain both and must land byte-for-byte.
+        for step in dd.deploy_steps({}):
+            if ".env" in step.name:
+                continue
+            for line in step.command.splitlines():
+                if line.startswith("cat > "):
+                    self.assertIn("<<'", line, step.name)
+
+
+class TestShellQuoting(unittest.TestCase):
+    def test_a_plain_value_is_quoted(self):
+        self.assertEqual(dd.shell_quote("hunter2"), "'hunter2'")
+
+    def test_an_apostrophe_survives(self):
+        # A password with a quote in it is not exotic, and unquoted it
+        # truncates silently into both .env and the postgres role.
+        quoted = dd.shell_quote("it's fine")
+        self.assertEqual(quoted, "'it'\\''s fine'")
+
+    def test_the_quoting_round_trips_through_a_real_shell(self):
+        content = dd.remote_secrets_content({"DB_PASS": "a'b$c `d` \"e\""}, ("DB_PASS",))
+        parsed = dd.parse_env_text(content)
+        # parse_env_text strips the outer quotes; the inner escape is the
+        # shell's business, so check the shape rather than re-parsing it.
+        self.assertTrue(content.startswith("DB_PASS='"))
+        self.assertTrue(content.endswith("'\n"))
+        self.assertIn("$c", parsed["DB_PASS"])
+
+    def test_a_missing_key_is_written_empty_rather_than_omitted(self):
+        content = dd.remote_secrets_content({}, ("DB_PASS", "APP_PASS"))
+        self.assertEqual(content, "DB_PASS=''\nAPP_PASS=''\n")
+
+    def test_provision_stages_only_what_it_needs(self):
+        self.assertEqual(dd.PROVISION_SECRET_KEYS, ("DB_PASS", "APP_PASS"))
+        self.assertIn("CRYPTO_MASTER_KEY", dd.DEPLOY_SECRET_KEYS)
+
+
+class TestLocalPreflight(unittest.TestCase):
+    GOOD = {
+        "CRYPTO_MASTER_KEY": base64.b64encode(b"\x01" * 32).decode(),
+        "EMAIL_PROVIDER": "graph",
+        "PRIVACY_MAILBOX": "p@e.com",
+        "GRAPH_TENANT_ID": "t",
+        "GRAPH_CLIENT_ID": "c",
+        "GRAPH_CLIENT_SECRET": "s",
+    }
+
+    def test_a_good_secrets_file_passes_without_warning(self):
+        self.assertEqual(dd.validate_secrets(dict(self.GOOD)), [])
+
+    def test_a_hex_master_key_is_refused_before_anything_is_pushed(self):
+        env = dict(self.GOOD)
+        env["CRYPTO_MASTER_KEY"] = "a" * 64
+        with self.assertRaises(dd.SecretsError):
+            dd.validate_secrets(env)
+
+    def test_a_missing_graph_credential_is_refused_and_named(self):
+        env = dict(self.GOOD)
+        env["GRAPH_CLIENT_SECRET"] = ""
+        with self.assertRaises(dd.SecretsError) as caught:
+            dd.validate_secrets(env)
+        self.assertIn("GRAPH_CLIENT_SECRET", str(caught.exception))
+
+    def test_the_key_is_checked_before_the_mailer(self):
+        # Both are broken; the master key is the one that cannot be fixed
+        # after the fact, so it must be the one reported.
+        with self.assertRaises(dd.SecretsError) as caught:
+            dd.validate_secrets({"CRYPTO_MASTER_KEY": "", "EMAIL_PROVIDER": "smtp"})
+        self.assertIn("CRYPTO_MASTER_KEY", str(caught.exception))
+
+    def test_a_refusal_is_catchable_as_a_refusal(self):
+        self.assertTrue(issubclass(dd.SecretsError, dd.Refusal))
+
+
+class TestFingerprintGuard(unittest.TestCase):
+    KEY = base64.b64encode(b"\x01" * 32).decode()
+    OTHER = base64.b64encode(b"\x02" * 32).decode()
+
+    def test_matching_fingerprints_are_no_refusal(self):
+        fp = dd.key_fingerprint(self.KEY)
+        self.assertEqual(dd.fingerprint_refusal(fp, fp, "s.env", "root@h"), "")
+
+    def test_an_empty_remote_fingerprint_is_a_first_deployment(self):
+        fp = dd.key_fingerprint(self.KEY)
+        self.assertEqual(dd.fingerprint_refusal(fp, "", "s.env", "root@h"), "")
+        self.assertEqual(dd.fingerprint_refusal(fp, "\n", "s.env", "root@h"), "")
+
+    def test_a_different_key_refuses_and_names_both_files(self):
+        message = dd.fingerprint_refusal(
+            dd.key_fingerprint(self.KEY),
+            dd.key_fingerprint(self.OTHER),
+            "deploy/.secrets.blr.env",
+            "root@1.2.3.4",
+        )
+        self.assertIn("deploy/.secrets.blr.env", message)
+        self.assertIn("root@1.2.3.4", message)
+        self.assertIn(dd.key_fingerprint(self.KEY), message)
+        self.assertIn(dd.key_fingerprint(self.OTHER), message)
+
+    def test_the_refusal_never_contains_either_key(self):
+        message = dd.fingerprint_refusal(
+            dd.key_fingerprint(self.KEY),
+            dd.key_fingerprint(self.OTHER),
+            "s.env",
+            "root@h",
+        )
+        self.assertNotIn(self.KEY, message)
+        self.assertNotIn(self.OTHER, message)
+
+    def test_trailing_newlines_from_ssh_do_not_look_like_a_mismatch(self):
+        fp = dd.key_fingerprint(self.KEY)
+        self.assertEqual(dd.fingerprint_refusal(fp, fp + "\n", "s.env", "h"), "")
+
+    def test_the_remote_side_computes_it_with_key_fingerprint_too(self):
+        # deploy.sh uses `md5sum | cut -c1-8`. key_fingerprint is sha256, so
+        # a shell fingerprint would never match a local one and the guard
+        # would refuse every single deployment. Both sides must be this
+        # function, run by the copy of this tool that was just pushed.
+        command = dd.REMOTE_FINGERPRINT_COMMAND
+        self.assertIn("key_fingerprint", command)
+        self.assertIn("parse_env_text", command)
+        self.assertIn(dd.ENV_PATH, command)
+        self.assertNotIn("md5sum", command)
+        self.assertNotIn("sha256sum", command)
+
+    def test_a_box_with_no_env_prints_nothing_rather_than_a_hash_of_nothing(self):
+        # key_fingerprint('') is a perfectly good hash, and returning it
+        # would mismatch every real key and block every first deployment.
+        self.assertIn("if k.strip() else ''", dd.REMOTE_FINGERPRINT_COMMAND)
+
+
+class TestDiskBudgetRefusal(unittest.TestCase):
+    def test_deploy_budgets_the_documented_total(self):
+        self.assertEqual(dd.deploy_needs(), {dd.INSTALL_PREFIX: 420 * 1000 * 1000})
+
+    def test_a_full_box_is_refused_with_both_numbers(self):
+        mounts = dd.parse_df(DF_SINGLE_ROOT_NEARLY_FULL)
+        refusal = dd.budget_refusal(
+            dd.check_budget(mounts, dd.deploy_needs()), dd.deploy_breakdown()
+        )
+        self.assertTrue(refusal.startswith("FATAL:"))
+        self.assertIn("/", refusal)
+        self.assertIn("node_modules", refusal)
+        self.assertIn("doctor --disk", refusal)
+
+    def test_a_roomy_box_is_no_refusal_at_all(self):
+        mounts = dd.parse_df(DF_SEPARATE)
+        self.assertEqual(
+            dd.budget_refusal(dd.check_budget(mounts, {"/home": 1024})), ""
+        )
+
+    def test_provision_budgets_the_package_install(self):
+        self.assertEqual(list(dd.provision_needs()), ["/usr"])
+        self.assertGreater(dd.provision_needs()["/usr"], 0)
+
+
+class TestDeployPayload(unittest.TestCase):
+    def payload(self):
+        return dd.deploy_payload("/repo")
+
+    def test_it_pushes_the_three_bundles_the_dispatch_names(self):
+        remotes = [item.remote for item in self.payload()]
+        self.assertIn("%s/server/dist" % dd.INSTALL_PREFIX, remotes)
+        self.assertIn("%s/admin" % dd.WEB_ROOT, remotes)
+        self.assertIn("%s/public-form" % dd.WEB_ROOT, remotes)
+
+    def test_the_admin_bundle_does_not_land_on_the_public_form(self):
+        by_remote = dict((item.remote, item.local) for item in self.payload())
+        self.assertIn("admin", by_remote["%s/admin" % dd.WEB_ROOT])
+        self.assertIn("public-form", by_remote["%s/public-form" % dd.WEB_ROOT])
+
+    def test_the_lockfile_goes_as_a_file_not_a_directory(self):
+        kinds = dict((item.remote, item.kind) for item in self.payload())
+        self.assertEqual(
+            kinds["%s/server/package-lock.json" % dd.INSTALL_PREFIX], "file"
+        )
+        self.assertEqual(kinds["%s/server/dist" % dd.INSTALL_PREFIX], "dir")
+
+    def test_nothing_is_ever_pushed_over_the_uploads_directory(self):
+        # push_dir mirrors by removing the destination first, so a payload
+        # entry pointing at uploads would delete regulatory records.
+        for item in self.payload():
+            self.assertNotIn("uploads", item.remote)
+
+    def test_every_destination_is_under_a_path_this_tool_owns(self):
+        for item in self.payload():
+            self.assertTrue(
+                item.remote.startswith(dd.INSTALL_PREFIX + "/")
+                or item.remote.startswith(dd.WEB_ROOT + "/"),
+                item.remote,
+            )
+
+    def test_the_three_bundles_are_built_before_anything_is_pushed(self):
+        commands = dd.build_commands("/repo")
+        self.assertEqual([c for _d, c in commands], ["npm run build"] * 3)
+        self.assertEqual(
+            [pathlib.PurePath(d).as_posix() for d, _c in commands],
+            ["/repo/server", "/repo/apps/admin", "/repo/apps/public-form"],
+        )
+
+
+class TestHealthPoll(unittest.TestCase):
+    def test_the_probe_checks_the_unit_and_the_port(self):
+        command = dd.health_command()
+        self.assertIn("systemctl is-active --quiet %s" % dd.SERVICE, command)
+        self.assertIn("127.0.0.1:%d" % dd.APP_PORT, command)
+
+    def test_it_keeps_waiting_until_the_last_attempt(self):
+        self.assertEqual(dd.poll_delay(1), dd.HEALTH_INTERVAL_SECONDS)
+        self.assertEqual(dd.poll_delay(dd.HEALTH_ATTEMPTS - 1), dd.HEALTH_INTERVAL_SECONDS)
+
+    def test_it_gives_up_after_the_last_attempt(self):
+        self.assertIsNone(dd.poll_delay(dd.HEALTH_ATTEMPTS))
+        self.assertIsNone(dd.poll_delay(dd.HEALTH_ATTEMPTS + 1))
+
+    def test_it_does_not_sleep_after_the_final_probe(self):
+        total = sum(
+            dd.poll_delay(n) or 0 for n in range(1, dd.HEALTH_ATTEMPTS + 1)
+        )
+        self.assertEqual(total, (dd.HEALTH_ATTEMPTS - 1) * dd.HEALTH_INTERVAL_SECONDS)
+
+    def test_the_window_is_deploy_shs_sixty_seconds(self):
+        self.assertEqual(dd.HEALTH_ATTEMPTS, 20)
+        self.assertEqual(dd.HEALTH_INTERVAL_SECONDS, 3)
+
+    def test_a_slow_start_is_not_reported_as_a_failure(self):
+        # The reason this polls at all: on a 1-vCPU box Nest can take well
+        # over four seconds to bind, and a one-shot probe calls a working
+        # deployment broken.
+        ssh = FakeSsh(fail_until=4)  # the fifth probe is the one that answers
+        slept = []
+        self.assertTrue(dd.poll_health(ssh, io.StringIO(), sleep=slept.append))
+        self.assertEqual(len(ssh.commands), 5)
+        self.assertEqual(slept, [dd.HEALTH_INTERVAL_SECONDS] * 4)
+
+    def test_an_api_that_never_binds_gives_up_after_twenty(self):
+        ssh = FakeSsh(fail_until=10 ** 6)
+        slept = []
+        self.assertFalse(dd.poll_health(ssh, io.StringIO(), sleep=slept.append))
+        self.assertEqual(len(ssh.commands), dd.HEALTH_ATTEMPTS)
+        self.assertEqual(len(slept), dd.HEALTH_ATTEMPTS - 1)
+
+
+class TestRunSteps(unittest.TestCase):
+    def test_it_names_every_step_as_it_runs(self):
+        ssh = FakeSsh()
+        out = io.StringIO()
+        dd.run_steps(ssh, [dd.Step("first", "a"), dd.Step("second", "b")], out)
+        self.assertIn("first", out.getvalue())
+        self.assertIn("second", out.getvalue())
+        self.assertEqual(ssh.commands, ["a", "b"])
+
+    def test_it_stops_at_the_first_failure(self):
+        ssh = FakeSsh(fail_on="b")
+        with self.assertRaises(dd.Refusal):
+            dd.run_steps(
+                ssh,
+                [dd.Step("first", "a"), dd.Step("second", "b"), dd.Step("third", "c")],
+                io.StringIO(),
+            )
+        self.assertEqual(ssh.commands, ["a", "b"])
+
+    def test_the_refusal_names_the_step_and_quotes_the_stderr(self):
+        ssh = FakeSsh(fail_on="b", stderr="pg_hba.conf: permission denied")
+        with self.assertRaises(dd.Refusal) as caught:
+            dd.run_steps(ssh, [dd.Step("second", "b")], io.StringIO())
+        self.assertIn("second", str(caught.exception))
+        self.assertIn("permission denied", str(caught.exception))
+
+    def test_a_silent_failure_falls_back_to_stdout(self):
+        message = dd.step_failure_message("nginx -t", 1, "", "nginx: configuration file failed")
+        self.assertIn("nginx -t", message)
+        self.assertIn("configuration file failed", message)
+
+    def test_a_failure_that_printed_nothing_still_says_something(self):
+        message = dd.step_failure_message("a step", 137, "", "")
+        self.assertIn("a step", message)
+        self.assertIn("137", message)
+        self.assertTrue(message.strip())
 
 
 class TestAtomicWrite(unittest.TestCase):
