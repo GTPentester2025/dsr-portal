@@ -191,6 +191,20 @@ ssh -i <key> "$DEPLOY_HOST" 'journalctl -u dsr-api -f'
 node deploy/smoke.mjs            # 24 production checks (ADMIN_PW required)
 ```
 
+### If a role policy locks operators out
+
+Migration `0013_role-matrix.sql` enforces role authorization in the database.
+If a predicate is wrong, one statement restores the previous behaviour without
+a rollback — role enforcement falls back to the application layer, where it
+lived before that migration:
+
+```sql
+CREATE OR REPLACE FUNCTION app_role_may_write(text[]) RETURNS boolean
+  AS $$ SELECT true $$ LANGUAGE sql STABLE;
+```
+
+Restore the real function from the migration once the predicate is fixed.
+
 ## Configuration is done in the GUI
 
 Sign in as an administrator and open **Settings**. Most of what used to be an
