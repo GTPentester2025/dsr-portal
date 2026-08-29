@@ -73,6 +73,14 @@ function listFilters(q: CaseListQuery): { sql: string; params: unknown[] } {
  * derived from the zone because cases are not assigned to individuals.
  */
 const LIST_SELECT = `
+  WITH approvers AS (
+    SELECT zone_id,
+           string_agg(name, ', ' ORDER BY name) AS names,
+           array_agg(email ORDER BY name) AS emails
+      FROM users
+     WHERE active AND role = 'approver'
+     GROUP BY zone_id
+  )
   SELECT c.id, c.case_ref, c.zone_id, c.form_key, c.request_types, c.status,
          c.assignee_id, c.due_at, c.created_at, c.requester_email_enc,
          c.pending_party, c.pending_on,
@@ -84,12 +92,7 @@ const LIST_SELECT = `
       SELECT value_json FROM case_fields
        WHERE case_id = c.id AND field_key = 'country' LIMIT 1
     ) cf ON true
-    LEFT JOIN LATERAL (
-      SELECT string_agg(u.name, ', ' ORDER BY u.name) AS names,
-             array_agg(u.email ORDER BY u.name) AS emails
-        FROM users u
-       WHERE u.active AND u.role = 'approver' AND u.zone_id = c.zone_id
-    ) app ON true
+    LEFT JOIN approvers app ON app.zone_id = c.zone_id
    WHERE true`;
 
 
@@ -108,7 +111,7 @@ export class CasesService {
       const { sql: filterSql, params } = listFilters(q);
       const rows = await client.query(
         `${LIST_SELECT} ${filterSql}
-          ORDER BY c.created_at DESC
+          ORDER BY c.created_at DESC, c.id DESC
           LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, pageSize, (page - 1) * pageSize],
       );
@@ -155,7 +158,7 @@ export class CasesService {
     return this.db.withContext(ctx, async (_db, client) => {
       const { sql: filterSql, params } = listFilters(q);
       const rows = await client.query(
-        `${LIST_SELECT} ${filterSql} ORDER BY c.created_at DESC LIMIT 10000`,
+        `${LIST_SELECT} ${filterSql} ORDER BY c.created_at DESC, c.id DESC LIMIT 10000`,
         params,
       );
       return rows.rows.map((r) => this.shapeListRow(r));
