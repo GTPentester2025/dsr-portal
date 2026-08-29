@@ -54,3 +54,25 @@ export function hasPermission(role: string, permission: Permission): boolean {
   const granted = ROLE_PERMISSIONS[role as Role];
   return granted ? granted.includes(permission) : false;
 }
+
+/**
+ * Roles whose session is not pinned to a zone.
+ *
+ * `zoneContextFor` resolves exactly these to `zone: '*'`, which is what the
+ * database reads as "every zone" — so holding one of these roles is a
+ * cross-zone grant however narrow the account's own `zone_id` looks. That
+ * makes the list a security boundary in two places at once: `auth.service.ts`
+ * uses it to build the context, and `admin-policy.ts` uses it to refuse a zone
+ * manager the ability to mint such an account.
+ *
+ * It lives here, in the permission table, because this module imports nothing:
+ * both of those files can depend on it without either depending on the other,
+ * which is what a helper in `auth.service.ts` or `admin-policy.ts` would have
+ * forced. Adding a zone-wide role means adding it here, and both sides follow.
+ */
+export const ZONE_WIDE_ROLES: readonly Role[] = ['super_admin', 'admin', 'auditor'];
+
+/** True when a session in this role sees every zone rather than one. */
+export function seesEveryZone(role: Role): boolean {
+  return ZONE_WIDE_ROLES.includes(role);
+}

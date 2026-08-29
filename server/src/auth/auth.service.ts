@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { DbService, ZoneContext } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
 import { SettingsService } from '../settings/settings.service';
+import { seesEveryZone } from './permissions';
 
 const DEFAULT_IDLE_TIMEOUT_MIN = 30;
 const DEFAULT_ABSOLUTE_LIFETIME_H = 8;
@@ -20,11 +21,15 @@ export interface SessionUser {
 
 export function zoneContextFor(user: SessionUser): ZoneContext {
   // Super admins, admins and auditors see every zone; the rest are pinned.
+  // The membership test is shared with `canAssignRole` (ZONE_WIDE_ROLES in
+  // permissions.ts) so that a role cannot be zone-wide here while a zone
+  // manager is still allowed to create one there.
+  //
   // The role itself is passed through unchanged: collapsing super_admin into
   // admin here would make an instance-administration policy inexpressible in
   // the database, because the two would be indistinguishable by the time a
   // query ran.
-  if (user.role === 'super_admin' || user.role === 'admin' || user.role === 'auditor') {
+  if (seesEveryZone(user.role)) {
     return { role: user.role, zone: '*' };
   }
   return { role: user.role, zone: user.zoneId ?? '__none__' };

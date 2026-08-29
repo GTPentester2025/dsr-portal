@@ -1,4 +1,4 @@
-import type { Role } from './permissions';
+import { seesEveryZone, type Role } from './permissions';
 
 export interface RoleActor {
   role: Role;
@@ -25,7 +25,14 @@ export function canAssignRole(
     return 'Only a super admin can grant the super admin role';
   }
   if (actor.role === 'zone_manager') {
-    if (targetRole === 'admin' || targetRole === 'super_admin') {
+    // Pinning the target's zone is not enough on its own: a zone-wide role
+    // ignores the zone it is filed under. `zoneContextFor` resolves every role
+    // in ZONE_WIDE_ROLES to `zone: '*'`, so an `auditor` created with
+    // `zoneId: 'EUR'` still reads every zone's cases and exports the whole
+    // audit log. Asking `seesEveryZone` rather than naming roles here means a
+    // role added to that list in the future is refused the moment it is added,
+    // instead of quietly reopening this the way `auditor` did.
+    if (seesEveryZone(targetRole)) {
       return 'Zone managers can only manage their own zone';
     }
     if (targetZone !== actor.zoneId) {

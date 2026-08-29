@@ -1,4 +1,5 @@
 import { canAssignRole } from './admin-policy';
+import { ZONE_WIDE_ROLES } from './permissions';
 
 const superAdmin = { role: 'super_admin' as const, zoneId: null };
 const admin = { role: 'admin' as const, zoneId: null };
@@ -27,6 +28,23 @@ describe('canAssignRole', () => {
     );
   });
 
+  it('stops a zone manager creating an auditor in their own zone', () => {
+    // An auditor's session is zone '*' whatever zone_id the row carries, so
+    // this would have handed an EUR manager every zone's cases and the whole
+    // audit log through an account that looks zone-scoped in the console.
+    expect(canAssignRole(eurManager, 'auditor', 'EUR')).toBe(
+      'Zone managers can only manage their own zone',
+    );
+  });
+
+  it('stops a zone manager granting any zone-wide role', () => {
+    // Keyed off the shared list rather than three literals: a zone-wide role
+    // added later has to be refused here without anyone remembering to.
+    for (const role of ZONE_WIDE_ROLES) {
+      expect(canAssignRole(eurManager, role, 'EUR')).not.toBeNull();
+    }
+  });
+
   it('stops a zone manager acting outside their zone', () => {
     expect(canAssignRole(eurManager, 'approver', 'SAZ')).toBe(
       'Zone managers can only manage their own zone',
@@ -47,5 +65,13 @@ describe('canAssignRole', () => {
   it('lets an admin manage any operational role in any zone', () => {
     expect(canAssignRole(admin, 'zone_manager', 'SAZ')).toBeNull();
     expect(canAssignRole(admin, 'auditor', null)).toBeNull();
+  });
+
+  it('leaves zone-wide roles available to those above a zone manager', () => {
+    // The refusal is about the actor, not the role: an auditor is a normal
+    // thing for an admin or a super admin to create.
+    expect(canAssignRole(admin, 'auditor', 'EUR')).toBeNull();
+    expect(canAssignRole(superAdmin, 'auditor', 'EUR')).toBeNull();
+    expect(canAssignRole(superAdmin, 'admin', null)).toBeNull();
   });
 });
