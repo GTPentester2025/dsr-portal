@@ -2,7 +2,9 @@
 
 Status: approved for planning
 Date: 2026-08-29
-Sub-project 1 of 4 (email → RBAC/SSO seams → scale hardening → RHEL deployer)
+Sub-project 1 of 5 (email → RBAC hardening → SSO seams → scale hardening →
+RHEL deployer). The original plan had four sub-projects; RBAC and SSO were
+split once the RBAC work grew to include a database-level role matrix.
 
 ## Context
 
