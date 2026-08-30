@@ -73,7 +73,7 @@ Out of scope, each for a stated reason:
 
 ### One file, two sides
 
-`deploy/dsr-deploy.py`, invoked as `python3 deploy/dsr-deploy.py <command>`.
+`deploy/dsr_deploy.py`, invoked as `python3 deploy/dsr_deploy.py <command>`.
 Python **3.9 or newer**, which is what RHEL 9 ships as `/usr/bin/python3`, so
 there is nothing to install on either end. "One file" means the tool: its unit
 tests live in a sibling file, because a test file is not something an operator
@@ -91,14 +91,14 @@ Instead the local side does three things — build, push one payload, invoke the
 remote side — and the remote side runs as a normal Python process on the box:
 
 ```
-local:   dsr-deploy.py deploy
+local:   dsr_deploy.py deploy
            → validate secrets, budget disk, build, tar → ssh
-           → ssh host "python3 /root/dsr-deploy.py --remote deploy"
+           → ssh host "python3 /root/dsr_deploy.py --remote deploy"
 remote:  reads real state, acts, prints one JSON document
 local:   renders that document as human output, sets the exit code
 ```
 
-The tool copies **itself** to `/root/dsr-deploy.py` as the first act of every
+The tool copies **itself** to `/root/dsr_deploy.py` as the first act of every
 command. That path rather than `/opt/dsr/` because `provision` runs against a
 bare host where `/opt/dsr` and the `dsr` user do not yet exist; `/root` always
 does, and the existing `deploy/.target.env` already assumes a `root@host` SSH
@@ -109,6 +109,27 @@ target.
 Everything that needs to *read* machine state does so in Python, where
 `pg_hba.conf` is a file to parse rather than a `sed` expression inside three
 levels of quoting.
+
+### Staging secrets
+
+`provision` and `deploy` are the only two commands that ever handle a
+credential, and both need the same thing: passwords and keys available to a
+handful of remote steps without those values ever appearing in a `Step`
+string, an argv element, a process list, or a log line. The mechanism is a
+staging file: secrets are written to `/root/.dsr-secrets.env` at mode
+`0600`, pushed to the box over the SSH transport's stdin rather than as a
+command-line argument, `source`d by exactly the two or three steps that
+need a value (role creation, writing `.env`), and removed in a
+`try`/`finally` around the whole run — so a step that fails partway through
+still leaves nothing on disk afterwards.
+
+This is why no `Step` string anywhere in this design contains a credential:
+every value a step needs is a shell variable reference like `${DB_PASS}`,
+expanded on the box from the sourced file at the moment the step runs, never
+substituted into the command text on the local side. It is also why
+`--dry-run` is safe to run in front of anyone — the plan it prints is the
+literal `Step` text, and that text was never allowed to hold a secret in the
+first place.
 
 ### Talking to Postgres without a driver
 
@@ -142,9 +163,10 @@ below possible. It touches nothing belonging to the portal — no service, no
 config, no database, no uploaded file — and `--no-state` suppresses even that,
 for running against a box you want to leave bit-identical.
 
-`doctor --disk` restricts output to the host and disk group; the other groups
-have equivalent flags. A global `--dry-run` prints the plan for `provision` and
-`deploy` without executing it.
+`doctor --disk` restricts output to the disk group alone, not the host group
+too — a flag named `--disk` that also printed host findings would surprise.
+Each of the five other groups has its own equivalent flag. A global
+`--dry-run` prints the plan for `provision` and `deploy` without executing it.
 
 ### Disk as a first-class constraint
 
@@ -161,7 +183,7 @@ preflight refuses with real numbers rather than failing halfway:
 FATAL: /opt has 240 MB free; deploy needs ~420 MB
        (node_modules ~310 MB, dist ~40 MB, transfer headroom ~70 MB)
        Reclaimable now: 180 MB dnf cache, 96 MB journal, 55 MB npm cache.
-       See: dsr-deploy.py doctor --disk
+       See: dsr_deploy.py doctor --disk
 ```
 
 A refusal that names the number and where to find the space is the difference
@@ -195,16 +217,30 @@ normal way to repair a half-finished provision.
 3. **Node 22.** Prefer the AppStream module (`dnf module enable nodejs:22`);
    fall back to the NodeSource RPM when that stream is unavailable. Either way,
    assert `node -v` reports major ≥ 22 rather than trusting the install.
-4. **PostgreSQL 16.** Prefer the AppStream module — service `postgresql`, data
-   directory `/var/lib/pgsql/data`. Fall back to PGDG, where the service is
-   `postgresql-16` and the data directory `/var/lib/pgsql/16/data`. Which one is
-   in use is recorded in the state file, because every later step needs the right
-   name. Then `postgresql-setup --initdb`, which Debian never required and
-   without which the service exits immediately.
+4. **PostgreSQL 16, AppStream only** — service `postgresql`, data directory
+   `/var/lib/pgsql/data`. A PGDG fallback (`postgresql-16` service,
+   `/var/lib/pgsql/16/data`) was considered and deliberately not built: this
+   tool always installs PostgreSQL itself from AppStream, so a PGDG layout
+   only arises on a host where someone pre-installed Postgres differently
+   before running this tool — and with no RHEL box available this session to
+   exercise that path, an untested fallback would be a guess dressed up as a
+   guarantee. If that situation is ever hit in practice, add the fallback then,
+   against a real host. Then `postgresql-setup --initdb`, which Debian never
+   required and without which the service exits immediately.
 5. **`pg_hba.conf`.** Ensure `127.0.0.1/32` and `::1/128` use `scram-sha-256`.
    RHEL's default is `ident`, under which the API authenticates against nothing
    and every query fails. Edited by parsing the file and rewriting the matching
    lines, with a `.orig` backup and a managed marker so a second run is a no-op.
+   Both this rewrite and nginx's below go through one atomic-write routine
+   rather than an in-place edit: the new content is written to a temp file
+   in the same directory, its mode and ownership are copied from the
+   original, and `os.replace` swaps it into place in one step. A process that
+   dies mid-write — a dropped SSH connection, an OOM kill on a 1-vCPU box —
+   leaves the original file wholly intact instead of truncated, which for
+   `pg_hba.conf` is the difference between a config edit and a host that can
+   no longer authenticate any database connection. The `.orig` backup itself
+   is taken once, guarded the same way the marker guards the rewrite, so a
+   second run does not overwrite a real backup with an already-edited file.
 6. **Roles and database.** The same SQL `setup-db.sh` runs today, executed
    through `psql`: owner `dsr`, restricted `dsr_app` that RLS depends on,
    database owned by `dsr`, UTF8, `template0`.
@@ -295,8 +331,25 @@ Instead: a sibling `deploy/test_dsr_deploy.py` using the standard library's
 server, no database.
 
 That is only worth doing if the logic worth testing is pure, so the file is
-structured to make it so. These are the parts that carry real bugs and all of
-them are testable offline:
+structured to make it so. The design decision that makes `doctor` testable
+without a server at all is the split between collectors and evaluators. A
+collector runs exactly one command against the box — `psql`, `getsebool`,
+`df`, `journalctl` — and returns whatever text came back, uninterpreted; it
+does no comparisons and reaches no conclusions. An evaluator is a pure
+function from that text to a list of `Finding`s: given the string a
+collector could have produced, it decides severity and writes the fix,
+touching no subprocess, no file, no network. Only evaluators are unit-tested
+— a test hands an evaluator a captured or hand-written string exactly like
+`psql -tAc '…'` would produce, and asserts on the `Finding`s it returns.
+Collectors are exercised only by running `doctor` against a real host, the
+same as provisioning. This split is what lets every failure mode `doctor`
+recognizes — a `pg_hba` still on `ident`, a crash-looping service, the
+`httpd_can_network_connect` boolean off — be encoded as a test against a
+string literal instead of a fixture host, and it is the most reusable idea
+in this sub-project: any future diagnostic follows the same shape.
+
+These are the parts that carry real bugs and all of them are testable
+offline:
 
 - secrets validation — the 32-byte rule against hex, base64 of the wrong length,
   whitespace, and empty; the Graph credential rule
@@ -310,6 +363,14 @@ them are testable offline:
 - Node and Postgres version comparison, including `22.1.0` against `22`
 - growth-rate and days-until-full arithmetic, including the no-baseline case
 - rendering a findings list to text and to the right exit code
+- the Python 3.9 target itself: a test parses the module with
+  `ast.parse(source, feature_version=(3, 9))`, which makes the parser reject
+  3.10+ grammar, plus an AST walk that rejects `tomllib`, `datetime.UTC`,
+  `hashlib.file_digest`, `itertools.pairwise` and `ExceptionGroup` by name —
+  none of which are grammar changes the parser would catch on its own. This
+  one matters more than it looks: a single 3.10-only construct would make
+  `import dsr_deploy` fail immediately on every real RHEL 9 box, while every
+  test in this suite kept passing on whatever newer Python runs them locally.
 
 Provisioning a host cannot be unit tested. That part is verified on a real box,
 and the spec says so rather than pretending otherwise.
@@ -318,14 +379,14 @@ and the spec says so rather than pretending otherwise.
 
 ```bash
 python3 -m unittest discover -s deploy          # the pure parts
-python3 deploy/dsr-deploy.py --help
-python3 deploy/dsr-deploy.py provision --dry-run   # prints the plan, touches nothing
-python3 deploy/dsr-deploy.py doctor                # read-only, safe against a live box
+python3 deploy/dsr_deploy.py --help
+python3 deploy/dsr_deploy.py provision --dry-run   # prints the plan, touches nothing
+python3 deploy/dsr_deploy.py doctor                # read-only, safe against a live box
 
 # on a real RHEL 9 host, in order:
-python3 deploy/dsr-deploy.py provision
-python3 deploy/dsr-deploy.py deploy
-python3 deploy/dsr-deploy.py doctor                # expect: exit 0
+python3 deploy/dsr_deploy.py provision
+python3 deploy/dsr_deploy.py deploy
+python3 deploy/dsr_deploy.py doctor                # expect: exit 0
 node deploy/smoke.mjs                              # the existing black-box test, still passing
 ```
 
