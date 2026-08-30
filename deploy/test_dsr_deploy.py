@@ -376,6 +376,69 @@ class TestPgHba(unittest.TestCase):
             self.assertFalse(changed, line)
             self.assertEqual(new, line)
 
+    # hostssl and hostnossl are the same rule with a TLS requirement bolted
+    # on. Matching only `host` left them on ident, and the box then failed in
+    # exactly the way this function exists to prevent: the portal boots, and
+    # cannot read its own database.
+
+    def test_every_tcp_connection_type_is_rewritten(self):
+        for kind in ("host", "hostssl", "hostnossl"):
+            new, changed = dd.rewrite_pg_hba("%s all all 127.0.0.1/32 ident\n" % kind)
+            self.assertTrue(changed, kind)
+            self.assertEqual(new, "%s all all 127.0.0.1/32 scram-sha-256\n" % kind)
+
+    def test_every_tcp_connection_type_survives_every_shape(self):
+        for kind in ("hostssl", "hostnossl"):
+            for line, expected in (
+                ("%s all all 127.0.0.1/32 ident  # legacy" % kind, "# legacy"),
+                (
+                    "%s all all 127.0.0.1/32 md5 clientcert=verify-full" % kind,
+                    "scram-sha-256 clientcert=verify-full",
+                ),
+                (
+                    "%s all all 127.0.0.1 255.255.255.255 ident" % kind,
+                    "255.255.255.255 scram-sha-256",
+                ),
+                ("%s all all localhost ident" % kind, "scram-sha-256"),
+                ("%s all all samehost md5" % kind, "scram-sha-256"),
+                ("%s all all ::1/128 ident" % kind, "scram-sha-256"),
+            ):
+                new, changed = dd.rewrite_pg_hba(line + "\n")
+                self.assertTrue(changed, line)
+                self.assertIn("scram-sha-256", new, line)
+                self.assertIn(expected, new, line)
+                self.assertTrue(new.startswith(kind), line)
+                twice, again = dd.rewrite_pg_hba(new)
+                self.assertFalse(again, line)
+                self.assertEqual(new, twice, line)
+
+    def test_replication_is_left_alone_for_every_tcp_connection_type(self):
+        for kind in ("host", "hostssl", "hostnossl"):
+            line = "%s replication all 127.0.0.1/32 ident\n" % kind
+            new, changed = dd.rewrite_pg_hba(line)
+            self.assertFalse(changed, kind)
+            self.assertEqual(new, line)
+
+    def test_a_remote_hostssl_rule_is_still_left_alone(self):
+        # Widening the connection type must not widen what counts as
+        # loopback.
+        text = "hostssl all all 10.0.0.0/8 md5\n"
+        new, changed = dd.rewrite_pg_hba(text)
+        self.assertFalse(changed)
+        self.assertEqual(new, text)
+
+    def test_a_commented_hostssl_rule_is_not_rewritten(self):
+        text = "# hostssl all all 127.0.0.1/32 ident\n"
+        new, changed = dd.rewrite_pg_hba(text)
+        self.assertFalse(changed)
+        self.assertEqual(new, text)
+
+    def test_a_word_merely_starting_with_host_is_not_a_connection_type(self):
+        text = "hostile all all 127.0.0.1/32 ident\n"
+        new, changed = dd.rewrite_pg_hba(text)
+        self.assertFalse(changed)
+        self.assertEqual(new, text)
+
     def test_column_alignment_survives_the_rewrite(self):
         new, _ = dd.rewrite_pg_hba(
             "host    all             all             127.0.0.1/32            ident\n"
@@ -1118,6 +1181,9 @@ AVC_DENIAL = (
 
 FORBIDDEN_SELINUX_ADVICE = ("setenforce 0", "SELINUX=disabled", "--permissive")
 
+WEBROOT_CONTEXT_OK = "unconfined_u:object_r:httpd_sys_content_t:s0 /var/www/dsr\n"
+WEBROOT_CONTEXT_BAD = "unconfined_u:object_r:admin_home_t:s0 /var/www/dsr\n"
+
 
 def _blob(findings):
     return " ".join(f.title + " " + f.detail + " " + f.fix for f in findings)
@@ -1145,7 +1211,10 @@ class TestSelinuxEvaluator(unittest.TestCase):
         self.assertIn("Permission denied while connecting to upstream", detail)
 
     def test_boolean_on_and_enforcing_is_clean(self):
-        findings = dd.evaluate_selinux("Enforcing", "httpd_can_network_connect --> on", "")
+        findings = dd.evaluate_selinux(
+            "Enforcing", "httpd_can_network_connect --> on", "", WEBROOT_CONTEXT_OK
+        )
+        self.assertTrue(findings)
         self.assertTrue(all(f.severity == dd.OK for f in findings))
 
     def test_permissive_is_a_warning_not_a_recommendation(self):
@@ -1155,6 +1224,40 @@ class TestSelinuxEvaluator(unittest.TestCase):
         blob = " ".join(f.fix + f.detail for f in findings)
         self.assertNotIn("setenforce 0", blob)
         self.assertNotIn("SELINUX=disabled", blob)
+
+    def test_a_mislabelled_web_root_is_a_failure_that_names_restorecon(self):
+        # 403 on every page, and nothing in the nginx log names SELinux.
+        for label in ("admin_home_t", "default_t", "user_home_t"):
+            context = "unconfined_u:object_r:%s:s0 /var/www/dsr\n" % label
+            findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, "", context)
+            bad = [f for f in findings if f.severity == dd.FAIL]
+            self.assertEqual(len(bad), 1, label)
+            self.assertIn("/var/www/dsr", bad[0].title)
+            self.assertIn(label, bad[0].detail)
+            self.assertIn("httpd_sys_content_t", bad[0].detail)
+            self.assertEqual(bad[0].fix, "restorecon -Rv /var/www/dsr")
+
+    def test_a_correctly_labelled_web_root_is_clean(self):
+        context = "unconfined_u:object_r:httpd_sys_content_t:s0 /var/www/dsr\n"
+        findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, "", context)
+        self.assertTrue(findings)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+        self.assertIn("httpd_sys_content_t", _blob(findings))
+
+    def test_an_unreadable_web_root_label_warns_rather_than_passing(self):
+        for context in (
+            "",
+            "ls: cannot access '/var/www/dsr': No such file or directory\n",
+            "? /var/www/dsr\n",
+        ):
+            findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, "", context)
+            labels = [f for f in findings if "label of /var/www/dsr" in f.title]
+            self.assertEqual([f.severity for f in labels], [dd.WARN], repr(context))
+
+    def test_the_web_root_check_never_echoes_the_command_output(self):
+        context = "unconfined_u:object_r:default_t:s0 /var/www/dsr SOMETHING-ELSE\n"
+        blob = _blob(dd.evaluate_selinux("Enforcing", SEBOOL_ON, "", context))
+        self.assertNotIn("SOMETHING-ELSE", blob)
 
     def test_disabled_is_told_apart_from_an_unreadable_mode(self):
         # A disabled box needs a relabel and a reboot, not `setenforce 1`:
@@ -1185,7 +1288,9 @@ class TestSelinuxEvaluator(unittest.TestCase):
         # ausearch exits 1 when the audit log is clean, printing nothing or
         # `<no matches>`. Both are the good case.
         for avc in ("", "<no matches>\n"):
-            findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, avc)
+            findings = dd.evaluate_selinux(
+                "Enforcing", SEBOOL_ON, avc, WEBROOT_CONTEXT_OK
+            )
             self.assertTrue(findings)
             self.assertTrue(all(f.severity == dd.OK for f in findings), repr(avc))
 
@@ -1210,9 +1315,12 @@ class TestSelinuxEvaluator(unittest.TestCase):
         for mode in ("Enforcing", "Permissive", "Disabled", "", "getenforce: not found"):
             for booleans in (SEBOOL_ON, SEBOOL_OFF, ""):
                 for avc in ("", AVC_DENIAL):
-                    blob = _blob(dd.evaluate_selinux(mode, booleans, avc))
-                    for forbidden in FORBIDDEN_SELINUX_ADVICE:
-                        self.assertNotIn(forbidden, blob)
+                    for webroot in ("", WEBROOT_CONTEXT_OK, WEBROOT_CONTEXT_BAD):
+                        blob = _blob(
+                            dd.evaluate_selinux(mode, booleans, avc, webroot)
+                        )
+                        for forbidden in FORBIDDEN_SELINUX_ADVICE:
+                            self.assertNotIn(forbidden, blob)
 
 
 JOURNAL_CLEAN = (
@@ -1903,6 +2011,7 @@ HEALTHY_REPLIES = [
     ("schema_migrations", MIGRATIONS_APPLIED),
     ("drizzle", "\n".join(MIGRATION_FILES) + "\n"),
     ("openssl x509", "notAfter=Dec 31 00:00:00 2026 GMT\n"),
+    ("ls -Zd", WEBROOT_CONTEXT_OK),
     ("nginx -t", NGINX_T_OK),
     ("ss -lntp", SS_HEALTHY),
 ]
@@ -1930,6 +2039,7 @@ class TestDoctorCommands(unittest.TestCase):
             "openssl x509 -enddate -noout",
             "nginx -t",
             "ss -lntp",
+            "ls -Zd /var/www/dsr",
         ):
             self.assertIn(expected, blob, "doctor never runs %s" % expected)
 

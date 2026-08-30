@@ -272,6 +272,10 @@ _WEAK_METHODS = ("ident", "md5", "trust", "password")
 # whether the rule uses CIDR or the older `address netmask` pair.
 _ADDRESS_FIELD = 3
 
+# The three TCP connection types pg_hba.conf accepts. `local` is a unix
+# socket and stays on peer; the portal connects over TCP to 127.0.0.1.
+_HOST_TYPES = ("host", "hostssl", "hostnossl")
+
 
 def _split_comment(line: str) -> tuple:
     """(code, comment) at the first `#`. pg_hba has no quoting that survives
@@ -332,6 +336,11 @@ def rewrite_pg_hba(text: str) -> tuple:
     than by an exact string, and the method is found by name rather than by
     being last on the line.
 
+    All three TCP connection types count. A box whose loopback rules read
+    `hostssl` rather than `host` -- ordinary where TLS is required on the
+    wire -- kept `ident` under the earlier match, and then failed in exactly
+    the way this function exists to prevent.
+
     Replication rows are left alone: they are not how the portal connects,
     and changing them is not this tool's business.
     """
@@ -343,7 +352,7 @@ def rewrite_pg_hba(text: str) -> tuple:
         if (
             code.strip()
             and len(fields) > _ADDRESS_FIELD + 1
-            and fields[0] == "host"
+            and fields[0].lower() in _HOST_TYPES
             and fields[1] != "replication"
             and _is_loopback(fields[_ADDRESS_FIELD])
         ):
@@ -1402,6 +1411,13 @@ DOCTOR_GROUPS = ("host", "disk", "database", "service", "web", "selinux")
 SELINUX_BOOLEAN = "httpd_can_network_connect"
 SELINUX_FIX = "setsebool -P %s on" % SELINUX_BOOLEAN
 
+# What the web root has to be labelled for nginx to be allowed to read
+# it. A directory moved into place rather than created there keeps the
+# context it came from -- admin_home_t after a `mv` out of /root -- and
+# every request then answers 403 with nothing in the nginx log naming
+# SELinux.
+WEB_ROOT_CONTEXT = "httpd_sys_content_t"
+
 
 def redact_url(text: str) -> str:
     """Blank the password out of any connection string in `text`.
@@ -1460,7 +1476,7 @@ def _unreadable(text: str) -> bool:
     return any(marker in (text or "") for marker in _UNREADABLE_MARKERS)
 
 
-def evaluate_selinux(getenforce: str, booleans: str, avc: str) -> list:
+def evaluate_selinux(getenforce: str, booleans: str, avc: str, webroot: str = "") -> list:
     """Read `getenforce`, `getsebool` and `ausearch` output.
 
     Nothing here ever suggests turning SELinux off. That is the fix people
@@ -1540,6 +1556,43 @@ def evaluate_selinux(getenforce: str, booleans: str, avc: str) -> list:
     else:
         findings.append(
             Finding(group, OK, "%s is on" % SELINUX_BOOLEAN, "", "")
+        )
+
+    # Only the type is read out, never the whole line: an evaluator that
+    # echoes command output back is an evaluator that prints whatever the
+    # command happened to say.
+    label = re.search(r":([a-z_]+_t):", webroot or "")
+    if label is None:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the SELinux label of %s" % WEB_ROOT,
+                "`ls -Zd` answered without a context, so whether nginx is "
+                "allowed to read the built portal is unknown. The directory "
+                "may not exist yet.",
+                "ls -Zd %s" % WEB_ROOT,
+            )
+        )
+    elif label.group(1) != WEB_ROOT_CONTEXT:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "%s has the wrong SELinux file context" % WEB_ROOT,
+                "Labelled %s, not %s. nginx is refused every file under it "
+                "and the portal answers 403 -- and that label is what a `mv` "
+                "into place leaves behind, because a moved file keeps the "
+                "context of where it came from."
+                % (label.group(1), WEB_ROOT_CONTEXT),
+                "restorecon -Rv %s" % WEB_ROOT,
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                group, OK, "%s is labelled %s" % (WEB_ROOT, WEB_ROOT_CONTEXT), "", ""
+            )
         )
 
     # Checked before the denial scan, because "Permission denied" contains
@@ -2564,6 +2617,9 @@ DOCTOR_COMMANDS = (
         "DSR_CERT=$(ls /etc/letsencrypt/live/*/fullchain.pem 2>/dev/null | head -1); "
         "[ -n \"$DSR_CERT\" ] && openssl x509 -enddate -noout -in \"$DSR_CERT\"",
     ),
+    # The fourth SELinux check the spec lists: a web root labelled
+    # default_t or admin_home_t answers 403 and names nothing.
+    ("webroot_context", "ls -Zd %s 2>&1" % WEB_ROOT),
     ("nginx_t", "nginx -t 2>&1"),
     ("listeners", "ss -lntp 2>&1"),
 )
@@ -2663,7 +2719,9 @@ def assemble_findings(capture: dict, samples: dict, now_epoch: int) -> list:
 
     findings = []
     findings += evaluate_host(get("os_release"), get("node_version"), get("psql_version"))
-    findings += evaluate_selinux(get("getenforce"), get("sebool"), get("avc"))
+    findings += evaluate_selinux(
+        get("getenforce"), get("sebool"), get("avc"), get("webroot_context")
+    )
     findings += evaluate_service(get("is_active"), get("nrestarts"), get("journal"))
     findings += evaluate_env(get("env_text"), get("env_mode"))
     findings += evaluate_disk(get("df"), samples)
