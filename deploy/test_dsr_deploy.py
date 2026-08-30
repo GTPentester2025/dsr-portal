@@ -2377,6 +2377,341 @@ class TestDiskEvaluator(unittest.TestCase):
         self.assertTrue(any(f.severity == dd.WARN for f in findings))
 
 
+# Hand-written examples of what these commands print, not captures: there is
+# no RHEL host in this session and inventing a "capture" would be a lie about
+# provenance. The shapes are taken from the tools' documented output.
+FREE_2G = (
+    "               total        used        free      shared  "
+    "buff/cache   available\n"
+    "Mem:      2061725696   611672064   184623104     8404992  "
+    "1265430528  1188945920\n"
+    "Swap:     1030862848           0  1030862848\n"
+)
+
+FREE_8G = (
+    "               total        used        free      shared  "
+    "buff/cache   available\n"
+    "Mem:      8589934592  1611672064  4184623104     8404992  "
+    "2793639424  6588945920\n"
+    "Swap:              0           0           0\n"
+)
+
+FREE_UNREADABLE = "bash: free: command not found\n"
+
+SWAPON_ZRAM = (
+    "NAME       TYPE      SIZE       USED PRIO\n"
+    "/dev/zram0 partition 1030862848    0  100\n"
+)
+
+SWAPON_SWAPFILE = (
+    "NAME      TYPE SIZE       USED PRIO\n"
+    "/swapfile file 2147483648    0   -2\n"
+)
+
+# What swapon prints on a host with no swap: nothing at all, not even a
+# header. That is the condition the check exists to catch, so it must not be
+# mistaken for a failed read.
+SWAPON_NONE = ""
+
+SWAPON_UNREADABLE = "bash: swapon: command not found\n"
+
+# du prints its children first and the argument last.
+DU_OPT_DSR = (
+    "4394582016\t/opt/dsr/uploads\n"
+    "366477312\t/opt/dsr/server\n"
+    "12582912\t/opt/dsr/backups\n"
+    "4096\t/opt/dsr/tmp\n"
+    "4773646336\t/opt/dsr\n"
+)
+
+DU_OPT_DSR_MANY = (
+    "4394582016\t/opt/dsr/uploads\n"
+    "366477312\t/opt/dsr/server\n"
+    "12582912\t/opt/dsr/backups\n"
+    "8388608\t/opt/dsr/tmp\n"
+    "4194304\t/opt/dsr/spool\n"
+    "2097152\t/opt/dsr/state\n"
+    "1048576\t/opt/dsr/old\n"
+    "4789035008\t/opt/dsr\n"
+)
+
+# One unreadable subdirectory, with stderr folded into stdout.
+DU_OPT_DSR_PARTIAL = (
+    "du: cannot read directory '/opt/dsr/uploads/2026': Permission denied\n"
+    "4394582016\t/opt/dsr/uploads\n"
+    "366477312\t/opt/dsr/server\n"
+    "4773646336\t/opt/dsr\n"
+)
+
+DU_DNF_CACHE = "44040192\t/var/cache/dnf\n"
+DU_NPM_CACHE = "18874368\t/root/.npm\n"
+DU_DNF_CACHE_BIG = "230686720\t/var/cache/dnf\n"
+DU_NPM_CACHE_BIG = "62914560\t/root/.npm\n"
+DU_ABSENT = "du: cannot access '/root/.npm': No such file or directory\n"
+DU_DENIED = "du: cannot read directory '/var/cache/dnf': Permission denied\n"
+
+JOURNAL_USAGE = "Archived and active journals take up 48.0M in the file system.\n"
+JOURNAL_USAGE_BIG = "Archived and active journals take up 1.2G in the file system.\n"
+JOURNAL_USAGE_UNREADABLE = "bash: journalctl: command not found\n"
+
+ENV_BACKUP_SIZE = "742\n"
+ENV_BACKUP_MISSING = "stat: cannot statx '/opt/dsr/server/.env.bak': No such file or directory\n"
+
+
+class TestMemoryEvaluator(unittest.TestCase):
+    def test_the_ram_total_is_reported(self):
+        findings = dd.evaluate_memory(FREE_2G, SWAPON_ZRAM)
+        self.assertIn("1.9 GiB of RAM", _blob(findings))
+
+    def test_zram_is_reported_as_active_and_clean(self):
+        findings = dd.evaluate_memory(FREE_2G, SWAPON_ZRAM)
+        self.assertEqual(dd.exit_code_for(findings), 0)
+        self.assertIn("zram swap is active", _blob(findings))
+        self.assertIn("983.1 MiB", _blob(findings))
+
+    def test_a_swapfile_is_a_warning_that_names_the_file(self):
+        # A 2 GiB swapfile is a fifth of this box. Reporting it as "swap is
+        # present, fine" is how the disk ends up spent before provisioning.
+        findings = dd.evaluate_memory(FREE_2G, SWAPON_SWAPFILE)
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        blob = _blob(findings)
+        self.assertIn("/swapfile", blob)
+        self.assertIn("zram", blob)
+
+    def test_no_swap_on_a_small_box_is_a_failure_naming_npm_ci(self):
+        findings = dd.evaluate_memory(FREE_2G, SWAPON_NONE)
+        self.assertEqual(dd.exit_code_for(findings), 2)
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertEqual(len(bad), 1)
+        self.assertIn("no swap", bad[0].title)
+        self.assertIn("npm ci", bad[0].detail)
+        self.assertIn("systemd-zram-setup", bad[0].fix)
+
+    def test_no_swap_on_a_roomy_box_is_only_a_warning(self):
+        # 8 GiB of RAM is not the box npm ci gets killed on.
+        findings = dd.evaluate_memory(FREE_8G, SWAPON_NONE)
+        self.assertEqual(dd.exit_code_for(findings), 1)
+
+    def test_an_unreadable_free_warns_rather_than_inventing_a_size(self):
+        findings = dd.evaluate_memory(FREE_UNREADABLE, SWAPON_ZRAM)
+        titles = [f.title for f in findings if f.severity == dd.WARN]
+        self.assertIn("could not read the memory table", titles)
+        self.assertNotIn("of RAM", _blob(findings))
+
+    def test_an_unreadable_swapon_is_not_reported_as_no_swap(self):
+        findings = dd.evaluate_memory(FREE_2G, SWAPON_UNREADABLE)
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        blob = _blob(findings)
+        self.assertIn("could not read the swap table", blob)
+        self.assertNotIn("there is no swap", blob)
+
+    def test_nothing_here_ever_recommends_a_swapfile(self):
+        for swaps in (SWAPON_ZRAM, SWAPON_SWAPFILE, SWAPON_NONE, SWAPON_UNREADABLE):
+            blob = _blob(dd.evaluate_memory(FREE_2G, swaps))
+            for forbidden in ("fallocate", "mkswap", "dd if=/dev/zero"):
+                self.assertNotIn(forbidden, blob)
+
+    def test_parse_free_reads_the_mem_row_and_not_the_swap_row(self):
+        self.assertEqual(dd.parse_free(FREE_2G), {"ram": 2061725696})
+
+    def test_parse_swapon_skips_the_header(self):
+        self.assertEqual(
+            dd.parse_swapon(SWAPON_ZRAM), [("/dev/zram0", "partition", 1030862848)]
+        )
+        self.assertEqual(dd.parse_swapon(SWAPON_NONE), [])
+
+
+class TestLargestDirs(unittest.TestCase):
+    def test_the_biggest_directories_are_named_with_sizes(self):
+        findings = dd.evaluate_largest_dirs(DU_OPT_DSR)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, dd.OK)
+        self.assertIn("/opt/dsr holds 4.4 GiB", findings[0].title)
+        self.assertIn("uploads 4.1 GiB", findings[0].detail)
+        self.assertIn("server 349.5 MiB", findings[0].detail)
+
+    def test_the_biggest_comes_first(self):
+        detail = dd.evaluate_largest_dirs(DU_OPT_DSR)[0].detail
+        self.assertLess(detail.index("uploads"), detail.index("server"))
+        self.assertLess(detail.index("server"), detail.index("backups"))
+
+    def test_the_listing_is_capped(self):
+        detail = dd.evaluate_largest_dirs(DU_OPT_DSR_MANY)[0].detail
+        self.assertEqual(detail.count(" MiB") + detail.count(" GiB"), 5)
+        self.assertNotIn("old", detail)
+
+    def test_the_prefix_itself_is_the_total_not_a_child(self):
+        detail = dd.evaluate_largest_dirs(DU_OPT_DSR)[0].detail
+        self.assertNotIn("/opt/dsr ", detail)
+        self.assertIn("4.4 GiB", dd.evaluate_largest_dirs(DU_OPT_DSR)[0].title)
+
+    def test_the_uploads_tree_is_named_but_given_no_command(self):
+        finding = dd.evaluate_largest_dirs(DU_OPT_DSR)[0]
+        self.assertIn("uploads", finding.detail)
+        self.assertEqual(finding.fix, "")
+        self.assertIn("never reclaimed", finding.detail)
+
+    def test_one_unreadable_subdirectory_does_not_lose_the_measurement(self):
+        finding = dd.evaluate_largest_dirs(DU_OPT_DSR_PARTIAL)[0]
+        self.assertEqual(finding.severity, dd.OK)
+        self.assertIn("uploads 4.1 GiB", finding.detail)
+        self.assertNotIn("Permission denied", finding.detail)
+
+    def test_no_output_at_all_warns_rather_than_reporting_an_empty_prefix(self):
+        findings = dd.evaluate_largest_dirs("")
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        self.assertIn("could not measure", findings[0].title)
+
+    def test_is_uploads_path_holds_up(self):
+        self.assertTrue(dd.is_uploads_path("/opt/dsr/uploads"))
+        self.assertTrue(dd.is_uploads_path("/opt/dsr/uploads/"))
+        self.assertTrue(dd.is_uploads_path("/opt/dsr/uploads/2026/07"))
+        self.assertFalse(dd.is_uploads_path("/opt/dsr/uploadsx"))
+        self.assertFalse(dd.is_uploads_path("/opt/dsr/server"))
+
+
+class TestReclaimable(unittest.TestCase):
+    def healthy(self):
+        return dd.evaluate_reclaimable(
+            DU_DNF_CACHE, DU_NPM_CACHE, JOURNAL_USAGE, ENV_BACKUP_SIZE
+        )
+
+    def test_each_source_carries_the_exact_command_that_frees_it(self):
+        pairs = [(f.title, f.fix) for f in self.healthy()]
+        blob = " | ".join("%s -> %s" % pair for pair in pairs)
+        self.assertIn("the dnf package cache is 42.0 MiB -> dnf clean all", blob)
+        self.assertIn("the npm cache is 18.0 MiB -> npm cache clean --force", blob)
+        self.assertIn(
+            "the systemd journal is 48.0 MiB -> journalctl --vacuum-size=100M", blob
+        )
+
+    def test_the_total_is_the_sum_of_the_three(self):
+        titles = [f.title for f in self.healthy()]
+        # 42 MiB + 18 MiB + 48 MiB
+        self.assertIn("about 108.0 MiB can be reclaimed without touching data", titles)
+
+    def test_a_small_total_is_not_a_warning(self):
+        self.assertEqual(dd.exit_code_for(self.healthy()), 0)
+
+    def test_a_large_total_warns(self):
+        findings = dd.evaluate_reclaimable(
+            DU_DNF_CACHE_BIG, DU_NPM_CACHE_BIG, JOURNAL_USAGE_BIG, ENV_BACKUP_SIZE
+        )
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        warned = [f for f in findings if f.severity == dd.WARN]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("can be reclaimed", warned[0].title)
+
+    def test_the_uploads_directory_never_appears_in_a_reclaimable_finding(self):
+        # Uploads are the largest thing on the box and the least reclaimable:
+        # scanned identity documents held as regulatory records. Naming them
+        # under a heading an operator reads as "things you can delete" is how
+        # an accident starts.
+        for capture in (
+            (DU_DNF_CACHE, DU_NPM_CACHE, JOURNAL_USAGE, ENV_BACKUP_SIZE),
+            (DU_DNF_CACHE_BIG, DU_NPM_CACHE_BIG, JOURNAL_USAGE_BIG, ENV_BACKUP_MISSING),
+            (DU_DENIED, DU_ABSENT, JOURNAL_USAGE_UNREADABLE, ""),
+        ):
+            findings = dd.evaluate_reclaimable(*capture)
+            blob = _blob(findings)
+            self.assertNotIn(dd.UPLOADS_DIR, blob)
+            for finding in findings:
+                self.assertNotIn("upload", finding.fix.lower())
+
+    def test_the_database_is_never_offered_as_reclaimable(self):
+        blob = _blob(self.healthy())
+        for forbidden in ("/var/lib/pgsql", "dropdb", "DROP", "TRUNCATE", "vacuumdb"):
+            self.assertNotIn(forbidden, blob)
+
+    def test_an_absent_cache_is_not_an_error_and_frees_nothing(self):
+        findings = dd.evaluate_reclaimable(
+            DU_DNF_CACHE, DU_ABSENT, JOURNAL_USAGE, ENV_BACKUP_SIZE
+        )
+        self.assertEqual(dd.exit_code_for(findings), 0)
+        titles = [f.title for f in findings]
+        self.assertIn("the npm cache is empty or absent", titles)
+        # 42 MiB + 48 MiB, with nothing counted for the absent cache.
+        self.assertIn("about 90.0 MiB can be reclaimed without touching data", titles)
+
+    def test_an_unreadable_cache_is_not_reported_as_empty(self):
+        findings = dd.evaluate_reclaimable(
+            DU_DENIED, DU_NPM_CACHE, JOURNAL_USAGE, ENV_BACKUP_SIZE
+        )
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        warned = [f.title for f in findings if f.severity == dd.WARN]
+        self.assertIn("could not measure the dnf package cache", warned)
+
+    def test_an_unreadable_journal_is_not_reported_as_zero(self):
+        findings = dd.evaluate_reclaimable(
+            DU_DNF_CACHE, DU_NPM_CACHE, JOURNAL_USAGE_UNREADABLE, ENV_BACKUP_SIZE
+        )
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        self.assertIn("could not measure the journal", _blob(findings))
+
+    def test_the_env_rollback_copy_is_reported_and_never_given_a_command(self):
+        rollback = [
+            f for f in self.healthy() if "rollback copy" in f.title
+        ]
+        self.assertEqual(len(rollback), 1)
+        self.assertEqual(rollback[0].title, "the .env rollback copy is 742 B")
+        self.assertEqual(rollback[0].fix, "")
+        self.assertIn("only rollback", rollback[0].detail)
+
+    def test_no_reclaimable_finding_proposes_removing_a_file_by_path(self):
+        # Every command here is a cache-clearing subcommand that knows what
+        # it owns. An `rm` on a path is how the wrong path gets typed.
+        for capture in (
+            (DU_DNF_CACHE, DU_NPM_CACHE, JOURNAL_USAGE, ENV_BACKUP_SIZE),
+            (DU_DENIED, DU_ABSENT, JOURNAL_USAGE_UNREADABLE, ENV_BACKUP_MISSING),
+        ):
+            blob = _blob(dd.evaluate_reclaimable(*capture))
+            for forbidden in ("rm ", "rm -", "unlink ", "shred ", "> /"):
+                self.assertNotIn(forbidden, blob)
+
+    def test_a_box_with_no_rollback_copy_says_so(self):
+        findings = dd.evaluate_reclaimable(
+            DU_DNF_CACHE, DU_NPM_CACHE, JOURNAL_USAGE, ENV_BACKUP_MISSING
+        )
+        self.assertEqual(dd.exit_code_for(findings), 0)
+        self.assertIn("no .env rollback copy", _blob(findings))
+
+    def test_the_rollback_copy_is_not_counted_as_reclaimable(self):
+        with_backup = [f.title for f in self.healthy()]
+        without = [
+            f.title
+            for f in dd.evaluate_reclaimable(
+                DU_DNF_CACHE, DU_NPM_CACHE, JOURNAL_USAGE, ENV_BACKUP_MISSING
+            )
+        ]
+        total = [t for t in with_backup if "can be reclaimed" in t]
+        self.assertEqual(total, [t for t in without if "can be reclaimed" in t])
+
+    def test_parse_size_reads_systemds_units(self):
+        self.assertEqual(dd.parse_size("48.0M"), 48 * 1024 * 1024)
+        self.assertEqual(dd.parse_size("1.2G"), int(1.2 * 1024 ** 3))
+        self.assertEqual(dd.parse_size("512K"), 512 * 1024)
+        self.assertEqual(dd.parse_size("742"), 742)
+        self.assertIsNone(dd.parse_size("no number here"))
+
+    def test_parse_du_skips_what_is_not_a_measurement(self):
+        self.assertEqual(
+            dd.parse_du(DU_OPT_DSR_PARTIAL),
+            [
+                (4394582016, "/opt/dsr/uploads"),
+                (366477312, "/opt/dsr/server"),
+                (4773646336, "/opt/dsr"),
+            ],
+        )
+        self.assertEqual(dd.parse_du(""), [])
+
+    def test_parse_du_needs_both_a_size_and_a_path(self):
+        # A line with only one field is not a measurement, and turning it
+        # into one invents a directory named after a number.
+        self.assertEqual(dd.parse_du("4096\n\n4096\t/opt/dsr\n"),
+                         [(4096, "/opt/dsr")])
+
+
+
 class TestTlsEvaluator(unittest.TestCase):
     # 1788220800 is 2026-09-01T00:00:00Z. Nine days before the cert below.
     NOW = 1788220800
@@ -2670,9 +3005,16 @@ HEALTHY_REPLIES = [
     ("ausearch", ""),
     ("is-active", "active\n"),
     ("NRestarts", "NRestarts=0\n"),
-    ("journalctl", JOURNAL_CLEAN),
+    ("journalctl -u", JOURNAL_CLEAN),
     ("df -PB1", DF_ROOMY),
-    ("stat -c", "600\n"),
+    ("free -b", FREE_2G),
+    ("swapon", SWAPON_ZRAM),
+    ("--max-depth", DU_OPT_DSR),
+    ("/var/cache/dnf", DU_DNF_CACHE),
+    ("/root/.npm", DU_NPM_CACHE),
+    ("journalctl --disk-usage", JOURNAL_USAGE),
+    ("stat -c %s", ENV_BACKUP_SIZE),
+    ("stat -c %a", "600\n"),
     ("cat %s" % dd.ENV_PATH, ENV_GOOD),
     ("pg_roles", PSQL_ROLES),
     ("schema_migrations", MIGRATIONS_APPLIED),
@@ -2707,6 +3049,13 @@ class TestDoctorCommands(unittest.TestCase):
             "nginx -t",
             "ss -lntp",
             "ls -Zd /var/www/dsr",
+            "free -b",
+            "swapon --show --bytes",
+            "du -xb --max-depth=1 /opt/dsr",
+            "du -sb /var/cache/dnf",
+            "du -sb /root/.npm",
+            "journalctl --disk-usage",
+            "stat -c %s /opt/dsr/server/.env.bak",
         ):
             self.assertIn(expected, blob, "doctor never runs %s" % expected)
 
@@ -2740,8 +3089,44 @@ class TestDoctorCommands(unittest.TestCase):
                 "CREATE",
                 "certbot",
                 "migrate.mjs",
+                # du takes none of these, but find-shaped muscle memory
+                # writes them anyway, and this tree is identity documents.
+                "-delete",
+                "--delete",
+                "-exec",
+                "-execdir",
+                "truncate",
+                "shred",
+                "unlink",
+                "mv ",
+                "clean all",
+                "cache clean",
+                "--vacuum",
+                "-X POST",
+                "-X PUT",
+                "--data",
+                "-o /dev/null -X",
             ):
                 self.assertNotIn(forbidden, command, "%s would change the box" % name)
+
+    def test_the_du_collectors_carry_only_measuring_flags(self):
+        # The blanket sweep above catches flags somebody typed. This one
+        # catches flags nobody thought of, by refusing everything that is
+        # not on the list -- and asserts the du collectors are still there,
+        # so deleting them cannot make this pass.
+        allowed = ("-x", "-b", "-s", "-sb", "-xb", "-bs", "--max-depth=1")
+        seen = []
+        for name, command in dd.DOCTOR_COMMANDS:
+            words = command.split(" 2>")[0].split()
+            if words[0] != "du":
+                continue
+            seen.append(name)
+            for token in words[1:]:
+                if token.startswith("-"):
+                    self.assertIn(token, allowed, "%s: %s" % (name, token))
+        self.assertEqual(
+            sorted(seen), ["dnf_cache", "largest_dirs", "npm_cache"]
+        )
 
 
 class TestDoctorAssembly(unittest.TestCase):
@@ -2754,6 +3139,22 @@ class TestDoctorAssembly(unittest.TestCase):
         bad = [(f.group, f.title, f.detail) for f in findings if f.severity != dd.OK]
         self.assertEqual(bad, [])
         self.assertEqual(dd.exit_code_for(findings), 0)
+
+    def test_the_new_host_and_disk_checks_reach_the_report(self):
+        # An evaluator with passing unit tests that nothing calls is a check
+        # that does not exist.
+        titles = [f.title for f in dd.assemble_findings(self.healthy(), {}, NOW)]
+        for expected in (
+            "the host has 1.9 GiB of RAM",
+            "zram swap is active (983.1 MiB)",
+            "/opt/dsr holds 4.4 GiB",
+            "the dnf package cache is 42.0 MiB",
+            "the npm cache is 18.0 MiB",
+            "the systemd journal is 48.0 MiB",
+            "the .env rollback copy is 742 B",
+            "about 108.0 MiB can be reclaimed without touching data",
+        ):
+            self.assertIn(expected, titles)
 
     def test_every_group_the_cli_can_filter_on_actually_reports(self):
         groups = {f.group for f in dd.assemble_findings(self.healthy(), {}, NOW)}

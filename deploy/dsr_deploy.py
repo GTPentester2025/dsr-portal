@@ -2284,6 +2284,272 @@ def evaluate_disk(df_text: str, samples: dict) -> list:
     return findings
 
 
+# ---------------------------------------------------------------------------
+# disk: what is eating it, and what can honestly be given back
+# ---------------------------------------------------------------------------
+
+# "Which directory is eating the disk" without the operator guessing.
+#
+# -x stops du crossing a filesystem boundary, so a separate /var or a bind
+# mount under the prefix is not counted against this one.
+#
+# --max-depth=1 limits the *output*, not the walk: du still stats every file
+# under the uploads tree, and on a box holding a hundred thousand case files
+# that takes real time. That cost is accepted deliberately. The flags that
+# would avoid it are the flags that mutate -- `-delete`, `-exec`, anything
+# that prunes or moves while measuring -- and doctor is read-only, over a
+# tree of scanned identity documents. Nobody is to "optimise" this into a
+# command that changes the box.
+LARGEST_DIRS_COMMAND = "du -xb --max-depth=1 %s 2>&1" % INSTALL_PREFIX
+LARGEST_DIRS_SHOWN = 5
+
+# Reclaimable space, and only things that are genuinely reclaimable: caches
+# that regenerate and logs that have already been read.
+#
+# Uploads and the Postgres cluster are the two largest things on this box and
+# neither appears here. They are scanned identity documents and regulatory
+# records; listing them under a heading an operator reads as "things you can
+# delete" is how an accident starts.
+DNF_CACHE_DIR = "/var/cache/dnf"
+NPM_CACHE_DIR = "/root/.npm"
+ENV_BACKUP_PATH = ENV_PATH + ".bak"
+
+DNF_CACHE_COMMAND = "du -sb %s 2>&1" % DNF_CACHE_DIR
+NPM_CACHE_COMMAND = "du -sb %s 2>&1" % NPM_CACHE_DIR
+JOURNAL_USAGE_COMMAND = "journalctl --disk-usage 2>&1"
+ENV_BACKUP_COMMAND = "stat -c %%s %s 2>&1" % ENV_BACKUP_PATH
+
+DNF_CLEAN_FIX = "dnf clean all"
+NPM_CLEAN_FIX = "npm cache clean --force"
+JOURNAL_VACUUM_FIX = "journalctl --vacuum-size=100M"
+
+# Worth telling an operator about on a ~10 GB box. Below it the report is
+# still printed -- the number is the point -- but it is not a warning.
+RECLAIM_WARN_BYTES = 256 * 1024 * 1024
+
+
+def parse_du(text: str) -> list:
+    """`du -b` output into [(bytes, path), ...], skipping anything else.
+
+    With stderr folded in, du's complaints (`cannot read directory`) arrive
+    on the same stream as its answers. A line that is not a number followed
+    by a path is one of those, and skipping it is what lets a single
+    unreadable subdirectory still produce a usable measurement.
+    """
+    rows = []
+    for line in (text or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            size = int(parts[0])
+        except ValueError:
+            continue
+        rows.append((size, parts[1].strip()))
+    return rows
+
+
+def parse_size(text: str):
+    """systemd's `96.0M` / `1.5G` / `512K` into bytes, or None.
+
+    systemd formats these 1024-based, which is what human_bytes prints back.
+    """
+    found = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT])?", text or "")
+    if found is None:
+        return None
+    scale = {None: 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+    return int(float(found.group(1)) * scale[found.group(2)])
+
+
+def is_uploads_path(path: str) -> bool:
+    """True for the uploads directory itself or anything inside it."""
+    cleaned = (path or "").rstrip("/")
+    root = UPLOADS_DIR.rstrip("/")
+    return cleaned == root or cleaned.startswith(root + "/")
+
+
+def evaluate_largest_dirs(du_text: str) -> list:
+    """The biggest directories directly under the install prefix.
+
+    Reports sizes and nothing else. There is no fix on any finding here on
+    purpose: the largest directory on this box is the uploads tree, and a
+    "fix:" line beside it would read as a suggestion to delete case files.
+    """
+    group = "disk"
+    rows = parse_du(du_text)
+    if not rows:
+        return [
+            Finding(
+                group,
+                WARN,
+                "could not measure the directories under %s" % INSTALL_PREFIX,
+                "Without this, \"the disk is full\" names no cause.",
+                LARGEST_DIRS_COMMAND.split(" 2>")[0],
+            )
+        ]
+
+    prefix = INSTALL_PREFIX.rstrip("/")
+    children = [row for row in rows if row[1].rstrip("/") != prefix]
+    totals = [row[0] for row in rows if row[1].rstrip("/") == prefix]
+    total = totals[0] if totals else sum(row[0] for row in children)
+
+    children.sort(key=lambda row: (-row[0], row[1]))
+    shown = children[:LARGEST_DIRS_SHOWN]
+    listed = ", ".join(
+        "%s %s" % (path[len(prefix) + 1:] or path, human_bytes(size))
+        for size, path in shown
+    )
+    detail = "Largest: %s." % listed if listed else "Nothing underneath it."
+    if any(is_uploads_path(path) for _size, path in shown):
+        detail += (
+            " The uploads tree is scanned identity documents and regulatory "
+            "records; it is reported here, never reclaimed."
+        )
+    return [
+        Finding(
+            group,
+            OK,
+            "%s holds %s" % (prefix, human_bytes(total)),
+            detail,
+            "",
+        )
+    ]
+
+
+def _measure_cache(text: str):
+    """(bytes, state) for a `du -sb` capture: ok, absent, or unreadable."""
+    rows = parse_du(text)
+    if rows:
+        return rows[0][0], "ok"
+    if not (text or "").strip() or "No such file" in text:
+        return 0, "absent"
+    return 0, "unreadable"
+
+
+def evaluate_reclaimable(
+    dnf_cache: str, npm_cache: str, journal_usage: str, env_backup: str
+) -> list:
+    """Each reclaimable thing, its size, and the exact command that frees it.
+
+    Nothing here is portal data. Uploads and the database are the two largest
+    things on the box and neither is reclaimable, so neither is measured,
+    named as a path, or given a command.
+    """
+    group = "disk"
+    findings = []
+    total = 0
+
+    for label, text, command, fix, detail in (
+        (
+            "the dnf package cache",
+            dnf_cache,
+            DNF_CACHE_COMMAND,
+            DNF_CLEAN_FIX,
+            "Packages that are already installed. dnf re-downloads what it "
+            "needs next time.",
+        ),
+        (
+            "the npm cache",
+            npm_cache,
+            NPM_CACHE_COMMAND,
+            NPM_CLEAN_FIX,
+            "Tarballs npm can fetch again. deploy cleans this after npm ci; "
+            "an interrupted deploy leaves it behind.",
+        ),
+    ):
+        size, state = _measure_cache(text)
+        if state == "ok":
+            total += size
+            findings.append(
+                Finding(
+                    group, OK, "%s is %s" % (label, human_bytes(size)), detail, fix
+                )
+            )
+        elif state == "absent":
+            findings.append(
+                Finding(group, OK, "%s is empty or absent" % label, "", "")
+            )
+        else:
+            findings.append(
+                Finding(
+                    group,
+                    WARN,
+                    "could not measure %s" % label,
+                    "An unreadable answer is not the same as nothing to "
+                    "reclaim, and on a full box the difference matters.",
+                    command.split(" 2>")[0],
+                )
+            )
+
+    journal_text = journal_usage or ""
+    journal_bytes = None
+    if not _unreadable(journal_text) and "take up" in journal_text:
+        journal_bytes = parse_size(journal_text.split("take up", 1)[1])
+    if journal_bytes is None:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not measure the journal",
+                "journald defaults to a tenth of its filesystem, which on this "
+                "box is most of a gigabyte of logs nobody has read.",
+                "journalctl --disk-usage",
+            )
+        )
+    else:
+        total += journal_bytes
+        findings.append(
+            Finding(
+                group,
+                OK,
+                "the systemd journal is %s" % human_bytes(journal_bytes),
+                "Logs already written. Vacuuming keeps the most recent 100M "
+                "and drops the rest.",
+                JOURNAL_VACUUM_FIX,
+            )
+        )
+
+    # Counted in nothing and given no command: it is the only rollback a
+    # deployment has, and it is a few hundred bytes.
+    stripped = (env_backup or "").strip()
+    if stripped.isdigit():
+        findings.append(
+            Finding(
+                group,
+                OK,
+                "the .env rollback copy is %s" % human_bytes(int(stripped)),
+                "Not reclaimable and not counted above: it is the only "
+                "rollback a deployment has, and it is smaller than this "
+                "sentence.",
+                "",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                group,
+                OK,
+                "there is no .env rollback copy on this box yet",
+                "deploy writes %s before it overwrites the live file."
+                % ENV_BACKUP_PATH,
+                "",
+            )
+        )
+
+    findings.append(
+        Finding(
+            group,
+            WARN if total >= RECLAIM_WARN_BYTES else OK,
+            "about %s can be reclaimed without touching data" % human_bytes(total),
+            "Caches and old logs only. Uploaded case files and the database "
+            "are not in this figure and are not reclaimable: they are "
+            "identity documents and regulatory records.",
+            "; ".join((DNF_CLEAN_FIX, NPM_CLEAN_FIX, JOURNAL_VACUUM_FIX)),
+        )
+    )
+    return findings
+
+
 # openssl prints English month abbreviations whatever the box's locale is,
 # while time.strptime("%b") follows LC_TIME and silently stops matching under
 # a non-English one. Spelling the months out keeps this readable anywhere.
@@ -2729,6 +2995,145 @@ def evaluate_host(os_release: str, node_version: str, psql_version: str) -> list
 
 
 # ---------------------------------------------------------------------------
+# host: RAM, and whether zram actually came back
+# ---------------------------------------------------------------------------
+
+# provision configures zram rather than a swapfile, because `fallocate -l 2G`
+# would spend a fifth of this box's ~10 GB filesystem before a single package
+# was installed. Compressed swap in RAM costs no disk at all.
+#
+# Nothing until now confirmed the unit was still there after a reboot, and a
+# box with no swap of any kind is the box where `npm ci` on a single vCPU is
+# OOM-killed halfway through -- which the kernel reports as a killed process,
+# not as a failed install.
+FREE_COMMAND = "free -b 2>&1"
+SWAPON_COMMAND = "swapon --show --bytes 2>&1"
+
+ZRAM_FIX = (
+    "systemctl start systemd-zram-setup@zram0.service "
+    "-- provision installs zram-generator and writes "
+    "/etc/systemd/zram-generator.conf"
+)
+
+# Below this much RAM, no swap at all is a failure rather than a warning: it
+# is the configuration under which npm ci is killed rather than slowed.
+ZRAM_REQUIRED_BELOW_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def parse_free(text: str) -> dict:
+    """`free -b` into {"ram": bytes}, or {} when the row is not there.
+
+    Only the Mem: row is read. free's own Swap: row is deliberately ignored,
+    because it says how much swap there is and the whole question here is
+    what kind -- which only `swapon --show` answers.
+    """
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].rstrip(":").lower() == "mem":
+            try:
+                return {"ram": int(fields[1])}
+            except ValueError:
+                return {}
+    return {}
+
+
+def parse_swapon(text: str) -> list:
+    """`swapon --show --bytes` into [(name, kind, size), ...].
+
+    Empty output is not a parse failure. It is precisely what a host with no
+    swap prints, and that is the condition this check exists to find.
+    """
+    entries = []
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) < 3 or fields[0].upper() == "NAME":
+            continue
+        try:
+            size = int(fields[2])
+        except ValueError:
+            continue
+        entries.append((fields[0], fields[1], size))
+    return entries
+
+
+def evaluate_memory(free_text: str, swapon_text: str) -> list:
+    """Report RAM, and whether swap is zram, a disk file, or absent."""
+    group = "host"
+    findings = []
+
+    ram = parse_free(free_text).get("ram")
+    if ram is None:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the memory table",
+                "`free -b` printed nothing this tool could parse, so the swap "
+                "judgement below is made without knowing how much RAM there is.",
+                "free -b",
+            )
+        )
+    else:
+        findings.append(
+            Finding(group, OK, "the host has %s of RAM" % human_bytes(ram), "", "")
+        )
+
+    if _unreadable(swapon_text):
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the swap table",
+                "An unreadable answer is not a pass: this is the check that "
+                "says whether zram survived the last reboot.",
+                "swapon --show --bytes",
+            )
+        )
+        return findings
+
+    entries = parse_swapon(swapon_text)
+    zram = [entry for entry in entries if "zram" in entry[0].lower()]
+    if zram:
+        findings.append(
+            Finding(
+                group,
+                OK,
+                "zram swap is active (%s)" % human_bytes(sum(e[2] for e in zram)),
+                "",
+                "",
+            )
+        )
+    elif entries:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "swap is on disk, not in zram",
+                "%s costs the filesystem exactly what it is sized at. provision "
+                "configures zram instead, because a 2 GiB swapfile is a fifth "
+                "of this box." % ", ".join(entry[0] for entry in entries),
+                ZRAM_FIX,
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                group,
+                WARN if ram is None or ram >= ZRAM_REQUIRED_BELOW_BYTES else FAIL,
+                "there is no swap on this host",
+                "provision configures zram, so either it was never run here or "
+                "the unit did not come back after a reboot. With no swap on a "
+                "single-vCPU box, npm ci is the step the kernel runs out of "
+                "memory during, and it kills the process rather than failing "
+                "the install.",
+                ZRAM_FIX,
+            )
+        )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # doctor: collectors, state and the command itself
 # ---------------------------------------------------------------------------
 
@@ -2751,6 +3156,13 @@ DOCTOR_COMMANDS = (
     ("nrestarts", "systemctl show %s -p NRestarts" % SERVICE),
     ("journal", "journalctl -u %s -n 25 --no-pager 2>&1" % SERVICE),
     ("df", "df -PB1"),
+    ("memory", FREE_COMMAND),
+    ("swaps", SWAPON_COMMAND),
+    ("largest_dirs", LARGEST_DIRS_COMMAND),
+    ("dnf_cache", DNF_CACHE_COMMAND),
+    ("npm_cache", NPM_CACHE_COMMAND),
+    ("journal_usage", JOURNAL_USAGE_COMMAND),
+    ("env_backup", ENV_BACKUP_COMMAND),
     ("env_mode", "stat -c %%a %s 2>/dev/null" % ENV_PATH),
     ("env_text", "cat %s 2>/dev/null" % ENV_PATH),
     (
@@ -2871,12 +3283,17 @@ def assemble_findings(capture: dict, samples: dict, now_epoch: int) -> list:
 
     findings = []
     findings += evaluate_host(get("os_release"), get("node_version"), get("psql_version"))
+    findings += evaluate_memory(get("memory"), get("swaps"))
     findings += evaluate_selinux(
         get("getenforce"), get("sebool"), get("avc"), get("webroot_context")
     )
     findings += evaluate_service(get("is_active"), get("nrestarts"), get("journal"))
     findings += evaluate_env(get("env_text"), get("env_mode"))
     findings += evaluate_disk(get("df"), samples)
+    findings += evaluate_largest_dirs(get("largest_dirs"))
+    findings += evaluate_reclaimable(
+        get("dnf_cache"), get("npm_cache"), get("journal_usage"), get("env_backup")
+    )
     findings += evaluate_database(
         get("psql_roles"),
         get("migrations"),
