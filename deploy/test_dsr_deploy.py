@@ -1156,6 +1156,19 @@ class TestSelinuxEvaluator(unittest.TestCase):
         self.assertNotIn("setenforce 0", blob)
         self.assertNotIn("SELINUX=disabled", blob)
 
+    def test_disabled_is_told_apart_from_an_unreadable_mode(self):
+        # A disabled box needs a relabel and a reboot, not `setenforce 1`:
+        # falling through to the generic "could not read the SELinux mode"
+        # would hand the operator advice that cannot work.
+        findings = dd.evaluate_selinux("Disabled", SEBOOL_ON, "")
+        mode = [f for f in findings if "SELinux" in f.title]
+        self.assertTrue(mode)
+        self.assertEqual(mode[0].severity, dd.WARN)
+        self.assertNotIn("could not read", mode[0].title)
+        self.assertIn("/.autorelabel", mode[0].fix)
+        self.assertIn("reboot", mode[0].fix)
+        self.assertNotIn("setenforce 1", mode[0].fix)
+
     def test_avc_denials_are_surfaced(self):
         avc = "type=AVC msg=audit(1): avc:  denied  { name_connect } for  pid=1 comm=\"nginx\""
         findings = dd.evaluate_selinux("Enforcing", "httpd_can_network_connect --> on", avc)
@@ -1361,6 +1374,34 @@ class TestEnvEvaluator(unittest.TestCase):
         findings = dd.evaluate_env(text, "600")
         self.assertTrue(any(f.severity == dd.FAIL for f in findings))
         self.assertIn("GRAPH_CLIENT_SECRET", _blob(findings))
+
+    def test_cookie_secure_off_warns_that_the_session_travels_in_clear(self):
+        text = self.GOOD + "COOKIE_SECURE=false\n"
+        warned = [
+            f
+            for f in dd.evaluate_env(text, "600")
+            if f.severity == dd.WARN and "COOKIE_SECURE" in f.title
+        ]
+        self.assertTrue(warned)
+        self.assertIn("false", warned[0].title)
+        self.assertIn("HTTP", warned[0].detail)
+
+    def test_cookie_secure_true_is_not_warned_about(self):
+        text = self.GOOD + "COOKIE_SECURE=true\n"
+        self.assertEqual(
+            [f for f in dd.evaluate_env(text, "600") if f.severity != dd.OK], []
+        )
+
+    def test_a_development_node_env_warns(self):
+        text = self.GOOD.replace("NODE_ENV=production", "NODE_ENV=development")
+        warned = [
+            f
+            for f in dd.evaluate_env(text, "600")
+            if f.severity == dd.WARN and "NODE_ENV" in f.title
+        ]
+        self.assertTrue(warned)
+        self.assertIn("development", warned[0].title)
+        self.assertIn("NODE_ENV=production", warned[0].fix)
 
 
 class TestRedaction(unittest.TestCase):
@@ -1655,6 +1696,12 @@ LISTEN 0      511           0.0.0.0:80          0.0.0.0:*     users:(("nginx",pi
 LISTEN 0      511         127.0.0.1:3000        0.0.0.0:*     users:(("node",pid=4111,fd=20))
 """
 
+# nginx down entirely: the API is up and bound, but nothing answers on 80.
+SS_NO_NGINX = """State  Recv-Q Send-Q  Local Address:Port  Peer Address:Port Process
+LISTEN 0      511         127.0.0.1:3000        0.0.0.0:*     users:(("node",pid=4111,fd=20))
+LISTEN 0      244         127.0.0.1:5432        0.0.0.0:*     users:(("postmaster",pid=980,fd=7))
+"""
+
 
 class TestWebEvaluator(unittest.TestCase):
     def test_a_valid_config_and_every_port_is_clean(self):
@@ -1673,6 +1720,15 @@ class TestWebEvaluator(unittest.TestCase):
         self.assertTrue(bad)
         self.assertIn("3000", _blob(bad))
         self.assertIn("502", _blob(bad))
+
+    def test_nothing_listening_on_80_is_a_failure(self):
+        # The portal is unreachable and certbot's HTTP-01 challenge cannot
+        # complete either, so this is not the same problem as a missing 443.
+        findings = dd.evaluate_web(NGINX_T_OK, SS_NO_NGINX)
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertTrue(bad)
+        self.assertIn("nginx is not listening on port 80", [f.title for f in bad])
+        self.assertEqual(dd.exit_code_for(findings), 2)
 
     def test_http_only_is_a_warning(self):
         findings = dd.evaluate_web(NGINX_T_OK, SS_HTTP_ONLY)
