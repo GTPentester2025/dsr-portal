@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -781,9 +782,16 @@ class FakeSsh:
         self.pushed_files = []
         self.pushed_texts = []
         self.pushed_dirs = []
+        # One ordered log across runs and pushes. Two separate lists cannot
+        # answer "did the fingerprint probe happen before the first
+        # push_dir", and that ordering is the thing worth pinning: push_dir
+        # mirrors a directory by deleting it first, so every guard has to
+        # come before it.
+        self.events = []
 
     def run(self, command, check=True):
         self.commands.append(command)
+        self.events.append(("run", command))
         if command in self.responses:
             return self.Result(*self.responses[command])
         failed = len(self.commands) <= self.fail_until or command == self.fail_on
@@ -791,12 +799,24 @@ class FakeSsh:
 
     def push_file(self, local, remote):
         self.pushed_files.append((local, remote))
+        self.events.append(("push_file", remote))
 
     def push_text(self, text, remote, mode=""):
         self.pushed_texts.append((text, remote, mode))
+        self.events.append(("push_text", remote))
 
     def push_dir(self, local, remote):
         self.pushed_dirs.append((local, remote))
+        self.events.append(("push_dir", remote))
+
+    def index_of_run(self, command):
+        return self.events.index(("run", command))
+
+    def first_index_of(self, kind):
+        for position, event in enumerate(self.events):
+            if event[0] == kind:
+                return position
+        return None
 
 
 class TestSecretsStaging(unittest.TestCase):
@@ -1246,6 +1266,152 @@ class TestFingerprintProbeGuard(CommandTestCase):
         self.assertTrue(ssh.pushed_dirs)
 
 
+class TestCmdProvision(CommandTestCase):
+    """The function this task existed to create, which had no test at all."""
+
+    def test_dry_run_reads_no_secrets_and_never_touches_the_box(self):
+        code, ssh = self.run_command(dd.cmd_provision, ["provision", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.secrets_read, [])
+        self.assertEqual(ssh.events, [])
+        self.assertIn("install base packages", self.out.getvalue())
+
+    def test_it_runs_every_provisioning_step_in_order(self):
+        code, ssh = self.run_command(dd.cmd_provision, ["provision"])
+        self.assertEqual(code, 0)
+        expected = [s.command for s in dd.provision_steps()]
+        ran = [c for _kind, c in [e for e in ssh.events if e[0] == "run"]]
+        for command in expected:
+            self.assertIn(command, ran)
+        self.assertIn("PROVISION_OK", self.out.getvalue())
+
+    def test_the_budget_is_checked_before_a_single_step_runs(self):
+        _code, ssh = self.run_command(dd.cmd_provision, ["provision"])
+        first_step = dd.provision_steps()[0].command
+        self.assertLess(ssh.index_of_run("df -PB1"), ssh.index_of_run(first_step))
+
+    def test_a_full_box_is_refused_before_anything_is_staged(self):
+        ssh = self.ssh(responses={"df -PB1": (0, DF_SINGLE_ROOT_NEARLY_FULL, "")})
+        with self.assertRaises(dd.Refusal) as caught:
+            self.run_command(dd.cmd_provision, ["provision"], ssh=ssh)
+        self.assertIn("FATAL:", str(caught.exception))
+        self.assertEqual(ssh.pushed_texts, [])
+
+    def test_the_staged_secrets_are_removed_even_when_a_step_fails(self):
+        failing = dd.provision_steps()[1].command
+        ssh = self.ssh(responses={failing: (1, "", "No package nginx available")})
+        with self.assertRaises(dd.Refusal) as caught:
+            self.run_command(dd.cmd_provision, ["provision"], ssh=ssh)
+        self.assertIn("No package nginx available", str(caught.exception))
+        # The whole reason the removal is in a `finally`: a 0600 file with
+        # both role passwords must not outlive a failed run.
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+
+    def test_it_stages_only_the_two_role_passwords(self):
+        _code, ssh = self.run_command(dd.cmd_provision, ["provision"])
+        self.assertEqual(len(ssh.pushed_texts), 1)
+        text, remote, mode = ssh.pushed_texts[0]
+        self.assertEqual(remote, dd.REMOTE_SECRETS)
+        self.assertEqual(mode, "600")
+        self.assertEqual(sorted(dd.parse_env_text(text)), ["APP_PASS", "DB_PASS"])
+        self.assertNotIn("CRYPTO_MASTER_KEY", text)
+
+
+class TestCmdDeploy(CommandTestCase):
+    """The other untested half, and the one the Critical lived in."""
+
+    def test_dry_run_reads_no_secrets_and_never_touches_the_box(self):
+        code, ssh = self.run_command(dd.cmd_deploy, ["deploy", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.secrets_read, [])
+        self.assertEqual(ssh.events, [])
+        self.assertEqual(self.builds, [])
+        self.assertIn("restart dsr-api", self.out.getvalue())
+
+    def test_a_successful_deployment_runs_every_step_and_reports_ok(self):
+        code, ssh = self.run_command(dd.cmd_deploy, ["deploy"])
+        self.assertEqual(code, 0)
+        ran = [c for _k, c in [e for e in ssh.events if e[0] == "run"]]
+        for step in dd.deploy_steps(dict(self.SECRETS)):
+            self.assertIn(step.command, ran)
+        self.assertIn("DEPLOY_OK", self.out.getvalue())
+
+    def test_both_guards_run_before_the_first_directory_is_mirrored(self):
+        # push_dir removes its destination before it unpacks, so a guard
+        # that fires after the first push has already cost the box a
+        # working install. Both must precede it, and the fingerprint --
+        # the unrecoverable one -- must precede the disk check.
+        _code, ssh = self.run_command(dd.cmd_deploy, ["deploy"])
+        fingerprint = ssh.index_of_run(dd.REMOTE_FINGERPRINT_COMMAND)
+        disk = ssh.index_of_run("df -PB1")
+        first_push = ssh.first_index_of("push_dir")
+        self.assertIsNotNone(first_push)
+        self.assertLess(fingerprint, disk)
+        self.assertLess(disk, first_push)
+
+    def test_a_mismatched_key_refuses_before_anything_is_pushed(self):
+        other = dd.key_fingerprint(base64.b64encode(b"\x09" * 32).decode())
+        ssh = self.ssh(
+            responses={dd.REMOTE_FINGERPRINT_COMMAND: (0, other + "\n", "")}
+        )
+        with self.assertRaises(dd.Refusal) as caught:
+            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
+        self.assertIn("app_settings", str(caught.exception))
+        self.assertEqual(ssh.pushed_dirs, [])
+        self.assertEqual(self.builds, [])
+
+    def test_a_failed_build_pushes_nothing(self):
+        def failing_build(command, **kwargs):
+            self.builds.append((command, kwargs.get("cwd")))
+            return dd.subprocess.CompletedProcess(command, 1)
+
+        ssh = self.ssh()
+        args = dd.build_parser().parse_args(["deploy"])
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(dd, "target_ssh", lambda: (ssh, self.HOST))
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    dd, "read_secrets", lambda path: dict(self.SECRETS)
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(dd.subprocess, "run", failing_build)
+            )
+            with self.assertRaises(dd.Refusal) as caught:
+                dd.cmd_deploy(args, out=self.out)
+        self.assertIn("Nothing was pushed", str(caught.exception))
+        self.assertEqual(ssh.pushed_dirs, [])
+
+    def test_the_staged_secrets_are_removed_even_when_a_step_fails(self):
+        failing = dd.deploy_steps(dict(self.SECRETS))[3].command
+        ssh = self.ssh(responses={failing: (1, "", "relation does not exist")})
+        with self.assertRaises(dd.Refusal):
+            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+
+    def test_an_api_that_never_comes_up_fails_and_shows_the_journal(self):
+        ssh = self.ssh(responses={dd.health_command(): (1, "", "")})
+        code, ssh = self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
+        self.assertEqual(code, 1)
+        self.assertIn(dd.JOURNAL_TAIL_COMMAND, ssh.commands)
+        self.assertNotIn("DEPLOY_OK", self.out.getvalue())
+        self.assertIn("did not come up", self.err.getvalue())
+        # It waited the full window rather than giving up on one probe, and
+        # it still cleaned the secrets file up on the way out.
+        self.assertEqual(len(self.slept), dd.HEALTH_ATTEMPTS - 1)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+
+    def test_the_deployer_itself_is_pushed_before_the_probe_that_uses_it(self):
+        _code, ssh = self.run_command(dd.cmd_deploy, ["deploy"])
+        self.assertIn(("push_file", dd.REMOTE_SELF), ssh.events)
+        self.assertLess(
+            ssh.events.index(("push_file", dd.REMOTE_SELF)),
+            ssh.index_of_run(dd.REMOTE_FINGERPRINT_COMMAND),
+        )
+
+
 class TestAtomicWrite(unittest.TestCase):
     def setUp(self):
         self.directory = pathlib.Path(tempfile.mkdtemp())
@@ -1275,6 +1441,72 @@ class TestAtomicWrite(unittest.TestCase):
             with self.assertRaises(OSError):
                 dd.atomic_write(str(self.target), "rewritten\n")
         self.assertEqual([p.name for p in self.directory.iterdir()], ["pg_hba.conf"])
+
+    # Mode and ownership are the half of atomic_write nothing reached: this
+    # suite runs on Windows, where hasattr(os, "chown") is False and the
+    # whole branch is skipped. os.replace swaps inodes, so without it
+    # pg_hba.conf comes back root:root 0644 -- PostgreSQL then either
+    # refuses to start or the authentication file is world-readable.
+
+    @unittest.skipUnless(hasattr(os, "chown"), "POSIX file modes only")
+    def test_the_mode_survives_the_replacement(self):
+        os.chmod(str(self.target), 0o640)
+        dd.atomic_write(str(self.target), "rewritten\n")
+        self.assertEqual(stat.S_IMODE(os.stat(str(self.target)).st_mode), 0o640)
+
+    def test_the_original_uid_and_gid_are_carried_onto_the_replacement(self):
+        # Runs everywhere, including where the platform has no ownership at
+        # all: os.stat is doctored for this one path so the uid and gid
+        # asserted on cannot be whatever the test runner happens to have.
+        chowned = []
+        chmodded = []
+        real_stat = os.stat
+
+        def stat_with_known_owner(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if str(path) == str(self.target):
+                fields = list(result)
+                fields[0] = 0o100640
+                fields[4] = 4242
+                fields[5] = 4343
+                return os.stat_result(fields)
+            return result
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(os, "stat", stat_with_known_owner)
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    os, "chown", lambda *a: chowned.append(a), create=True
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(os, "chmod", lambda *a: chmodded.append(a))
+            )
+            dd.atomic_write(str(self.target), "rewritten\n")
+
+        self.assertEqual(len(chowned), 1)
+        temp_path, uid, gid = chowned[0]
+        self.assertEqual((uid, gid), (4242, 4343))
+        self.assertEqual(
+            pathlib.Path(temp_path).parent.resolve(), self.directory.resolve()
+        )
+        self.assertEqual(len(chmodded), 1)
+        self.assertEqual(chmodded[0][0], temp_path)
+        self.assertEqual(stat.S_IMODE(chmodded[0][1]), 0o640)
+
+    def test_a_file_that_did_not_exist_is_not_chowned_to_nothing(self):
+        # There is no original to copy from, so neither call may happen --
+        # os.stat raising must not become a chown(temp, -1, -1).
+        chowned = []
+        fresh = self.directory / "brand-new.conf"
+        with unittest.mock.patch.object(
+            os, "chown", lambda *a: chowned.append(a), create=True
+        ):
+            dd.atomic_write(str(fresh), "hello\n")
+        self.assertEqual(chowned, [])
+        self.assertEqual(fresh.read_text(), "hello\n")
 
     def test_the_temporary_file_is_a_sibling_so_the_rename_stays_atomic(self):
         # os.replace across filesystems is not atomic and can raise, so the
