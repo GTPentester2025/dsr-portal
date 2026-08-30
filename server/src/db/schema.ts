@@ -143,6 +143,13 @@ export const verificationTokens = pgTable(
     draftId: uuid('draft_id').notNull().references(() => formDrafts.id),
     sessionId: text('session_id').notNull(),
     email: text('email').notNull(),
+    /**
+     * Zone of the latest form_versions row for the draft's form_key, matching
+     * how IntakeService derives a case's zone. Nullable: a form withdrawn
+     * between the link being sent and the token being read leaves NULL, which
+     * app_zone_allows() shows to a zone-wide role and hides from a scoped one.
+     */
+    zoneId: text('zone_id'),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     consumedAt: timestamp('consumed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),

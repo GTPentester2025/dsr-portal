@@ -140,9 +140,16 @@ export class ReportService {
         params,
       );
 
+      // Zone-filtered like every other figure here since 0018 gave
+      // verification_tokens a zone column. Row-level security scopes this to
+      // the caller's zone anyway; the explicit filter is what makes an
+      // administrator's ?zone=SAZ request return SAZ's verifications rather
+      // than the whole instance's beside SAZ's everything else.
       const verified = await client.query(
         `SELECT count(*)::int AS n FROM verification_tokens
-          WHERE consumed_at::date = now()::date`,
+          WHERE consumed_at::date = now()::date
+            ${zone ? 'AND zone_id = $1' : ''}`,
+        params,
       );
 
       // Week on week, plus the near-term breach risk. Separate from the

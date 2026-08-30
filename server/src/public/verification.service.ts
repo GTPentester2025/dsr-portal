@@ -1,8 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { SettingsService } from '../settings/settings.service';
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, desc, eq, isNull } from 'drizzle-orm';
 import { DbService } from '../db/db.module';
-import { formDrafts, verificationTokens } from '../db/schema';
+import { formDrafts, formVersions, verificationTokens } from '../db/schema';
 import { CryptoService } from '../crypto/crypto.service';
 import { EMAIL_PROVIDER, type EmailProvider } from '../email/email-provider.interface';
 import { RateLimitService } from './rate-limit.service';
@@ -130,11 +130,31 @@ export class VerificationService {
         this.log.warn(`verification not sent: draft ${args.draftId} expired at ${draft.expiresAt.toISOString()}`);
         return false;
       }
+      // Stamp the token with its zone so row-level security can scope reads
+      // to it. Resolved the same way IntakeService resolves a case's zone --
+      // the highest version for this form_key -- because form_versions is
+      // unique on (form_key, version), not on (form_key, zone_id), and any
+      // other rule here could disagree with the case this draft becomes.
+      const formVersion = await db.query.formVersions.findFirst({
+        where: eq(formVersions.formKey, draft.formKey),
+        orderBy: desc(formVersions.version),
+        columns: { zoneId: true },
+      });
+      if (!formVersion) {
+        // The form was withdrawn after the draft was started. The token is
+        // still issued -- the requester is mid-flow and did nothing wrong --
+        // but it carries no zone, so only a zone-wide role can read the row.
+        this.log.warn(
+          `verification token for draft ${args.draftId} has no zone: no form_versions row for "${draft.formKey}"`,
+        );
+      }
+
       await db.insert(verificationTokens).values({
         tokenHash,
         draftId: args.draftId,
         sessionId: args.sessionId,
         email,
+        zoneId: formVersion?.zoneId ?? null,
         expiresAt,
       });
       return true;
