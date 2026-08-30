@@ -815,6 +815,29 @@ def _remote_text_fix(path: str, func_name: str) -> str:
     ) % (remote_dir, path, func_name, path)
 
 
+# The two version assertions the install steps make about themselves.
+#
+# Each is used twice in its step: once as the "already good enough, skip the
+# install" guard, and once `&&`-chained onto the end so the step's own exit
+# code carries the claim its name makes. Before this only the first use
+# existed, which meant the check ran *before* the install and never after.
+#
+# `node -v` prints `v22.11.0`; stripping the `v` and taking the first
+# dot-field is version-length-proof in a way `cut -c2-3` was not -- that
+# read "22" out of v22 and "9." out of v9, which compares as an error.
+NODE_MAJOR_TEST = (
+    '[ "$(node -v 2>/dev/null | tr -d v | cut -d. -f1)" -ge 22 ] 2>/dev/null'
+)
+
+# `postgres --version` prints `postgres (PostgreSQL) 16.4`. Asking the
+# binary rather than rpm, because rpm answers about the package name and
+# `postgresql-server` is the same package name on every stream: RHEL 9's
+# default is PostgreSQL 13, and `rpm -q postgresql-server` is true of it.
+PG_MAJOR_TEST = (
+    '[ "$(/usr/bin/postgres --version 2>/dev/null | '
+    "awk '{print $NF}' | cut -d. -f1)\" -ge 16 ] 2>/dev/null"
+)
+
 # What every later step and every deploy assumes is already there.
 #
 # `tar` is on this list because `push_dir` runs `tar -xzf -` on the box, and
@@ -868,18 +891,38 @@ def provision_steps() -> list:
             # Deliberate `;` after `module reset`: it exits non-zero when no
             # nodejs stream is enabled, which is the common case on a bare
             # box and not a reason to skip the install that follows.
-            "(command -v node >/dev/null 2>&1 && [ \"$(node -v | cut -c2-3)\" -ge 22 ]) || "
+            #
+            # The `-ge 22` test on the first line is the *skip* guard, read
+            # before anything is installed. The runbook says provisioning
+            # "asserts node -v reports major >= 22", and nothing re-read it
+            # afterwards -- so a stream that enabled and installed something
+            # older reported success. The trailing test is that assertion:
+            # `&&`-chained, so the step's own exit code carries it.
+            "((command -v node >/dev/null 2>&1 && %s) || "
             "(dnf module reset -y nodejs >/dev/null 2>&1; "
-            "dnf module enable -y nodejs:22 && dnf install -y nodejs && dnf clean all)",
+            "dnf module enable -y nodejs:22 && dnf install -y nodejs && "
+            "dnf clean all)) && %s"
+            % (NODE_MAJOR_TEST, NODE_MAJOR_TEST),
         ),
         Step(
             "install PostgreSQL 16",
             # Deliberate `;` after `module reset`, for the same reason as
             # the Node step above.
-            "rpm -q postgresql-server >/dev/null 2>&1 || "
+            #
+            # The guard was `rpm -q postgresql-server`, which is true of any
+            # version. RHEL 9's default stream is PostgreSQL 13, so on a host
+            # where someone had already run `dnf install postgresql-server`
+            # this step short-circuited, reported success under the name
+            # "install PostgreSQL 16", and left 13 running -- and the next
+            # thing to notice would have been a migration failing on syntax
+            # that 13 does not have. The guard now asks the version, and the
+            # trailing test asserts it afterwards either way.
+            "((rpm -q postgresql-server >/dev/null 2>&1 && %s) || "
             "(dnf module reset -y postgresql >/dev/null 2>&1; "
             "dnf module enable -y postgresql:16 && "
-            "dnf install -y postgresql-server postgresql-contrib && dnf clean all)",
+            "dnf install -y postgresql-server postgresql-contrib && "
+            "dnf clean all)) && %s"
+            % (PG_MAJOR_TEST, PG_MAJOR_TEST),
         ),
         Step(
             "initialize the data directory (postgresql-setup --initdb)",
@@ -1266,8 +1309,13 @@ DEPLOY_BYTES = (
 #
 # Estimates, and labelled as such: being roughly right before the fact beats
 # being exactly right halfway through a failed `dnf install`.
-PROVISION_INSTALL_BYTES = 600 * 1000 * 1000
-PROVISION_CACHE_BYTES = 300 * 1000 * 1000
+#
+# 1024-based, for the reason given over the deploy constants above: as
+# `* 1000 * 1000` the refusal printed "572.2 MiB" under a constant named
+# 600, and a refusal that disagrees with its own source is a refusal nobody
+# can check.
+PROVISION_INSTALL_BYTES = 600 * 1024 * 1024
+PROVISION_CACHE_BYTES = 300 * 1024 * 1024
 PROVISION_PACKAGE_BYTES = PROVISION_INSTALL_BYTES + PROVISION_CACHE_BYTES
 
 # The keys each command stages on the box. Provisioning only ever needs the
@@ -1930,15 +1978,24 @@ def evaluate_selinux(getenforce: str, booleans: str, avc: str, webroot: str = ""
 
     # Checked before the denial scan, because "Permission denied" contains
     # the word the scan looks for.
-    if _unreadable(avc):
+    #
+    # `or not .strip()`: an empty body reached the scan, found no "denied"
+    # in it, and reported `ok  no recent SELinux denials` -- a diagnosis
+    # asserting health on the strength of having read nothing. This is the
+    # guard evaluate_service already has for the journal, added by 082bee9,
+    # "Stop an unread log being reported as a clean one", and not carried
+    # across. ausearch prints `<no matches>` on a genuinely empty audit log,
+    # so the healthy path is not the empty one.
+    if _unreadable(avc) or not (avc or "").strip():
         findings.append(
             Finding(
                 group,
                 WARN,
                 "could not read the audit log",
-                "ausearch answered with an error rather than with denials, so "
-                "the absence of denials here is not evidence that there are "
-                "none. auditd may not be installed or running.",
+                "ausearch printed nothing at all, or an error rather than "
+                "denials, so the absence of denials here is not evidence that "
+                "there are none -- a clean log says `<no matches>`. auditd may "
+                "not be installed or running.",
                 "ausearch -m avc -ts recent -i",
             )
         )

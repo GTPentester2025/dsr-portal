@@ -950,6 +950,52 @@ class TestPlans(unittest.TestCase):
                 "instead." % (step.name, match.group(0) if match else ""),
             )
 
+    def test_each_install_step_asserts_what_it_installed(self):
+        # The runbook says provision "asserts node -v reports major >= 22".
+        # It did not: the `-ge 22` test was the *skip* guard, evaluated
+        # before the install, and nothing re-read it afterwards. The
+        # assertion has to be `&&`-chained onto the end so the step's own
+        # exit code carries it.
+        for name, test in (
+            ("install Node.js 22", dd.NODE_MAJOR_TEST),
+            ("install PostgreSQL 16", dd.PG_MAJOR_TEST),
+        ):
+            step = [s for s in dd.provision_steps() if s.name == name][0]
+            # `&& ` and endswith asserted together, not separately: the
+            # same test also sits in the skip guard with an `&&` in front of
+            # it, so "the command contains `&& <test>`" is already satisfied
+            # by the guard and would stay green over a trailing `;`.
+            self.assertTrue(
+                step.command.rstrip().endswith("&& " + test),
+                "%s does not end with `&& <its own version assertion>`, so a "
+                "failed install would not fail the step:\n%s"
+                % (name, step.command),
+            )
+
+    def test_the_postgres_guard_asks_the_version_not_just_the_package(self):
+        # `rpm -q postgresql-server` is true of PostgreSQL 13, which is
+        # RHEL 9's default stream. A host where someone had already run
+        # `dnf install postgresql-server` short-circuited a step named
+        # "install PostgreSQL 16", reported success, and ran 13.
+        step = [s for s in dd.provision_steps() if s.name == "install PostgreSQL 16"][0]
+        guard = step.command.split(" || ", 1)[0]
+        self.assertIn("rpm -q postgresql-server", guard)
+        self.assertIn(dd.PG_MAJOR_TEST, guard)
+
+    def test_the_version_assertions_read_a_version_the_way_a_shell_would(self):
+        # Not a shell here, so this pins the shape rather than the result:
+        # the major number comes off the first dot-field, which `cut -c2-3`
+        # did not do -- it read "9." out of v9 and compared that as an
+        # integer.
+        self.assertIn("cut -d. -f1", dd.NODE_MAJOR_TEST)
+        self.assertIn("-ge 22", dd.NODE_MAJOR_TEST)
+        self.assertNotIn("cut -c2-3", dd.NODE_MAJOR_TEST)
+        self.assertIn("cut -d. -f1", dd.PG_MAJOR_TEST)
+        self.assertIn("-ge 16", dd.PG_MAJOR_TEST)
+        # Asking the server binary, not rpm: the package name is the same on
+        # every stream.
+        self.assertIn("postgres --version", dd.PG_MAJOR_TEST)
+
     def test_the_base_packages_include_tar(self):
         # push_dir runs `tar -xzf -` on the box for every payload directory,
         # and a RHEL 9 minimal install does not reliably ship tar. Without
@@ -1559,6 +1605,45 @@ class TestDiskBudgetRefusal(unittest.TestCase):
         refusals = dd.check_budget(mounts, dd.provision_needs())
         self.assertEqual(len(refusals), 1)
         self.assertIn(dd.human_bytes(dd.PROVISION_PACKAGE_BYTES), refusals[0])
+
+
+class TestBudgetConstantsAgreeWithHowTheyArePrinted(unittest.TestCase):
+    """Every size constant is 1024-based, because human_bytes is.
+
+    The deploy constants were converted with an eight-line comment saying
+    why: as `* 1000 * 1000` the breakdown read "node_modules ~295.6 MiB"
+    under a constant named 310, "and a refusal that disagrees with its own
+    source is a refusal nobody can check". The provision pair was left
+    decimal and printed "572.2 MiB" under a constant named 600.
+    """
+
+    NAMED = (
+        ("PROVISION_INSTALL_BYTES", 600),
+        ("PROVISION_CACHE_BYTES", 300),
+        ("DEPLOY_NODE_MODULES_BYTES", 310),
+        ("DEPLOY_DIST_BYTES", 40),
+        ("DEPLOY_TRANSFER_HEADROOM_BYTES", 70),
+    )
+
+    def test_each_constant_prints_the_number_it_is_named_after(self):
+        for name, mebibytes in self.NAMED:
+            self.assertEqual(
+                dd.human_bytes(getattr(dd, name)),
+                "%.1f MiB" % mebibytes,
+                "%s prints something other than the %d in its own name"
+                % (name, mebibytes),
+            )
+
+    def test_the_totals_print_the_sum_of_their_parts(self):
+        self.assertEqual(dd.human_bytes(dd.PROVISION_PACKAGE_BYTES), "900.0 MiB")
+        self.assertEqual(dd.human_bytes(dd.DEPLOY_BYTES), "420.0 MiB")
+
+    def test_the_provision_refusal_quotes_a_figure_matching_its_source(self):
+        # End to end: what the operator actually reads on a full box.
+        mounts = dd.parse_df(DF_SINGLE_ROOT_NEARLY_FULL)
+        refusal = dd.check_budget(mounts, dd.provision_needs())[0]
+        self.assertIn("900.0 MiB", refusal)
+        self.assertNotIn("858", refusal)
 
 
 class TestDeployPayload(unittest.TestCase):
@@ -2418,6 +2503,11 @@ class TestSsh(unittest.TestCase):
 SEBOOL_OFF = "httpd_can_network_connect --> off\n"
 SEBOOL_ON = "httpd_can_network_connect --> on\n"
 
+# What a clean audit log prints. Not "": the collector folds stderr in, so
+# an empty answer is a read that did not happen, and reporting it as clean
+# is a diagnosis asserting health on the strength of having read nothing.
+AVC_NO_MATCHES = "<no matches>\n"
+
 # One denial, in the shape ausearch prints. This is the log line behind the
 # 502 that started all of this.
 AVC_DENIAL = (
@@ -2462,7 +2552,10 @@ class TestSelinuxEvaluator(unittest.TestCase):
 
     def test_boolean_on_and_enforcing_is_clean(self):
         findings = dd.evaluate_selinux(
-            "Enforcing", "httpd_can_network_connect --> on", "", WEBROOT_CONTEXT_OK
+            "Enforcing",
+            "httpd_can_network_connect --> on",
+            AVC_NO_MATCHES,
+            WEBROOT_CONTEXT_OK,
         )
         self.assertTrue(findings)
         self.assertTrue(all(f.severity == dd.OK for f in findings))
@@ -2489,7 +2582,9 @@ class TestSelinuxEvaluator(unittest.TestCase):
 
     def test_a_correctly_labelled_web_root_is_clean(self):
         context = "unconfined_u:object_r:httpd_sys_content_t:s0 /var/www/dsr\n"
-        findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, "", context)
+        findings = dd.evaluate_selinux(
+            "Enforcing", SEBOOL_ON, AVC_NO_MATCHES, context
+        )
         self.assertTrue(findings)
         self.assertTrue(all(f.severity == dd.OK for f in findings))
         self.assertIn("httpd_sys_content_t", _blob(findings))
@@ -2535,14 +2630,39 @@ class TestSelinuxEvaluator(unittest.TestCase):
         self.assertIn("nginx", denials[0].detail)
 
     def test_no_denials_is_not_an_error(self):
-        # ausearch exits 1 when the audit log is clean, printing nothing or
-        # `<no matches>`. Both are the good case.
-        for avc in ("", "<no matches>\n"):
+        # ausearch exits 1 when the audit log is clean and prints
+        # `<no matches>`. Exit 1 is not a failure here and the collector
+        # folds stderr in, so that string is the whole of the good case.
+        findings = dd.evaluate_selinux(
+            "Enforcing", SEBOOL_ON, AVC_NO_MATCHES, WEBROOT_CONTEXT_OK
+        )
+        self.assertTrue(findings)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
+        self.assertIn("no recent SELinux denials", _blob(findings))
+
+    def test_an_empty_audit_capture_is_not_reported_as_a_clean_one(self):
+        # This used to read `ok  no recent SELinux denials`. The collector
+        # folds stderr in, so nothing at all is not what a clean audit log
+        # looks like -- it is what a read that did not happen looks like:
+        # a truncated answer, a dropped connection, a killed ausearch. Its
+        # sibling evaluate_service has had exactly this guard for the
+        # journal since 082bee9, "Stop an unread log being reported as a
+        # clean one", and it was not carried across.
+        for avc in ("", "   ", "\n\n"):
             findings = dd.evaluate_selinux(
                 "Enforcing", SEBOOL_ON, avc, WEBROOT_CONTEXT_OK
             )
-            self.assertTrue(findings)
-            self.assertTrue(all(f.severity == dd.OK for f in findings), repr(avc))
+            audit = [f for f in findings if "audit log" in f.title]
+            self.assertEqual([f.severity for f in audit], [dd.WARN], repr(avc))
+            self.assertNotIn("no recent SELinux denials", _blob(findings), repr(avc))
+
+    def test_the_sibling_guard_reads_the_same_way_on_both_evaluators(self):
+        # The bug was one evaluator being fixed and its twin not. Asserted
+        # as a pair, so the next divergence is visible.
+        selinux = dd.evaluate_selinux("Enforcing", SEBOOL_ON, "", WEBROOT_CONTEXT_OK)
+        service = dd.evaluate_service("active", "NRestarts=0", "")
+        self.assertIn("could not read the audit log", _blob(selinux))
+        self.assertIn("could not read the recent journal", _blob(service))
 
     def test_an_unreadable_audit_log_is_not_reported_as_no_denials(self):
         # With stderr folded in, ausearch's own complaint is the answer. An
@@ -3895,7 +4015,7 @@ HEALTHY_REPLIES = [
     ("psql --version", "psql (PostgreSQL) 16.2\n"),
     ("getenforce", "Enforcing\n"),
     ("getsebool", SEBOOL_ON),
-    ("ausearch", ""),
+    ("ausearch", "<no matches>\n"),
     ("is-active", "active\n"),
     ("NRestarts", "NRestarts=0\n"),
     ("journalctl -u", JOURNAL_CLEAN),

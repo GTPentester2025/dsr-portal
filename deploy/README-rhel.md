@@ -95,14 +95,22 @@ Audit this list before running it — every step is idempotent, so re-running
 after reading it is safe:
 
 1. Installs base packages: `nginx`, `policycoreutils-python-utils`,
-   `firewalld`, `curl`, `ca-certificates` (via `dnf`; cache cleaned after).
-2. Installs Node.js 22, preferring the AppStream module
-   (`dnf module enable nodejs:22`), and asserts `node -v` reports major
-   ≥ 22.
+   `firewalld`, `curl`, `ca-certificates`, `tar` (via `dnf`; cache cleaned
+   after). `tar` is on that list because `deploy` transfers every payload
+   directory through it, and RHEL 9 minimal installs do not reliably ship
+   it.
+2. Installs Node.js 22 from the AppStream module
+   (`dnf module enable nodejs:22`), then asserts `node -v` reports major
+   ≥ 22 — after the install, `&&`-chained, so an install that produced
+   something older fails the step rather than passing it.
 3. Installs PostgreSQL 16 from AppStream
    (`dnf module enable postgresql:16`) and runs
    `postgresql-setup --initdb` if the data directory is empty, then starts
-   and enables the `postgresql` service.
+   and enables the `postgresql` service. It asks `postgres --version` both
+   before and after: RHEL 9's default stream is PostgreSQL 13 and the
+   package name is the same on every stream, so a host where someone had
+   already run `dnf install postgresql-server` would otherwise skip this
+   step and run 13 under a step named "install PostgreSQL 16".
 4. Rewrites `/var/lib/pgsql/data/pg_hba.conf` so loopback (`127.0.0.1`,
    `::1`, `localhost`, `samehost`) uses `scram-sha-256` instead of RHEL's
    default `ident`. Takes a one-time backup at `pg_hba.conf.orig` and
