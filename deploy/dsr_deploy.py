@@ -1397,13 +1397,26 @@ def remote_secrets_content(env: dict, keys) -> str:
 #   @  ends the userinfo, so the rest of the password becomes the host
 #   :  starts the port, so the rest of the password has to be digits
 #   ?  starts the query, #  starts the fragment
+#   %  is read as an escape by the parser, not as itself
 #
 # `openssl rand -base64 32` -- what this file's own error messages
 # recommend -- emits `/` and `+`, so this is not a hypothetical class of
 # password. Run under bash with APP_PASS=pw/with/slash the real .env body
 # expands to `postgres://dsr_app:pw/with/slash@127.0.0.1:5432/dsr`, which
 # node-postgres reads as host `dsr_app` with no port at all.
-URL_RESERVED_IN_PASSWORD = "/@:?#"
+#
+# `%` fails silently rather than loudly, which is why it is not grouped with
+# the six characters above it. This file's own copy of pg-connection-string
+# (server/node_modules/pg-connection-string/index.js) calls
+# decodeURIComponent on the password it parses out, so `abc%41def` becomes
+# `abcAdef` with no error raised anywhere. Provisioning writes the *raw*
+# string into postgres as the role's password -- the SQL layer never
+# decodes anything -- so the two ends of the same deploy disagree on what
+# the password is, the API cannot authenticate, and systemd crash-loops it,
+# same as every other character in this set. The recommended generators
+# below cannot produce a `%`, so this only ever bites a hand-chosen
+# password -- which is exactly the kind likely to contain one.
+URL_RESERVED_IN_PASSWORD = "/@:?#%"
 
 # A generator that cannot emit any of the above. Both are 32 bytes of
 # entropy; the second is the first with the offending base64 characters
@@ -1744,6 +1757,17 @@ def redact_url(text: str) -> str:
     stray `@d` -- and a redactor that resolves the ambiguity in favour of
     printing loses a password the one time it is wrong. Stopping the password
     at whitespace keeps the over-redaction inside a single token.
+
+    The same cost shows up unprompted by any postgres URL at all: an npm
+    install failure logs
+    `npm ERR! request to https://registry.npmjs.org:443/@nestjs/core failed`,
+    and the port-then-`/@scope` sequence matches the password pattern just
+    as well as a real one does, becoming
+    `...npmjs.org:***@nestjs/core failed`. The unscoped form (no leading
+    `@org/`) is not a match and passes through untouched. This is the same
+    trade as the paragraph above, paid on a line with no secret in it at
+    all, and the regex is not worth narrowing to avoid it: the alternative
+    is a pattern that also stops matching some shape of a real password.
     """
     return re.sub(r"(://[^\s:/@]*):[^\s]*@", r"\1:***@", text or "")
 
@@ -1782,6 +1806,17 @@ def scrub(text: str, values) -> str:
     every occurrence of an ordinary word inside a weak password and shred
     the log the operator is reading, and half alone would blank three
     characters of a six-character value.
+
+    `values` in practice is not only the passwords: both call sites pass
+    every value in the whole secrets mapping, not just the keys a step
+    actually staged onto the box, so PRIVACY_MAILBOX, GRAPH_TENANT_ID and
+    plain `production`-style config strings go through this same fragment
+    treatment whenever they run six characters or long enough. That is
+    safe by construction -- scrubbing a non-secret costs nothing but
+    readability -- and arguably the right default given how easily a
+    future secret could be added to that mapping and missed here. But it
+    means the fragment rule's readability cost above is paid on more of
+    the mapping than "the real passwords" suggests.
     """
     text = text or ""
     needles = set()

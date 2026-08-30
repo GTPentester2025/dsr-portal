@@ -1426,7 +1426,10 @@ class TestLocalPreflight(unittest.TestCase):
         #   postgres://dsr_app:pw/with/slash@127.0.0.1:5432/dsr
         # which node-postgres reads as host `dsr_app` with no port.
         for key in dd.ROLE_PASSWORD_KEYS:
-            for character in "/@:?#":
+            # Iterates dd.URL_RESERVED_IN_PASSWORD itself, not a copy of it
+            # written out here, so a character added to that set later is
+            # covered by this test without anyone remembering to update it.
+            for character in dd.URL_RESERVED_IN_PASSWORD:
                 env = dict(self.GOOD)
                 env[key] = "pw" + character + "tail"
                 with self.assertRaises(dd.SecretsError) as caught:
@@ -1436,6 +1439,27 @@ class TestLocalPreflight(unittest.TestCase):
                 # Which character, not just that there was one: an operator
                 # staring at 32 base64 characters cannot spot it otherwise.
                 self.assertIn(character, message)
+
+    def test_percent_is_refused_because_it_silently_decodes_rather_than_fails(self):
+        # `%` is a different failure mode from the rest of the set: it is a
+        # URL *escape* character rather than a structural one, so a parser
+        # does not refuse it, it decodes it. This file's own copy of
+        # pg-connection-string (server/node_modules/pg-connection-string/
+        # index.js) calls decodeURIComponent on the password it parses out
+        # of the URL, so DB_PASS=abc%41def is written into postgres as the
+        # literal string `abc%41def` while the API authenticates with the
+        # decoded `abcAdef`. The two ends of one deploy disagree on what
+        # the password is, authentication fails, and systemd crash-loops
+        # the service with nothing in the logs naming the cause.
+        self.assertIn("%", dd.URL_RESERVED_IN_PASSWORD)
+        for key in dd.ROLE_PASSWORD_KEYS:
+            env = dict(self.GOOD)
+            env[key] = "abc%41def"
+            with self.assertRaises(dd.SecretsError) as caught:
+                dd.validate_secrets(env)
+            message = str(caught.exception)
+            self.assertIn(key, message)
+            self.assertIn("%", message)
 
     def test_the_refusal_points_at_a_generator_that_cannot_produce_one(self):
         # `openssl rand -base64 32` is what this file's other messages
