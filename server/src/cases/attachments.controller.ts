@@ -41,7 +41,14 @@ export class AttachmentsController {
   @Get()
   async list(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
     await this.assertCaseVisible(req, id);
-    return this.db.system(async (_db, client) => {
+    // The caller's own context rather than system(). case_attachments is
+    // scoped by its parent case's zone, and assertCaseVisible has just proved
+    // this caller may see that case, so the predicate that passed for the case
+    // passes for its attachments. Running under it puts row-level security
+    // behind the application check instead of beside it -- a bug in
+    // assertCaseVisible then stops being the only thing between a user and
+    // another zone's identity documents.
+    return this.db.withContext(req.zoneCtx, async (_db, client) => {
       const res = await client.query(
         `SELECT a.id, a.filename, a.mime_type, a.size_bytes, a.source, a.note,
                 a.created_at, a.in_reply_to, u.name AS uploaded_by_name
@@ -64,7 +71,8 @@ export class AttachmentsController {
   ) {
     const row = await this.assertCaseVisible(req, id);
 
-    const file = await this.db.system(async (_db, client) => {
+    // Caller's context: same reasoning as list() above.
+    const file = await this.db.withContext(req.zoneCtx, async (_db, client) => {
       const r = await client.query(
         `SELECT filename, mime_type, storage_key, size_bytes
            FROM case_attachments WHERE id = $1 AND case_id = $2`,
@@ -123,7 +131,13 @@ export class AttachmentsController {
       buffer: file.buffer,
     });
 
-    const saved = await this.db.system(async (_db, client) => {
+    // Caller's context for the write, too. This transaction touches
+    // case_attachments, cases and case_status_history; all three carry the
+    // same WITH CHECK role array -- system, super_admin, admin, zone_manager,
+    // approver -- and the route is gated by @Requires('cases.work'), whose
+    // four roles are all in it. So the caller is permitted, and the database
+    // now enforces that rather than taking the controller's word for it.
+    const saved = await this.db.withContext(req.zoneCtx, async (_db, client) => {
       const r = await client.query(
         `INSERT INTO case_attachments
            (case_id, zone_id, case_ref, filename, mime_type, size_bytes, storage_key,

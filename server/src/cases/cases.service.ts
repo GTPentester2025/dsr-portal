@@ -298,7 +298,10 @@ export class CasesService {
       );
       return r.rows[0] ?? {};
     });
-    const files = await this.db.system(async (_db, client) => {
+    // The caller's context, matching the `extra` read directly above: this
+    // method already has one, and case_attachments is scoped by its parent
+    // case's zone, which detail() has already resolved under that same ctx.
+    const files = await this.db.withContext(ctx, async (_db, client) => {
       const r = await client.query(
         `SELECT filename, size_bytes, source, created_at
            FROM case_attachments WHERE case_id = $1 ORDER BY created_at`,
