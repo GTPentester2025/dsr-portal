@@ -29,7 +29,7 @@ export class ReportController {
 
   @Get()
   summary(@Req() req: AuthedRequest, @Query('zone') zone?: string) {
-    return this.reports.build(this.scope(req, zone));
+    return this.reports.build(req.zoneCtx, this.scope(req, zone));
   }
 
   @Get('export.csv')
@@ -38,7 +38,7 @@ export class ReportController {
     @Res({ passthrough: true }) res: Response,
     @Query('zone') zone?: string,
   ) {
-    const s = await this.reports.build(this.scope(req, zone));
+    const s = await this.reports.build(req.zoneCtx, this.scope(req, zone));
 
     // One flat metric-per-row sheet: it opens cleanly and pivots easily, which
     // a nested layout would not.
@@ -81,7 +81,7 @@ export class ReportController {
     @Res({ passthrough: true }) res: Response,
     @Query('zone') zone?: string,
   ) {
-    const stats = await this.reports.build(this.scope(req, zone));
+    const stats = await this.reports.build(req.zoneCtx, this.scope(req, zone));
     const file = await this.pdf.render(stats);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(

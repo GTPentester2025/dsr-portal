@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
-import { DbService } from '../db/db.module';
+import { DbService, type ZoneContext } from '../db/db.module';
 import { SettingsService } from '../settings/settings.service';
 import { EMAIL_PROVIDER, type EmailProvider } from '../email/email-provider.interface';
 import { buildInsights, type Insight } from './insights';
@@ -51,6 +51,14 @@ export interface ReportStats {
  * the figure on screen can never disagree, which is the usual way reporting
  * loses trust.
  */
+/**
+ * The nightly report runs for no one: there is no session, no acting user and
+ * no zone to inherit. Naming that here means the privilege is visible at the
+ * one call site that needs it, rather than build() granting it to everybody
+ * because a scheduler exists.
+ */
+const REPORT_SCHEDULER_CTX: ZoneContext = { role: 'system', zone: '*' };
+
 @Injectable()
 export class ReportService {
   private readonly log = new Logger(ReportService.name);
@@ -62,11 +70,16 @@ export class ReportService {
     private readonly pdf: ReportPdfService,
   ) {}
 
-  async build(zone?: string): Promise<ReportStats> {
+  async build(ctx: ZoneContext, zone?: string): Promise<ReportStats> {
     const zoneFilter = zone ? 'AND c.zone_id = $1' : '';
     const params = zone ? [zone] : [];
 
-    return this.db.system(async (_db, client) => {
+    // The caller's own context rather than system(). Every `cases` query below
+    // already carries ${zoneFilter}, and a zone manager is pinned to their own
+    // zone by ReportController.scope() before it gets here -- so row-level
+    // security enforces what the SQL already filters, instead of being switched
+    // off for every caller because one of them is a scheduler.
+    return this.db.withContext(ctx, async (_db, client) => {
       const today = await client.query(
         `SELECT
            count(*) FILTER (WHERE c.created_at::date = now()::date)::int AS received,
@@ -343,7 +356,10 @@ ${
     for (const person of people) {
       const zone = person.role === 'zone_manager' ? person.zone_id ?? undefined : undefined;
       const key = zone ?? '*';
-      if (!cache.has(key)) cache.set(key, await this.build(zone));
+      // The daily report has no acting user, so it asks for system privilege
+      // here, in the one place that needs it, rather than build() assuming it
+      // on behalf of every caller.
+      if (!cache.has(key)) cache.set(key, await this.build(REPORT_SCHEDULER_CTX, zone));
       const stats = cache.get(key)!;
       // Rendered once per zone, not once per recipient.
       if (!pdfs.has(key)) {
