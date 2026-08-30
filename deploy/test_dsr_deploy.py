@@ -932,7 +932,10 @@ class TestPlans(unittest.TestCase):
         # shell_quote protects the shell layer. Nothing protected the SQL
         # layer: an apostrophe closed the string literal, psql failed, and
         # psql echoes the offending statement in its `LINE n:` context --
-        # which step_failure_message prints verbatim, password and all.
+        # which step_failure_message printed verbatim, password and all.
+        # run_steps now scrubs that sink, so this is the first of two
+        # defences rather than the only one: $$ inside a password ends the
+        # dollar-quoted block early and gets to the same echo.
         step = [s for s in dd.provision_steps() if "role" in s.name][0]
         doubling = "//\\'/\\'\\'}"
         self.assertIn("DB_PASS_SQL=${DB_PASS_SQL" + doubling, step.command)
@@ -1547,6 +1550,115 @@ class TestRunSteps(unittest.TestCase):
         self.assertIn("second", str(caught.exception))
         self.assertIn("permission denied", str(caught.exception))
 
+    def test_a_step_that_echoes_the_password_does_not_reach_the_refusal(self):
+        # The role step sends psql a `DO $$ ... $$` block with the expanded
+        # password inside it. On a *parse* error psql echoes the offending
+        # line back as `LINE n:`, run_steps passes that stderr straight
+        # through, and step_failure_message prints it verbatim. Doubling the
+        # apostrophes closed one trigger; a `$$` pair in the password ends
+        # the dollar-quoted block early and reopens it. The sink is what has
+        # to be closed, so this asserts about the sink.
+        password = "7$$xK9pQzSecret"
+        echoed = (
+            "psql:<stdin>:3: ERROR:  syntax error at or near \"xK9pQzSecret\"\n"
+            "LINE 3:   CREATE ROLE dsr LOGIN PASSWORD '%s';\n" % password
+        )
+        ssh = FakeSsh(fail_on="b", stderr=echoed)
+        with self.assertRaises(dd.Refusal) as caught:
+            dd.run_steps(
+                ssh,
+                [dd.Step("create the roles", "b")],
+                io.StringIO(),
+                {"DB_PASS": password, "APP_PASS": "app-pass-value"},
+            )
+        message = str(caught.exception)
+        self.assertNotIn(password, message)
+        self.assertNotIn("xK9pQzSecret", message)
+        # Still a usable refusal: the step, the code and the diagnosis.
+        self.assertIn("create the roles", message)
+        self.assertIn("syntax error", message)
+
+    def test_a_step_that_prints_a_connection_string_is_redacted_too(self):
+        # scrub only knows the values it was handed. redact_url catches a
+        # password that was never staged locally -- one already in a .env on
+        # the box -- so both filters run, not one.
+        ssh = FakeSsh(
+            fail_on="b",
+            stderr="could not connect to postgres://dsr:onTheBox9@127.0.0.1:5432/dsr",
+        )
+        with self.assertRaises(dd.Refusal) as caught:
+            dd.run_steps(ssh, [dd.Step("migrate", "b")], io.StringIO(), {})
+        self.assertNotIn("onTheBox9", str(caught.exception))
+
+    def test_a_failure_with_no_secrets_staged_still_refuses_readably(self):
+        ssh = FakeSsh(fail_on="b", stderr="pg_hba.conf: permission denied")
+        with self.assertRaises(dd.Refusal) as caught:
+            dd.run_steps(ssh, [dd.Step("second", "b")], io.StringIO(), None)
+        self.assertIn("permission denied", str(caught.exception))
+
+
+class TestScrub(unittest.TestCase):
+    """The exact-value filter the mutating half needs and did not have."""
+
+    def test_it_blanks_a_staged_value_wherever_it_appears(self):
+        out = dd.scrub("LINE 3: PASSWORD 'sw0rdfish'; -- sw0rdfish", ["sw0rdfish"])
+        self.assertNotIn("sw0rdfish", out)
+        self.assertEqual(out, "LINE 3: PASSWORD '***'; -- ***")
+
+    def test_a_password_containing_another_is_not_half_replaced(self):
+        # Shortest-first would turn "abcdefghij" into "***ghij" and leave a
+        # recognisable remainder, so the values are applied longest first.
+        out = dd.scrub("saw abcdefghij here", ["abcdef", "abcdefghij"])
+        self.assertEqual(out, "saw *** here")
+        self.assertNotIn("ghij", out)
+
+    def test_short_and_empty_values_are_skipped(self):
+        # "" would insert *** between every character; "dsr" would star out
+        # half the log and diagnose nothing.
+        self.assertEqual(dd.scrub("dsr-api on 127.0.0.1", ["", None, "dsr", "on"]),
+                         "dsr-api on 127.0.0.1")
+
+    def test_a_large_fragment_of_a_secret_goes_too(self):
+        # psql does not echo whole values. `syntax error at or near "..."`
+        # quotes one token, and when a `$$` in the password ended the
+        # dollar-quoted block early that token is the tail of the password.
+        out = dd.scrub('at or near "xK9pQzSecret"', ["7$$xK9pQzSecret"])
+        self.assertNotIn("xK9pQzSecret", out)
+        self.assertEqual(out, 'at or near "***"')
+
+    def test_a_seven_character_secret_is_still_replaced_whole(self):
+        # Nothing shorter than eight characters has a fragment, so a value
+        # of six or seven is only ever caught as itself. The fragment loop
+        # must not be the only thing putting the whole value on the list.
+        self.assertEqual(dd.scrub("PASSWORD 'abc1234'", ["abc1234"]),
+                         "PASSWORD '***'")
+        self.assertEqual(dd.scrub("PASSWORD 'abc123'", ["abc123"]),
+                         "PASSWORD '***'")
+
+    def test_a_small_fragment_is_left_alone(self):
+        # Under eight characters, or under half the secret, a run is a
+        # coincidence. A redactor that blanks coincidences stops being
+        # readable, and an unreadable log is one nobody checks.
+        out = dd.scrub("listening on port 5432, user dsr", ["5432abcdefghijkl"])
+        self.assertEqual(out, "listening on port 5432, user dsr")
+        out = dd.scrub("the aardvark ran", ["aardvarkXYZ123456789"])
+        self.assertEqual(out, "the aardvark ran")
+        # And with the eight-character floor binding rather than the half
+        # rule: `fish` is four of the nine characters of `sw0rdfish`, which
+        # is over half and still far too little to blank a word on.
+        self.assertEqual(
+            dd.scrub("a fish in the log", ["sw0rdfish"]), "a fish in the log"
+        )
+
+    def test_text_that_holds_no_secret_is_unchanged(self):
+        self.assertEqual(
+            dd.scrub("Failed to start dsr-api.service", ["sw0rdfish"]),
+            "Failed to start dsr-api.service",
+        )
+
+    def test_none_text_becomes_empty_rather_than_raising(self):
+        self.assertEqual(dd.scrub(None, ["sw0rdfish"]), "")
+
     def test_a_silent_failure_falls_back_to_stdout(self):
         message = dd.step_failure_message("nginx -t", 1, "", "nginx: configuration file failed")
         self.assertIn("nginx -t", message)
@@ -1731,6 +1843,76 @@ class TestCmdProvision(CommandTestCase):
         # The whole reason the removal is in a `finally`: a 0600 file with
         # both role passwords must not outlive a failed run.
         self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+
+    def test_a_failing_deploy_step_does_not_quote_the_staged_password(self):
+        secrets = dict(self.SECRETS)
+        secrets["DB_PASS"] = "7xK9pQzSecretValue"
+        failing = dd.deploy_steps(secrets)[3].command
+        ssh = self.ssh(
+            responses={
+                failing: (
+                    1,
+                    "",
+                    "LINE 3:   ALTER ROLE dsr PASSWORD '7xK9pQzSecretValue';",
+                )
+            }
+        )
+        with self.assertRaises(dd.Refusal) as caught:
+            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh, secrets=secrets)
+        self.assertNotIn("7xK9pQzSecretValue", str(caught.exception))
+
+    def test_a_failing_provision_step_does_not_quote_the_staged_password(self):
+        # The role step is the one that sends psql the expanded password.
+        secrets = dict(self.SECRETS)
+        secrets["APP_PASS"] = "appQzSecretValue42"
+        failing = [s for s in dd.provision_steps() if "role" in s.name][0].command
+        ssh = self.ssh(
+            responses={
+                failing: (
+                    1,
+                    "",
+                    "LINE 3:   CREATE ROLE dsr_app LOGIN PASSWORD "
+                    "'appQzSecretValue42';",
+                )
+            }
+        )
+        with self.assertRaises(dd.Refusal) as caught:
+            self.run_command(dd.cmd_provision, ["provision"], ssh=ssh, secrets=secrets)
+        self.assertNotIn("appQzSecretValue42", str(caught.exception))
+        self.assertIn("role", str(caught.exception))
+
+    def test_the_journal_dump_does_not_print_the_staged_passwords(self):
+        # This is the moment output gets pasted into a ticket, and it chains
+        # straight off the slash-in-the-password bug: a `/` in DB_PASS makes
+        # Node raise `ERR_INVALID_URL` with the whole URL in the message,
+        # the service crash-loops, the poll times out, and this runs.
+        secrets = dict(self.SECRETS)
+        secrets["DB_PASS"] = "7xK9pQzSecret"
+        secrets["APP_PASS"] = "appQzSecret42"
+        journal = (
+            "dsr-api[981]: TypeError [ERR_INVALID_URL]: Invalid URL: "
+            "postgres://dsr:7xK9pQzSecret@127.0.0.1:5432/dsr\n"
+            "dsr-api[981]:     at new NodeError (node:internal/errors:399:5)\n"
+            "dsr-api[981]: DATABASE_URL_APP=postgres://dsr_app:appQzSecret42@h/dsr\n"
+        )
+        ssh = self.ssh(
+            responses={
+                dd.health_command(): (1, "", ""),
+                dd.JOURNAL_TAIL_COMMAND: (0, journal, ""),
+            }
+        )
+        code, ssh = self.run_command(
+            dd.cmd_deploy, ["deploy"], ssh=ssh, secrets=secrets
+        )
+        self.assertEqual(code, 1)
+        printed = self.err.getvalue()
+        self.assertIn(dd.JOURNAL_TAIL_COMMAND, ssh.commands)
+        self.assertNotIn("7xK9pQzSecret", printed)
+        self.assertNotIn("appQzSecret42", printed)
+        self.assertNotIn(secrets["CRYPTO_MASTER_KEY"], printed)
+        # It is still a log: the operator needs the error, just not the key.
+        self.assertIn("ERR_INVALID_URL", printed)
+        self.assertIn("did not come up", printed)
 
     def test_a_transfer_that_dies_mid_push_still_removes_the_secrets_file(self):
         # push_text's remote `cat >` can create the file and then have the

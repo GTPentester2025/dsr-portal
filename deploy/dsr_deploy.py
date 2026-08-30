@@ -1613,6 +1613,54 @@ def redact_url(text: str) -> str:
     return re.sub(r"(://[^\s:/@]*):[^\s]*@", r"\1:***@", text or "")
 
 
+# The shortest run of a secret worth blanking out of a log on its own. Below
+# this a "fragment" is a coincidence, and blanking coincidences is how a
+# redactor stops being readable and starts being ignored.
+SCRUB_FRAGMENT = 8
+
+
+def scrub(text: str, values) -> str:
+    """Blank out any of `values` that appears anywhere in `text`.
+
+    redact_url is a filter over the *shape* of a connection string, so it
+    only catches a secret that arrives wearing one. The mutating half of
+    this tool stages the real passwords and then prints command output that
+    can carry them in any shape at all -- a psql `LINE n:` echo of a
+    dollar-quoted block, twenty-five lines of journal. When the exact secret
+    is in hand, the exact secret is what to look for.
+
+    Longest first, so a password that contains another value does not get
+    half-replaced and leave a recognisable remainder. Values shorter than
+    six characters are skipped: `dsr` or `on` would star out half the log
+    and tell the operator nothing, and a secret that short is a different
+    problem. Anything falsy is skipped too -- replacing "" would insert
+    `***` between every character in the text.
+
+    Large *fragments* go too, not only whole values, because the carrier
+    this exists for does not echo whole values. psql reports a parse error
+    as `syntax error at or near "xK9pQzSecret"`, and that token is the tail
+    of a password whose `$$` pair ended the dollar-quoted block early: the
+    `LINE n:` echo below it holds the whole password and is caught, while
+    the token above it is twelve of its fifteen characters and is not. A
+    fragment counts once it is at least eight characters *and* at least
+    half the secret. Both halves of that matter -- eight alone would blank
+    every occurrence of an ordinary word inside a weak password and shred
+    the log the operator is reading, and half alone would blank three
+    characters of a six-character value.
+    """
+    text = text or ""
+    needles = set()
+    for value in {str(v) for v in values or () if v and len(str(v)) >= 6}:
+        needles.add(value)
+        least = max(SCRUB_FRAGMENT, len(value) // 2)
+        for start in range(len(value)):
+            for end in range(start + least, len(value) + 1):
+                needles.add(value[start:end])
+    for needle in sorted(needles, key=len, reverse=True):
+        text = text.replace(needle, "***")
+    return text
+
+
 def describe_url(value: str) -> str:
     """`host:port/database` out of a connection string. Never the credentials.
 
@@ -3786,8 +3834,17 @@ def check_remote_budget(ssh, needs: dict, breakdown: str = "") -> None:
         raise Refusal(refusal)
 
 
-def run_steps(ssh, steps: list, out) -> None:
-    """Execute a plan, naming each step, stopping at the first failure."""
+def run_steps(ssh, steps: list, out, secrets: dict = None) -> None:
+    """Execute a plan, naming each step, stopping at the first failure.
+
+    `secrets` is the staged values, and it is not optional in practice. A
+    step's stderr goes into the refusal verbatim, and the steps that fail
+    are the ones handling passwords: the role step sends psql a `DO $$ ... $$`
+    block with the expanded password inside it, and on a *parse* error psql
+    echoes the offending line back as `LINE n:`. Doubling the apostrophes
+    closed one trigger; `$$` inside a password is another, and there will be
+    a third. The sink is the thing to close.
+    """
     total = len(steps)
     for index, step in enumerate(steps, 1):
         out.write("==> [%d/%d] %s\n" % (index, total, step.name))
@@ -3795,8 +3852,13 @@ def run_steps(ssh, steps: list, out) -> None:
         result = ssh.run(step.command, check=False)
         if result.returncode != 0:
             raise Refusal(
-                step_failure_message(
-                    step.name, result.returncode, result.stderr, result.stdout
+                scrub(
+                    redact_url(
+                        step_failure_message(
+                            step.name, result.returncode, result.stderr, result.stdout
+                        )
+                    ),
+                    (secrets or {}).values(),
                 )
             )
 
@@ -3855,7 +3917,7 @@ def cmd_provision(args, out=None) -> int:
             REMOTE_SECRETS,
             mode="600",
         )
-        run_steps(ssh, steps, out)
+        run_steps(ssh, steps, out, secrets)
     finally:
         ssh.run("rm -f %s" % REMOTE_SECRETS, check=False)
     out.write("PROVISION_OK\n")
@@ -3922,14 +3984,25 @@ def cmd_deploy(args, out=None) -> int:
             REMOTE_SECRETS,
             mode="600",
         )
-        run_steps(ssh, deploy_steps(secrets), out)
+        run_steps(ssh, deploy_steps(secrets), out, secrets)
         out.write("==> health\n")
         if not poll_health(ssh, out):
             sys.stderr.write(
                 "FATAL: the API did not come up within %ds. Last log lines:\n"
                 % (HEALTH_ATTEMPTS * HEALTH_INTERVAL_SECONDS)
             )
-            sys.stderr.write(ssh.run(JOURNAL_TAIL_COMMAND, check=False).stdout)
+            # Twenty-five raw journal lines, at the single most likely
+            # moment for an operator to paste this into a ticket. Node
+            # prints the whole DATABASE_URL in `ERR_INVALID_URL`, and a
+            # stack trace can carry a connection string anywhere in it --
+            # which is why evaluate_service refuses to quote journal lines
+            # at all. This half of the tool needs them, so it scrubs them.
+            sys.stderr.write(
+                scrub(
+                    redact_url(ssh.run(JOURNAL_TAIL_COMMAND, check=False).stdout),
+                    secrets.values(),
+                )
+            )
             return 1
     finally:
         ssh.run("rm -f %s" % REMOTE_SECRETS, check=False)
