@@ -39,6 +39,26 @@ export class HousekeepingService {
           `DELETE FROM verification_tokens WHERE expires_at < now() - interval '1 day'`,
         );
 
+        // Drafts hold a data subject's address in plain text before their
+        // request becomes a case, and nothing else ever deleted them -- an
+        // abandoned form used to sit here for the life of the box. Purged on
+        // the same one-day grace as the tokens above, because once a draft is
+        // past expires_at the requester cannot resume it.
+        //
+        // Ordered after that delete and guarded by NOT EXISTS because
+        // verification_tokens.draft_id references this table ON DELETE NO
+        // ACTION: a draft whose token has not yet aged out would fail the
+        // constraint and take the whole transaction with it. The guard makes
+        // it self-healing instead -- such a draft is skipped now and removed
+        // on the next run, once its token has gone.
+        const drafts = await client.query(
+          `DELETE FROM form_drafts d
+            WHERE d.expires_at < now() - interval '1 day'
+              AND NOT EXISTS (
+                SELECT 1 FROM verification_tokens t WHERE t.draft_id = d.id
+              )`,
+        );
+
         // Rate-limit windows older than a day cannot influence a decision.
         const counters = await client.query(
           `DELETE FROM rate_counters WHERE window_start < now() - interval '1 day'`,
@@ -47,13 +67,15 @@ export class HousekeepingService {
         return {
           sessions: sessions.rowCount ?? 0,
           tokens: tokens.rowCount ?? 0,
+          drafts: drafts.rowCount ?? 0,
           counters: counters.rowCount ?? 0,
         };
       });
 
-      if (counts.sessions || counts.tokens || counts.counters) {
+      if (counts.sessions || counts.tokens || counts.drafts || counts.counters) {
         this.log.log(
-          `housekeeping: removed ${counts.sessions} sessions, ${counts.tokens} tokens, ${counts.counters} rate counters`,
+          `housekeeping: removed ${counts.sessions} sessions, ${counts.tokens} tokens, ` +
+            `${counts.drafts} drafts, ${counts.counters} rate counters`,
         );
       }
     } catch (err) {
