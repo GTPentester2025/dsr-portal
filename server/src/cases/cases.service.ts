@@ -250,15 +250,23 @@ export class CasesService {
         .where(eq(emailLog.caseId, id))
         .orderBy(desc(emailLog.createdAt));
 
-      // Who a reply should copy in by default. Read through the system role
-      // because RLS scopes `users` to the caller's own zone context.
-      const approverRows = await this.db.system(async (_sdb, sclient) =>
-        sclient.query(
-          `SELECT email FROM users
-            WHERE active AND role = 'approver' AND zone_id = $1
-            ORDER BY name`,
-          [row.zoneId],
-        ),
+      // Who a reply should copy in by default, on the connection this method
+      // is already holding.
+      //
+      // This used to open a second one under system(), on the reasoning that
+      // RLS scopes `users` to the caller's zone. That is true and beside the
+      // point: the zone asked about is row.zoneId, and the caller only reached
+      // this line because cases_zone_isolation let them read that row -- so
+      // app_zone_allows(row.zoneId) is already true for them, and
+      // users_zone_role returns the same approvers either way.
+      //
+      // Dropping it also stops the hottest read path in the service checking
+      // out two pooled connections at once to answer one case view.
+      const approverRows = await client.query(
+        `SELECT email FROM users
+          WHERE active AND role = 'approver' AND zone_id = $1
+          ORDER BY name`,
+        [row.zoneId],
       );
 
       return {
