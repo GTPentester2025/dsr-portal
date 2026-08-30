@@ -2913,6 +2913,331 @@ def evaluate_web(nginx_t: str, listeners: str) -> list:
     return findings
 
 
+# ---------------------------------------------------------------------------
+# database: how big it is, and which table is making it so
+# ---------------------------------------------------------------------------
+
+# Beside the uploads tree this is the other thing on the box that only grows,
+# and it is the one whose filesystem filling corrupts rather than merely
+# annoys: Postgres does not degrade gracefully out of disk space.
+#
+# stdlib Python has no Postgres driver, so both of these are psql -tA output.
+# -tA already separates columns with a pipe, so the query asks for two columns
+# rather than concatenating them.
+DB_SIZE_COMMAND = (
+    "sudo -u postgres psql -tAc \"SELECT pg_database_size('dsr')\" 2>&1"
+)
+
+TABLE_SIZES_COMMAND = (
+    "sudo -u postgres psql -d dsr -tAc \"SELECT c.relname, "
+    "pg_total_relation_size(c.oid) FROM pg_class c JOIN pg_namespace n ON "
+    "n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' "
+    "ORDER BY 2 DESC LIMIT 5\" 2>&1"
+)
+
+# On a ~10 GB box, worth saying out loud.
+DB_SIZE_WARN_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def parse_table_sizes(text: str) -> list:
+    """`relname|bytes` rows from psql -tA into [(name, bytes), ...].
+
+    psql prints its errors on the same stream once stderr is folded in, and
+    an error line is not two pipe-separated fields ending in a number.
+    """
+    rows = []
+    for line in (text or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 2 or not parts[1].strip().isdigit():
+            continue
+        name = parts[0].strip()
+        if name:
+            rows.append((name, int(parts[1].strip())))
+    return rows
+
+
+def evaluate_database_size(db_size: str, table_sizes: str) -> list:
+    """Report the database size and its largest tables.
+
+    A failure here is a WARN rather than a FAIL: when the database is
+    unreachable the roles check above has already failed, and a second FAIL
+    for the same cause is noise an operator has to read past.
+    """
+    group = "database"
+    findings = []
+
+    # The first all-digit line, not the first line: psql's own warnings
+    # arrive on the same stream once stderr is folded in, and one of them
+    # ahead of a perfectly good answer should not lose it. An error prints
+    # no digits at all, which is what the empty case below means.
+    digits = [
+        line.strip()
+        for line in (db_size or "").splitlines()
+        if line.strip().isdigit()
+    ]
+    if not digits:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not measure the database",
+                "Size and growth are how a full Postgres filesystem is seen "
+                "coming rather than found afterwards.",
+                "systemctl status postgresql",
+            )
+        )
+    else:
+        size = int(digits[0])
+        big = size >= DB_SIZE_WARN_BYTES
+        findings.append(
+            Finding(
+                group,
+                WARN if big else OK,
+                "the dsr database is %s" % human_bytes(size),
+                "Beside the uploads tree this is the other thing here that "
+                "only grows, and Postgres does not fail gracefully when its "
+                "filesystem fills.",
+                "python3 deploy/dsr_deploy.py doctor --disk" if big else "",
+            )
+        )
+
+    rows = parse_table_sizes(table_sizes)
+    if not rows:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the largest tables",
+                "Without them, growth has a number but no cause.",
+                "systemctl status postgresql",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                group,
+                OK,
+                "largest tables: %s"
+                % ", ".join("%s %s" % (name, human_bytes(size)) for name, size in rows),
+                "Total relation size: the table, its indexes and its TOAST.",
+                "",
+            )
+        )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# web: the API as nginx sees it
+# ---------------------------------------------------------------------------
+
+# Two probes, and the pair is the point. Separately they are two facts; read
+# together they are a diagnosis.
+#
+# The proxied probe is /public/ and not /, deliberately. `location /` serves
+# the built public form off the disk, so http://127.0.0.1/ answers 200 with
+# the API stopped -- it would pass straight through the fault it exists to
+# catch. /public/ is proxied to 127.0.0.1:3000, so any HTTP status at all
+# proves nginx reached the upstream, and 502 proves it did not.
+#
+# / is still probed, because a 403 there is the mislabelled web root and a
+# 404 there is a bundle that never landed.
+CURL_HEAD = (
+    "curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' "
+)
+API_DIRECT_COMMAND = CURL_HEAD + "http://127.0.0.1:%d/ 2>&1" % APP_PORT
+API_PROXY_PATH = "/public/"
+API_PROXY_COMMAND = CURL_HEAD + "http://127.0.0.1%s 2>&1" % API_PROXY_PATH
+WEB_ROOT_COMMAND = CURL_HEAD + "http://127.0.0.1/ 2>&1"
+
+# What nginx answers when it could not reach the thing it proxies to.
+_UPSTREAM_FAILURE_CODES = (502, 503, 504)
+
+_HTTP_CODE = re.compile(r"(\d{3})\s*$")
+
+
+def parse_http_code(text: str):
+    """The status curl printed, or None when curl never got that far.
+
+    `-w '%{http_code}'` writes 000 when the connection failed, and with
+    stderr folded in curl's own complaint arrives first. The code is the
+    last thing on the stream either way.
+    """
+    found = _HTTP_CODE.search((text or "").strip())
+    return int(found.group(1)) if found else None
+
+
+def evaluate_proxy(api_direct: str, api_proxy: str, web_root: str) -> list:
+    """The API directly, the API through nginx, and the form nginx serves.
+
+    The differential lives here: an API that answers on 3000 and 502s on 80
+    is not a broken API. It is an nginx that is not allowed to open a socket
+    to it, which is what httpd_can_network_connect being off looks like from
+    outside -- and the nginx error log names neither SELinux nor the boolean.
+    """
+    group = "web"
+    findings = []
+
+    direct = parse_http_code(api_direct)
+    proxy = parse_http_code(api_proxy)
+    root = parse_http_code(web_root)
+
+    if direct is None and proxy is None:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not probe the portal from the box itself",
+                "curl printed no status, so neither the API nor the proxy in "
+                "front of it was actually tested.",
+                "dnf install -y curl",
+            )
+        )
+        return findings
+
+    answered_direct = bool(direct) and direct != 0
+    proxy_reached_upstream = (
+        proxy is not None and proxy != 0 and proxy not in _UPSTREAM_FAILURE_CODES
+    )
+
+    if direct is None or proxy is None:
+        # One probe that printed no status at all is not evidence about the
+        # other. An unreadable answer is neither a pass nor a fault to name,
+        # and naming the SELinux boolean off the back of one would be a
+        # diagnosis built on nothing.
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not probe the API %s"
+                % ("directly" if direct is None else "through nginx"),
+                "curl printed no status for that probe, so the pair that "
+                "tells a blocked proxy apart from a dead API is incomplete.",
+                (API_DIRECT_COMMAND if direct is None else API_PROXY_COMMAND).split(
+                    " 2>"
+                )[0],
+            )
+        )
+    elif answered_direct and proxy_reached_upstream:
+        findings.append(
+            Finding(
+                group,
+                OK,
+                "the API answers through nginx (%d on %s, %d direct)"
+                % (proxy, API_PROXY_PATH, direct),
+                "",
+                "",
+            )
+        )
+    elif answered_direct:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "the API answers directly but not through nginx",
+                "127.0.0.1:%d answered %d and http://127.0.0.1%s answered %s. "
+                "The API is healthy; nginx cannot open a socket to it. From "
+                "outside this is a 502 on every request with one line in the "
+                "error log -- Permission denied while connecting to upstream "
+                "-- which names neither SELinux nor the setting responsible. "
+                "That is exactly what %s being off looks like: check the "
+                "selinux group of this report."
+                % (
+                    APP_PORT,
+                    direct,
+                    API_PROXY_PATH,
+                    "nothing" if proxy in (None, 0) else str(proxy),
+                    SELINUX_BOOLEAN,
+                ),
+                "getsebool %s -- and if it is off: %s"
+                % (SELINUX_BOOLEAN, SELINUX_FIX),
+            )
+        )
+    elif proxy_reached_upstream:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "nginx answers for the API but the API does not answer directly",
+                "http://127.0.0.1%s answered %d while 127.0.0.1:%d answered "
+                "%s. nginx is serving something other than the API for that "
+                "path."
+                % (
+                    API_PROXY_PATH,
+                    proxy,
+                    APP_PORT,
+                    "nothing" if direct in (None, 0) else str(direct),
+                ),
+                "nginx -T | grep -A3 'location /public/'",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "the API answers neither directly nor through nginx",
+                "Both probes failed, so this is the service and not the proxy "
+                "in front of it. The service group above says which.",
+                "systemctl status %s" % SERVICE,
+            )
+        )
+
+    if root is None or root == 0:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not reach the public form on port 80",
+                "nginx answered nothing at all on the loopback address.",
+                "systemctl status nginx",
+            )
+        )
+    elif root == 403:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "nginx answers 403 for the public form",
+                "nginx is running and refusing to read %s. The usual cause is "
+                "the SELinux file context: a directory moved into place keeps "
+                "the label it came from, and nginx is denied every file under "
+                "it. The selinux group of this report says which label it has."
+                % WEB_ROOT,
+                "restorecon -Rv %s" % WEB_ROOT,
+            )
+        )
+    elif root == 404:
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "nginx answers 404 for the public form",
+                "nginx is serving %s and there is no index.html in it, so the "
+                "public bundle was never deployed." % WEB_ROOT,
+                "python3 deploy/dsr_deploy.py deploy",
+            )
+        )
+    elif root >= 500:
+        findings.append(
+            Finding(
+                group,
+                FAIL,
+                "nginx answers %d for the public form" % root,
+                "The public intake form is the page a data subject lands on.",
+                "systemctl status nginx",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                group, OK, "the public form answers %d on port 80" % root, "", ""
+            )
+        )
+
+    return findings
+
+
 def _version_number(text: str) -> str:
     """The dotted number out of `v22.11.0` or `psql (PostgreSQL) 16.2`."""
     found = re.search(r"(\d+(?:\.\d+)*)", text or "")
@@ -3176,6 +3501,8 @@ DOCTOR_COMMANDS = (
         "schema_migrations ORDER BY name' 2>&1",
     ),
     ("migration_files", "ls %s/server/drizzle 2>/dev/null" % INSTALL_PREFIX),
+    ("db_size", DB_SIZE_COMMAND),
+    ("table_sizes", TABLE_SIZES_COMMAND),
     (
         "cert",
         "DSR_CERT=$(ls /etc/letsencrypt/live/*/fullchain.pem 2>/dev/null | head -1); "
@@ -3186,6 +3513,9 @@ DOCTOR_COMMANDS = (
     ("webroot_context", "ls -Zd %s 2>&1" % WEB_ROOT),
     ("nginx_t", "nginx -t 2>&1"),
     ("listeners", "ss -lntp 2>&1"),
+    ("api_direct", API_DIRECT_COMMAND),
+    ("api_proxy", API_PROXY_COMMAND),
+    ("web_root", WEB_ROOT_COMMAND),
 )
 
 # Read out of band rather than through collect(), because its result feeds
@@ -3299,8 +3629,12 @@ def assemble_findings(capture: dict, samples: dict, now_epoch: int) -> list:
         get("migrations"),
         [line.strip() for line in get("migration_files").splitlines() if line.strip()],
     )
+    findings += evaluate_database_size(get("db_size"), get("table_sizes"))
     findings += evaluate_tls(get("cert"), now_epoch)
     findings += evaluate_web(get("nginx_t"), get("listeners"))
+    findings += evaluate_proxy(
+        get("api_direct"), get("api_proxy"), get("web_root")
+    )
     return findings
 
 

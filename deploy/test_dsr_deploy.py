@@ -2922,6 +2922,214 @@ OS_RELEASE_EL9 = (
 )
 
 
+# Hand-written examples again, not captures.
+DB_SIZE = "432013312\n"
+DB_SIZE_HUGE = "3221225472\n"
+DB_SIZE_ERROR = (
+    "psql: error: connection to server on socket \"/var/run/postgresql/.s.PGSQL.5432\" "
+    "failed: No such file or directory\n"
+)
+
+TABLE_SIZES = (
+    "attachments|213909504\n"
+    "cases|142606336\n"
+    "audit_events|41943040\n"
+    "form_submissions|20971520\n"
+    "schema_migrations|32768\n"
+)
+
+TABLE_SIZES_ERROR = "psql: error: FATAL:  database \"dsr\" does not exist\n"
+
+# A warning on stderr, folded in ahead of a perfectly good answer.
+DB_SIZE_AFTER_NOTICE = (
+    "psql: warning: extra command-line argument \"x\" ignored\n432013312\n"
+)
+
+HTTP_200 = "200"
+HTTP_404 = "404"
+HTTP_403 = "403"
+HTTP_502 = "502"
+# curl's own complaint reaches the same stream, and the status is still last.
+HTTP_REFUSED = (
+    "curl: (7) Failed to connect to 127.0.0.1 port 3000 after 0 ms: "
+    "Couldn't connect to server\n000"
+)
+HTTP_NO_CURL = "bash: curl: command not found\n"
+
+
+class TestDatabaseSize(unittest.TestCase):
+    def test_the_size_and_the_largest_tables_are_reported(self):
+        findings = dd.evaluate_database_size(DB_SIZE, TABLE_SIZES)
+        self.assertEqual(dd.exit_code_for(findings), 0)
+        blob = _blob(findings)
+        self.assertIn("the dsr database is 412.0 MiB", blob)
+        self.assertIn("attachments 204.0 MiB", blob)
+        self.assertIn("cases 136.0 MiB", blob)
+
+    def test_the_tables_are_listed_largest_first_and_capped_by_the_query(self):
+        listing = [f.title for f in dd.evaluate_database_size(DB_SIZE, TABLE_SIZES)
+                   if f.title.startswith("largest tables")][0]
+        self.assertLess(listing.index("attachments"), listing.index("cases"))
+        self.assertEqual(listing.count(" MiB") + listing.count(" KiB"), 5)
+
+    def test_a_large_database_warns_and_says_where_to_look(self):
+        findings = dd.evaluate_database_size(DB_SIZE_HUGE, TABLE_SIZES)
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        warned = [f for f in findings if f.severity == dd.WARN]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("3.0 GiB", warned[0].title)
+        self.assertIn("doctor --disk", warned[0].fix)
+
+    def test_an_unreachable_database_warns_rather_than_failing_twice(self):
+        # evaluate_database has already FAILed on the same cause; a second
+        # failure for one fault is noise an operator reads past.
+        findings = dd.evaluate_database_size(DB_SIZE_ERROR, TABLE_SIZES_ERROR)
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        self.assertIn("could not measure the database", _blob(findings))
+        self.assertIn("could not read the largest tables", _blob(findings))
+
+    def test_a_warning_ahead_of_the_answer_does_not_lose_the_answer(self):
+        findings = dd.evaluate_database_size(DB_SIZE_AFTER_NOTICE, TABLE_SIZES)
+        self.assertEqual(dd.exit_code_for(findings), 0)
+        self.assertIn("the dsr database is 412.0 MiB", _blob(findings))
+
+    def test_an_empty_answer_is_not_reported_as_a_zero_byte_database(self):
+        findings = dd.evaluate_database_size("", "")
+        self.assertIn("could not measure the database", _blob(findings))
+        self.assertNotIn("0 B", _blob(findings))
+
+    def test_nothing_here_offers_to_shrink_the_database(self):
+        for capture in ((DB_SIZE, TABLE_SIZES), (DB_SIZE_HUGE, TABLE_SIZES),
+                        (DB_SIZE_ERROR, TABLE_SIZES_ERROR)):
+            blob = _blob(dd.evaluate_database_size(*capture))
+            for forbidden in ("DROP", "TRUNCATE", "DELETE", "dropdb", "vacuumdb"):
+                self.assertNotIn(forbidden, blob)
+
+    def test_parse_table_sizes_ignores_anything_that_is_not_a_row(self):
+        self.assertEqual(
+            dd.parse_table_sizes(TABLE_SIZES_ERROR + "cases|10\n"), [("cases", 10)]
+        )
+        self.assertEqual(dd.parse_table_sizes(""), [])
+
+    def test_parse_table_sizes_needs_a_name_and_a_number(self):
+        # psql folds its notices onto the same stream, and some of them do
+        # contain a pipe. A row is two fields, named, counted in bytes.
+        self.assertEqual(
+            dd.parse_table_sizes(
+                "cases|not-a-number\n|4096\n  |  \ncases|10\n"
+            ),
+            [("cases", 10)],
+        )
+
+
+class TestProxyEvaluator(unittest.TestCase):
+    def test_a_healthy_pair_is_clean(self):
+        findings = dd.evaluate_proxy(HTTP_200, HTTP_404, HTTP_200)
+        self.assertEqual(dd.exit_code_for(findings), 0)
+        self.assertIn("the API answers through nginx", _blob(findings))
+
+    def test_a_proxied_404_still_proves_nginx_reached_the_api(self):
+        # Any status from the app is proof the socket opened. Only nginx's
+        # own 502/503/504 mean it could not.
+        findings = dd.evaluate_proxy(HTTP_200, HTTP_404, HTTP_200)
+        self.assertEqual([f.severity for f in findings], [dd.OK, dd.OK])
+
+    def test_up_on_3000_and_502_on_80_names_the_selinux_boolean(self):
+        # This is the whole reason the pair exists: two observations that
+        # separately say nothing, and together say exactly one thing.
+        findings = dd.evaluate_proxy(HTTP_200, HTTP_502, HTTP_200)
+        self.assertEqual(dd.exit_code_for(findings), 2)
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertEqual(len(bad), 1)
+        self.assertIn("directly but not through nginx", bad[0].title)
+        self.assertIn("httpd_can_network_connect", bad[0].detail)
+        self.assertIn("selinux group", bad[0].detail)
+        self.assertIn("Permission denied while connecting to upstream", bad[0].detail)
+        self.assertIn("setsebool -P httpd_can_network_connect on", bad[0].fix)
+
+    def test_the_differential_fires_when_the_proxy_could_not_connect_at_all(self):
+        findings = dd.evaluate_proxy(HTTP_200, HTTP_REFUSED, HTTP_200)
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertEqual(len(bad), 1)
+        self.assertIn("directly but not through nginx", bad[0].title)
+
+    def test_a_dead_api_is_not_blamed_on_nginx(self):
+        findings = dd.evaluate_proxy(HTTP_REFUSED, HTTP_502, HTTP_200)
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertEqual(len(bad), 1)
+        self.assertIn("neither directly nor through nginx", bad[0].title)
+        self.assertNotIn("httpd_can_network_connect", bad[0].detail)
+        self.assertIn("systemctl status dsr-api", bad[0].fix)
+
+    def test_a_proxy_answering_while_the_api_does_not_is_a_warning(self):
+        findings = dd.evaluate_proxy(HTTP_REFUSED, HTTP_200, HTTP_200)
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        self.assertIn("nginx answers for the API", _blob(findings))
+
+    def test_one_unreadable_probe_does_not_produce_a_diagnosis(self):
+        # The differential needs both halves. Naming the SELinux boolean
+        # because one probe printed nothing is a conclusion from no evidence.
+        findings = dd.evaluate_proxy(HTTP_200, HTTP_NO_CURL, HTTP_200)
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        self.assertIn("could not probe the API through nginx", _blob(findings))
+        self.assertNotIn("httpd_can_network_connect", _blob(findings))
+        warned = [f for f in findings if f.severity == dd.WARN]
+        self.assertIn("http://127.0.0.1/public/", warned[0].fix)
+
+    def test_an_unreachable_form_is_not_reported_as_an_answer(self):
+        findings = dd.evaluate_proxy(HTTP_200, HTTP_404, HTTP_REFUSED)
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        self.assertIn("could not reach the public form", _blob(findings))
+        self.assertNotIn("the public form answers", _blob(findings))
+
+    def test_no_curl_warns_rather_than_declaring_the_portal_down(self):
+        findings = dd.evaluate_proxy(HTTP_NO_CURL, HTTP_NO_CURL, HTTP_NO_CURL)
+        self.assertEqual(dd.exit_code_for(findings), 1)
+        self.assertIn("could not probe the portal", _blob(findings))
+        self.assertNotIn("answers neither", _blob(findings))
+
+    def test_a_403_on_the_form_points_at_the_web_root_label(self):
+        findings = dd.evaluate_proxy(HTTP_200, HTTP_404, HTTP_403)
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertEqual(len(bad), 1)
+        self.assertIn("403", bad[0].title)
+        self.assertIn("restorecon -Rv /var/www/dsr", bad[0].fix)
+
+    def test_a_404_on_the_form_is_a_bundle_that_never_landed(self):
+        findings = dd.evaluate_proxy(HTTP_200, HTTP_404, HTTP_404)
+        warned = [f for f in findings if f.severity == dd.WARN]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("404", warned[0].title)
+        self.assertIn("never deployed", warned[0].detail)
+
+    def test_nothing_in_this_group_ever_offers_to_disable_selinux(self):
+        for capture in (
+            (HTTP_200, HTTP_404, HTTP_200),
+            (HTTP_200, HTTP_502, HTTP_403),
+            (HTTP_REFUSED, HTTP_502, HTTP_REFUSED),
+            (HTTP_NO_CURL, HTTP_NO_CURL, HTTP_NO_CURL),
+        ):
+            blob = _blob(dd.evaluate_proxy(*capture))
+            for forbidden in FORBIDDEN_SELINUX_ADVICE:
+                self.assertNotIn(forbidden, blob)
+
+    def test_the_proxied_probe_is_not_the_static_root(self):
+        # http://127.0.0.1/ is served off the disk by `location /`, so it
+        # answers 200 with the API stopped -- a probe of / would pass
+        # straight through the fault this check exists to catch.
+        self.assertIn("/public/", dd.API_PROXY_COMMAND)
+        self.assertNotIn("/public/", dd.WEB_ROOT_COMMAND)
+        self.assertTrue(dd.API_PROXY_COMMAND.count("http://127.0.0.1/public/"))
+
+    def test_parse_http_code_reads_the_status_and_not_the_port(self):
+        self.assertEqual(dd.parse_http_code(HTTP_REFUSED), 0)
+        self.assertEqual(dd.parse_http_code("200"), 200)
+        self.assertEqual(dd.parse_http_code("502\n"), 502)
+        self.assertIsNone(dd.parse_http_code(HTTP_NO_CURL))
+        self.assertIsNone(dd.parse_http_code(""))
+
+
+
 class TestHostEvaluator(unittest.TestCase):
     def test_el9_with_the_right_runtimes_is_clean(self):
         findings = dd.evaluate_host(OS_RELEASE_EL9, "v22.11.0", "psql (PostgreSQL) 16.2")
@@ -3023,6 +3231,11 @@ HEALTHY_REPLIES = [
     ("ls -Zd", WEBROOT_CONTEXT_OK),
     ("nginx -t", NGINX_T_OK),
     ("ss -lntp", SS_HEALTHY),
+    ("127.0.0.1:3000/", HTTP_200),
+    ("127.0.0.1/public/", HTTP_404),
+    ("127.0.0.1/", HTTP_200),
+    ("pg_database_size", DB_SIZE),
+    ("pg_total_relation_size", TABLE_SIZES),
 ]
 
 BROKEN_REPLIES = [
@@ -3056,6 +3269,11 @@ class TestDoctorCommands(unittest.TestCase):
             "du -sb /root/.npm",
             "journalctl --disk-usage",
             "stat -c %s /opt/dsr/server/.env.bak",
+            "pg_database_size('dsr')",
+            "pg_total_relation_size",
+            "http://127.0.0.1:3000/",
+            "http://127.0.0.1/public/",
+            "http://127.0.0.1/ ",
         ):
             self.assertIn(expected, blob, "doctor never runs %s" % expected)
 
@@ -3109,6 +3327,19 @@ class TestDoctorCommands(unittest.TestCase):
             ):
                 self.assertNotIn(forbidden, command, "%s would change the box" % name)
 
+    def test_every_probe_that_opens_a_socket_carries_a_timeout(self):
+        # doctor is what an operator runs when the box is misbehaving, which
+        # is exactly when a socket hangs rather than refusing. A probe with
+        # no timeout turns a diagnosis into a second thing that is stuck.
+        seen = []
+        for name, command in dd.DOCTOR_COMMANDS:
+            if not command.startswith("curl "):
+                continue
+            seen.append(name)
+            self.assertIn("--max-time", command, name)
+            self.assertIn("--connect-timeout", command, name)
+        self.assertEqual(sorted(seen), ["api_direct", "api_proxy", "web_root"])
+
     def test_the_du_collectors_carry_only_measuring_flags(self):
         # The blanket sweep above catches flags somebody typed. This one
         # catches flags nobody thought of, by refusing everything that is
@@ -3153,6 +3384,9 @@ class TestDoctorAssembly(unittest.TestCase):
             "the systemd journal is 48.0 MiB",
             "the .env rollback copy is 742 B",
             "about 108.0 MiB can be reclaimed without touching data",
+            "the dsr database is 412.0 MiB",
+            "the API answers through nginx (404 on /public/, 200 direct)",
+            "the public form answers 200 on port 80",
         ):
             self.assertIn(expected, titles)
 
