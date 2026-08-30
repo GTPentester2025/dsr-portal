@@ -218,16 +218,37 @@ class TestCli(unittest.TestCase):
         self.assertFalse(dd.build_parser().parse_args(["deploy"]).dry_run)
         self.assertTrue(dd.build_parser().parse_args(["deploy", "--dry-run"]).dry_run)
 
-    def test_remote_is_accepted_but_hidden_from_help(self):
+    def test_remote_is_listed_in_doctors_own_help(self):
+        # It was hidden with argparse.SUPPRESS as an internal flag the local
+        # half used. The local half does not use it: nothing pushes the tool
+        # for doctor and doctor never runs itself remotely. Meanwhile
+        # target_ssh's refusal tells the operator to run `doctor --remote`,
+        # so `--help` denying it exists made the advice unfollowable.
         args = dd.build_parser().parse_args(["doctor", "--remote"])
         self.assertTrue(args.remote)
         # format_help() on the top-level parser never lists a subparser's own
-        # arguments, so asserting against it proves nothing -- --remote must
-        # be checked against the "doctor" subcommand's own help text, which
-        # is where argparse.SUPPRESS actually has an effect.
+        # arguments, so asserting against it proves nothing -- --remote has
+        # to be checked against the "doctor" subcommand's own help text.
         subparsers_action = dd.build_parser()._subparsers._group_actions[0]
         doctor_help = subparsers_action.choices["doctor"].format_help()
-        self.assertNotIn("--remote", doctor_help)
+        self.assertIn("--remote", doctor_help)
+
+    def test_the_flag_the_refusal_names_is_a_flag_help_admits_to(self):
+        # The pair, asserted together: whichever way this is settled, the
+        # refusal and the help text have to agree.
+        missing = pathlib.Path(tempfile.gettempdir()) / "dsr-no-such-target.env"
+        with unittest.mock.patch.object(dd, "TARGET_ENV_LOCAL", missing):
+            with self.assertRaises(dd.SecretsError) as caught:
+                dd.target_ssh()
+        named = "--remote" in str(caught.exception)
+        subparsers_action = dd.build_parser()._subparsers._group_actions[0]
+        listed = "--remote" in subparsers_action.choices["doctor"].format_help()
+        self.assertEqual(
+            named,
+            listed,
+            "target_ssh names --remote but doctor --help does not list it, "
+            "or the other way round.",
+        )
 
     def test_remote_is_a_doctor_only_flag(self):
         # provision --remote and deploy --remote used to parse and then die
@@ -1812,6 +1833,99 @@ class CommandTestCase(unittest.TestCase):
             stack.enter_context(unittest.mock.patch.object(sys, "stderr", self.err))
             code = func(args, out=self.out)
         return code, ssh
+
+
+class TestConnectionCountMatchesTheSpec(CommandTestCase):
+    """The spec's connection table, checked against the real command bodies.
+
+    The spec used to describe a different tool: one pushed copy re-invoked
+    as `ssh host "python3 /root/dsr_deploy.py --remote deploy"`, printing
+    one JSON document -- and it *rejected* per-step SSH on the grounds that
+    Windows OpenSSH has no ControlMaster. Per-step SSH is what was built.
+    That is a defensible outcome and the spec now says so, with the counts
+    written down. A number in prose rots the moment a step is added, so it
+    is read back out of the spec here rather than restated.
+    """
+
+    SPEC = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "docs"
+        / "superpowers"
+        / "specs"
+        / "2026-08-30-rhel-deployer-design.md"
+    )
+
+    def spec_text(self):
+        if not self.SPEC.exists():  # pragma: no cover - the spec is in-repo
+            self.skipTest("spec not present: %s" % self.SPEC)
+        return self.SPEC.read_text(encoding="utf-8")
+
+    def test_provision_opens_the_number_of_connections_the_spec_claims(self):
+        _code, ssh = self.run_command(dd.cmd_provision, ["provision"])
+        self.assertIn("| `provision` | %d |" % len(ssh.events), self.spec_text())
+
+    def test_deploy_opens_the_number_of_connections_the_spec_claims(self):
+        _code, healthy = self.run_command(dd.cmd_deploy, ["deploy"])
+        slow = self.ssh(responses={dd.health_command(): (1, "", "")})
+        self.run_command(dd.cmd_deploy, ["deploy"], ssh=slow)
+        self.assertIn(
+            "| `deploy` | %d on the healthy path, up to %d when the health "
+            "poll runs its full twenty probes |"
+            % (len(healthy.events), len(slow.events)),
+            self.spec_text(),
+        )
+
+    def test_doctor_opens_the_number_of_connections_the_spec_claims(self):
+        ssh = FakeSsh()
+        with contextlib.redirect_stdout(io.StringIO()):
+            dd.cmd_doctor(
+                dd.build_parser().parse_args(["doctor"]),
+                dd.SshRunner(ssh),
+                now_epoch=1700000000,
+            )
+        self.assertIn("| `doctor` | %d |" % len(ssh.events), self.spec_text())
+
+    def test_the_spec_no_longer_promises_a_json_document(self):
+        # The one sentence that described output the tool never produces.
+        text = self.spec_text()
+        self.assertNotIn("prints one JSON document", text)
+        self.assertIn("No JSON document is produced", text)
+
+    def test_doctor_neither_pushes_itself_nor_invokes_itself_remotely(self):
+        # What the spec's "first act of every command" claimed, and what is
+        # actually true: push_self is provision and deploy only.
+        ssh = FakeSsh()
+        with contextlib.redirect_stdout(io.StringIO()):
+            dd.cmd_doctor(
+                dd.build_parser().parse_args(["doctor"]),
+                dd.SshRunner(ssh),
+                now_epoch=1700000000,
+            )
+        self.assertEqual(ssh.pushed_files, [])
+        for command in ssh.commands:
+            self.assertNotIn(dd.REMOTE_SELF, command, command)
+
+    def test_the_pushed_copy_is_used_for_exactly_the_two_stated_jobs(self):
+        # REMOTE_SELF earns its place in the spec only for these two.
+        uses = [
+            command
+            for command in (
+                [s.command for s in dd.provision_steps()]
+                + [s.command for s in dd.deploy_steps({})]
+                + [dd.REMOTE_FINGERPRINT_COMMAND]
+            )
+            if dd.REMOTE_SELF.rsplit("/", 1)[0] in command and "dsr_deploy" in command
+        ]
+        self.assertEqual(len(uses), 3, uses)
+        self.assertEqual(
+            sum(1 for u in uses if "rewrite_pg_hba" in u),
+            1,
+        )
+        self.assertEqual(
+            sum(1 for u in uses if "neutralise_default_server" in u),
+            1,
+        )
+        self.assertEqual(sum(1 for u in uses if "key_fingerprint" in u), 1)
 
 
 class TestFingerprintProbeGuard(CommandTestCase):

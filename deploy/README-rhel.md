@@ -47,8 +47,18 @@ gitignored, never pasted into a ticket or a chat.
 
 ## The three commands
 
-Run all of these from the repo root, on your own machine — the tool copies
-itself to the box and re-invokes itself there; you never SSH in by hand.
+Run all of these from the repo root, on your own machine.
+
+`provision` and `deploy` copy the tool to `/root/dsr_deploy.py` before they
+start, and use that copy for the two jobs that genuinely need Python on the
+box: rewriting `pg_hba.conf` and `nginx.conf`, and reading the remote
+`CRYPTO_MASTER_KEY` fingerprint before the `.env` is overwritten. Everything
+else — every step, every check — is an individual SSH command. `doctor` does
+not copy anything and does not need to: it runs thirty-one read-only commands
+over SSH and works out what they mean on your machine.
+
+You do not need to SSH in by hand for any of the three. If you are already on
+the box, `python3 /root/dsr_deploy.py doctor --remote` reads it locally.
 
 ```bash
 # Bare RHEL 9 box -> ready to receive a deployment. Idempotent: re-running

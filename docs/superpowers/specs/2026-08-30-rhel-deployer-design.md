@@ -79,36 +79,61 @@ there is nothing to install on either end. "One file" means the tool: its unit
 tests live in a sibling file, because a test file is not something an operator
 ever copies to a server.
 
+An earlier draft of this section described a different architecture and
+rejected the one that was built. It is corrected here rather than quietly
+deleted, because the rejection was the argument the section used to justify
+itself, and a spec that argues for something the code does not do is worse
+than a spec that says nothing.
+
+**What was drafted.** The local side would build, push one payload, and
+invoke `ssh host "python3 /root/dsr_deploy.py --remote deploy"`; the remote
+side would act and print one JSON document; the local side would render it.
 The alternative — a Python script that runs `ssh host "…"` for each step, the
-way `deploy.sh` does — was rejected for two reasons. Windows OpenSSH has no
-`ControlMaster`, so each of roughly twenty-five steps pays a full TCP and
-authentication round trip. And every remote step becomes Python quoting bash
-quoting shell, which is the failure `deploy.sh` already documents in a comment:
-*"inline escaping of `$1` inside a double-quoted ssh command is how this broke
-once already."*
+way `deploy.sh` does — was rejected because Windows OpenSSH has no
+`ControlMaster`, so every step pays a full TCP and authentication round trip.
 
-Instead the local side does three things — build, push one payload, invoke the
-remote side — and the remote side runs as a normal Python process on the box:
+**What was built is that alternative.** Steps and collectors are individual
+SSH commands. Measured against the real command bodies:
 
-```
-local:   dsr_deploy.py deploy
-           → validate secrets, budget disk, build, tar → ssh
-           → ssh host "python3 /root/dsr_deploy.py --remote deploy"
-remote:  reads real state, acts, prints one JSON document
-local:   renders that document as human output, sets the exit code
-```
+| command | SSH connections |
+|---|---|
+| `provision` | 17 |
+| `deploy` | 27 on the healthy path, up to 47 when the health poll runs its full twenty probes |
+| `doctor` | 33 |
 
-The tool copies **itself** to `/root/dsr_deploy.py` as the first act of every
-command. That path rather than `/opt/dsr/` because `provision` runs against a
-bare host where `/opt/dsr` and the `dsr` user do not yet exist; `/root` always
-does, and the existing `deploy/.target.env` already assumes a `root@host` SSH
-target.
+No JSON document is produced anywhere: `doctor` collects thirty-one command
+outputs over SSH and evaluates them **locally**, in the same pure functions
+the unit tests call. That is what makes the evaluators testable without a
+host, which is the property this tool is actually built around.
 
-`--remote` is internal. An operator never types it.
+The connection cost is real and is the price paid for it. It is bearable
+because `provision` and `deploy` are occasional and already dominated by
+`dnf` and `npm`, and because `doctor` is thirty-three reads of a few
+kilobytes each. If it ever stops being bearable, the fix is a batched
+collector, not a rewrite.
 
-Everything that needs to *read* machine state does so in Python, where
-`pg_hba.conf` is a file to parse rather than a `sed` expression inside three
-levels of quoting.
+**What the pushed copy is actually for.** `push_self` copies the tool to
+`/root/dsr_deploy.py` as the first act of `provision` and `deploy` — not of
+every command; `doctor` never pushes itself and never invokes `--remote`
+remotely. `REMOTE_SELF` is used for exactly two jobs, both of which genuinely
+need Python on the box:
+
+- rewriting `pg_hba.conf` and `nginx.conf` (`_remote_text_fix`), where the
+  alternative is a `sed` expression inside three levels of quoting — the
+  failure `deploy.sh` documents in a comment: *"inline escaping of `$1`
+  inside a double-quoted ssh command is how this broke once already"*; and
+- computing the remote `CRYPTO_MASTER_KEY` fingerprint before the `.env` is
+  overwritten (`REMOTE_FINGERPRINT_COMMAND`).
+
+`/root` rather than `/opt/dsr/` because `provision` runs against a bare host
+where `/opt/dsr` and the `dsr` user do not yet exist; `/root` always does, and
+`deploy/.target.env` already assumes a `root@host` SSH target.
+
+`--remote` runs `doctor`'s collectors through a local runner instead of an
+SSH one. The local half never invokes it — nothing pushes the tool for
+`doctor` — so its only real user is an operator already logged in to the box,
+which is what `target_ssh`'s "no ssh target" refusal points them at. It is
+listed in `doctor --help` for that reason.
 
 ### Staging secrets
 
@@ -214,9 +239,16 @@ normal way to repair a half-finished provision.
    `dnf` reachable.
 2. **Packages.** `nginx`, `policycoreutils-python-utils` (for `semanage`),
    `firewalld`, `tar`, `zram-generator`. EPEL only if certbot is wanted.
-3. **Node 22.** Prefer the AppStream module (`dnf module enable nodejs:22`);
-   fall back to the NodeSource RPM when that stream is unavailable. Either way,
-   assert `node -v` reports major ≥ 22 rather than trusting the install.
+3. **Node 22, AppStream only** — `dnf module enable nodejs:22 && dnf install
+   -y nodejs`, `&&`-chained so an unavailable stream fails loudly at the step
+   that needed it. A NodeSource RPM fallback was described in an earlier draft
+   and deliberately not built, on the same ruling already recorded for
+   PostgreSQL below: with no RHEL box available this session to exercise it, an
+   untested fallback is a guess dressed up as a guarantee, and a guess that
+   fires only on the host where the primary path already failed is the worst
+   place to put one. If a host without the stream is ever hit in practice, add
+   it then, against that host. Assert `node -v` reports major ≥ 22 after the
+   install rather than trusting it.
 4. **PostgreSQL 16, AppStream only** — service `postgresql`, data directory
    `/var/lib/pgsql/data`. A PGDG fallback (`postgresql-16` service,
    `/var/lib/pgsql/16/data`) was considered and deliberately not built: this
@@ -249,9 +281,18 @@ normal way to repair a half-finished provision.
    and `/opt/dsr/uploads` at `0750` owned `dsr:dsr` so nothing else on the box
    can read a requester's identity documents.
 8. **SELinux, left enforcing.** `setsebool -P httpd_can_network_connect on` so
-   nginx may proxy to the API. `semanage fcontext -a -t httpd_sys_content_t
-   "/var/www/dsr(/.*)?"` followed by `restorecon -R`. **The tool never runs
-   `setenforce 0` and never suggests it.** Disabling SELinux is the fix people
+   nginx may proxy to the API, and `restorecon -R` over the web root and the
+   install prefix. An earlier draft also called for `semanage fcontext -a -t
+   httpd_sys_content_t "/var/www/dsr(/.*)?"`. No such call exists and none is
+   needed: RHEL's base policy already maps `/var/www(/.*)?` to
+   `httpd_sys_content_t`, so `restorecon -R` on its own gives `/var/www/dsr`
+   the right label. A local `fcontext` rule there would add a permanent entry
+   to the box's policy store that restates what the base policy already says.
+   What the rule was really guarding against — a directory `mv`d into place
+   carrying `admin_home_t` in from `/root` — is caught instead: `restorecon`
+   fixes it, and `doctor` reads `ls -Zd` on the web root and reports the label
+   it finds, so a wrong one is visible rather than assumed.
+   **The tool never runs `setenforce 0` and never suggests it.** Disabling SELinux is the fix people
    reach for, it is wrong, and a deployer that offers it teaches the wrong
    lesson on a box holding identity documents.
 9. **nginx.** The repo's `nginx.conf` is a server block; it goes to

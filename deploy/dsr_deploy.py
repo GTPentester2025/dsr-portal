@@ -4085,12 +4085,24 @@ def build_parser() -> argparse.ArgumentParser:
             help="print what would happen, touch nothing",
         )
         if name == "doctor":
-            # Internal: how the local half invokes the copy it pushed to the
-            # box. Hidden because an operator never types it, and only on
-            # doctor because only doctor has a local runner. provision and
-            # deploy accepted it and then died on target_ssh's "No ssh
+            # Listed rather than hidden. It was hidden as "internal: how the
+            # local half invokes the copy it pushed to the box" -- but the
+            # local half never invokes it. Nothing pushes the tool for
+            # doctor, and doctor never runs itself remotely. Its only real
+            # user is an operator already logged in to the box, which is
+            # exactly who target_ssh's "no ssh target" refusal sends here.
+            # A refusal that names a flag `--help` denies the existence of
+            # is worse than no advice.
+            #
+            # doctor only, because only doctor has a local runner. provision
+            # and deploy accepted it and then died on target_ssh's "No ssh
             # target", which is the least useful way to say "not supported".
-            p.add_argument("--remote", action="store_true", help=argparse.SUPPRESS)
+            p.add_argument(
+                "--remote",
+                action="store_true",
+                help="read this machine instead of the ssh target; run it on "
+                "the box itself",
+            )
             p.add_argument(
                 "--no-state",
                 action="store_true",
