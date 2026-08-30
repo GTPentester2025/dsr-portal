@@ -1653,10 +1653,37 @@ class TestDatabaseEvaluator(unittest.TestCase):
         self.assertIn("scram-sha-256", blob)
 
     def test_a_missing_migrations_table_says_migrations_never_ran(self):
+        # "some finding is a FAIL and migrate.mjs appears somewhere" is also
+        # true of the generic could-not-read branch, so the assertion has to
+        # be the distinguishing sentence -- which is the whole point of the
+        # branch.
         error = 'ERROR:  relation "schema_migrations" does not exist\n'
         findings = dd.evaluate_database(PSQL_ROLES, error, MIGRATION_FILES)
-        self.assertTrue(any(f.severity == dd.FAIL for f in findings))
-        self.assertIn("migrate.mjs", _blob(findings))
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertEqual(
+            [f.title for f in bad], ["the schema_migrations table does not exist"]
+        )
+        self.assertIn("No migration has ever run here", bad[0].detail)
+        self.assertIn("migrate.mjs", bad[0].fix)
+
+    def test_a_psql_error_that_is_not_the_missing_table_gets_the_generic_message(self):
+        error = 'psql: error: FATAL:  database "dsr" does not exist\n'
+        findings = dd.evaluate_database(PSQL_ROLES, error, MIGRATION_FILES)
+        bad = [f for f in findings if f.severity == dd.FAIL]
+        self.assertEqual([f.title for f in bad], ["could not read the applied migrations"])
+        self.assertIn("database \"dsr\" does not exist", bad[0].detail)
+
+    def test_no_files_and_no_applied_rows_is_not_reported_as_healthy(self):
+        # Removing the `elif not files:` guard turns this into an OK reading
+        # "all 0 migrations are applied". A diagnostic that reports health
+        # because it found nothing is worse than one that says nothing.
+        findings = dd.evaluate_database(PSQL_ROLES, "", [])
+        migrations = [f for f in findings if "migration" in f.title]
+        self.assertTrue(migrations)
+        self.assertEqual([f.severity for f in migrations], [dd.WARN])
+        self.assertEqual(migrations[0].title, "could not list the migration files")
+        self.assertNotIn("all 0 migrations are applied", _blob(findings))
+        self.assertEqual(dd.exit_code_for(findings), 1)
 
     def test_a_password_inside_a_psql_error_is_redacted(self):
         error = (
