@@ -570,6 +570,21 @@ def load_target(text: str) -> dict:
     return env
 
 
+def unpack_command(remote: str) -> str:
+    """The far side of push_dir: replace `remote` with what arrives on stdin.
+
+    A module-level function rather than a literal inside push_dir so that a
+    test can read the actual command instead of the docstring above it --
+    and so the `tar` it needs is one grep away from BASE_PACKAGES, which is
+    what has to carry it.
+    """
+    return "rm -rf '%s' && mkdir -p '%s' && tar -xzf - -C '%s'" % (
+        remote,
+        remote,
+        remote,
+    )
+
+
 class Ssh:
     """Runs a command on the target over ssh, or copies a file/directory to it.
 
@@ -635,9 +650,7 @@ class Ssh:
         """
         tar = subprocess.Popen(["tar", "-czf", "-", "-C", local, "."], stdout=subprocess.PIPE)
         ssh_proc = subprocess.Popen(
-            self.argv(
-                "rm -rf '%s' && mkdir -p '%s' && tar -xzf - -C '%s'" % (remote, remote, remote)
-            ),
+            self.argv(unpack_command(remote)),
             stdin=tar.stdout,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -802,6 +815,25 @@ def _remote_text_fix(path: str, func_name: str) -> str:
     ) % (remote_dir, path, func_name, path)
 
 
+# What every later step and every deploy assumes is already there.
+#
+# `tar` is on this list because `push_dir` runs `tar -xzf -` on the box, and
+# a RHEL 9 minimal install does not reliably ship it. Without it provision
+# succeeds, reports success, and deploy then dies on its first payload
+# transfer -- which is the worst place to find out, because the operator has
+# already been told the host is ready. It is one package and it is load
+# bearing; do not trim it.
+BASE_PACKAGES = (
+    "curl",
+    "ca-certificates",
+    # `semanage`, which doctor's SELinux advice assumes exists.
+    "policycoreutils-python-utils",
+    "firewalld",
+    "nginx",
+    "tar",
+)
+
+
 def provision_steps() -> list:
     """The RHEL 9 provisioning sequence, in order.
 
@@ -829,8 +861,7 @@ def provision_steps() -> list:
         ),
         Step(
             "install base packages",
-            "dnf install -y curl ca-certificates policycoreutils-python-utils "
-            "firewalld nginx && dnf clean all",
+            "dnf install -y %s && dnf clean all" % " ".join(BASE_PACKAGES),
         ),
         Step(
             "install Node.js 22",

@@ -4,6 +4,7 @@ import ast
 import base64
 import collections
 import contextlib
+import inspect
 import io
 import os
 import pathlib
@@ -948,6 +949,45 @@ class TestPlans(unittest.TestCase):
                 "holds identity documents. Set httpd_can_network_connect "
                 "instead." % (step.name, match.group(0) if match else ""),
             )
+
+    def test_the_base_packages_include_tar(self):
+        # push_dir runs `tar -xzf -` on the box for every payload directory,
+        # and a RHEL 9 minimal install does not reliably ship tar. Without
+        # it provision reports success and deploy dies on its first
+        # push_dir -- after the operator has been told the host is ready.
+        self.assertIn("tar", dd.BASE_PACKAGES)
+
+    def test_every_base_package_is_actually_installed(self):
+        # The list is only a guarantee if the step still installs all of it.
+        step = [s for s in dd.provision_steps() if s.name == "install base packages"][0]
+        installed = step.command.split("dnf install -y ", 1)[1].split(" &&")[0].split()
+        self.assertEqual(installed, list(dd.BASE_PACKAGES))
+
+    def test_the_transport_still_needs_the_package_the_list_carries(self):
+        # The other half of the coupling, read off the command itself rather
+        # than off push_dir's docstring -- which also says "tar -xzf -" and
+        # would have kept this passing over a transport that had stopped
+        # using it. push_dir is what makes tar a dependency; if that ever
+        # changes, this says so rather than leaving an unexplained package
+        # on the list forever.
+        self.assertIn("tar -xzf -", dd.unpack_command("/opt/dsr/server"))
+        self.assertIn("tar", dd.BASE_PACKAGES)
+
+    def test_the_base_package_list_is_the_whole_list(self):
+        # Not just tar: every one of these is assumed by a later step or by
+        # doctor, and dropping any of them fails somewhere that does not
+        # name the package.
+        self.assertEqual(
+            set(dd.BASE_PACKAGES),
+            {
+                "curl",
+                "ca-certificates",
+                "policycoreutils-python-utils",
+                "firewalld",
+                "nginx",
+                "tar",
+            },
+        )
 
     def test_the_role_sql_escapes_the_password_for_sql_not_just_for_the_shell(self):
         # shell_quote protects the shell layer. Nothing protected the SQL
