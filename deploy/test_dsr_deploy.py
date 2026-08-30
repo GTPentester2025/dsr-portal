@@ -750,25 +750,53 @@ DF_SINGLE_ROOT_NEARLY_FULL = """Filesystem     1B-blocks       Used  Available C
 """
 
 
+# A box with room to spare, so a budget check in a command-level test passes
+# on its own terms rather than on parse_df returning nothing.
+DF_PLENTY = """Filesystem     1B-blocks       Used  Available Capacity Mounted on
+/dev/vda1     42949672960 4294967296 38654705664      10% /
+"""
+
+
 class FakeSsh:
     """Records commands instead of running them. No host, by design.
 
     `fail_until` makes the first N calls fail, which is how a slow-starting
-    API is simulated; `fail_on` fails one specific command.
+    API is simulated; `fail_on` fails one specific command. `responses` maps
+    an exact command to the (returncode, stdout, stderr) it should answer
+    with, which is how the fingerprint probe and `df -PB1` are driven.
+
+    push_file / push_text / push_dir record rather than move bytes: the
+    destination of a push is the thing worth asserting on, and one of them
+    mirrors a directory by deleting it first.
     """
 
     Result = collections.namedtuple("Result", "returncode stdout stderr")
 
-    def __init__(self, fail_until=0, fail_on=None, stderr=""):
+    def __init__(self, fail_until=0, fail_on=None, stderr="", responses=None):
         self.commands = []
         self.fail_until = fail_until
         self.fail_on = fail_on
         self.stderr = stderr
+        self.responses = dict(responses or {})
+        self.pushed_files = []
+        self.pushed_texts = []
+        self.pushed_dirs = []
 
     def run(self, command, check=True):
         self.commands.append(command)
+        if command in self.responses:
+            return self.Result(*self.responses[command])
         failed = len(self.commands) <= self.fail_until or command == self.fail_on
         return self.Result(1 if failed else 0, "", self.stderr if failed else "")
+
+    def push_file(self, local, remote):
+        self.pushed_files.append((local, remote))
+
+    def push_text(self, text, remote, mode=""):
+        self.pushed_texts.append((text, remote, mode))
+
+    def push_dir(self, local, remote):
+        self.pushed_dirs.append((local, remote))
 
 
 class TestSecretsStaging(unittest.TestCase):
@@ -1084,6 +1112,138 @@ class TestRunSteps(unittest.TestCase):
         self.assertIn("a step", message)
         self.assertIn("137", message)
         self.assertTrue(message.strip())
+
+
+class CommandTestCase(unittest.TestCase):
+    """Base for the cmd_provision / cmd_deploy tests. No host, no secrets file.
+
+    Everything that would reach the world is replaced: target_ssh (so no
+    deploy/.target.env is read), read_secrets (so no secrets file on this
+    machine is opened), subprocess.run (so no npm build runs) and
+    time.sleep (so a health-poll timeout costs no wall clock). What is left
+    is the *order* of the decisions these two functions make, which is the
+    region the fail-open fingerprint guard lived in.
+    """
+
+    SECRETS = {
+        "DB_PASS": "db-pass",
+        "APP_PASS": "app-pass",
+        "CRYPTO_MASTER_KEY": base64.b64encode(b"\x03" * 32).decode(),
+        "EMAIL_PROVIDER": "graph",
+        "PRIVACY_MAILBOX": "privacy@example.com",
+        "GRAPH_TENANT_ID": "t",
+        "GRAPH_CLIENT_ID": "c",
+        "GRAPH_CLIENT_SECRET": "s",
+    }
+    HOST = "root@198.51.100.7"
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self.err = io.StringIO()
+        self.builds = []
+        self.slept = []
+        self.secrets_read = []
+        # Points SECRETS_FILE somewhere that does not exist, so a test that
+        # accidentally reaches the real read_secrets fails loudly instead of
+        # opening an operator's actual secrets file.
+        patcher = unittest.mock.patch.dict(
+            os.environ, {"SECRETS_FILE": "/nonexistent/.secrets.test.env"}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def ssh(self, responses=None, **kwargs):
+        answers = dict(responses or {})
+        answers.setdefault("df -PB1", (0, DF_PLENTY, ""))
+        # A box with no .env yet: the probe ran (exit 0) and printed nothing.
+        answers.setdefault(dd.REMOTE_FINGERPRINT_COMMAND, (0, "", ""))
+        answers.setdefault(dd.health_command(), (0, "", ""))
+        return FakeSsh(responses=answers, **kwargs)
+
+    def run_command(self, func, argv, ssh=None, secrets=None):
+        ssh = ssh if ssh is not None else self.ssh()
+
+        def fake_subprocess_run(command, **kwargs):
+            self.builds.append((command, kwargs.get("cwd")))
+            return dd.subprocess.CompletedProcess(command, 0)
+
+        def fake_read_secrets(path):
+            self.secrets_read.append(str(path))
+            return dict(self.SECRETS if secrets is None else secrets)
+
+        args = dd.build_parser().parse_args(argv)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(dd, "target_ssh", lambda: (ssh, self.HOST))
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(dd, "read_secrets", fake_read_secrets)
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(dd.subprocess, "run", fake_subprocess_run)
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(dd.time, "sleep", self.slept.append)
+            )
+            stack.enter_context(unittest.mock.patch.object(sys, "stderr", self.err))
+            code = func(args, out=self.out)
+        return code, ssh
+
+
+class TestFingerprintProbeGuard(CommandTestCase):
+    """The probe's *return code*, not just what it printed.
+
+    fingerprint_refusal reads an empty remote fingerprint as a first
+    deployment, which is right when the box genuinely has no .env. Every way
+    the probe can fail looks exactly the same on stdout, so before this the
+    guard passed on a box where it had never run -- and the box where it
+    cannot run is the RHEL 9 box with Python 3.9, the one it exists for.
+    """
+
+    def test_a_clean_probe_is_not_a_refusal(self):
+        self.assertEqual(dd.fingerprint_probe_refusal(0, "", "root@h"), "")
+
+    def test_a_failed_probe_names_the_exit_code_and_quotes_the_stderr(self):
+        message = dd.fingerprint_probe_refusal(
+            127, "bash: python3: command not found", "root@h"
+        )
+        self.assertIn("127", message)
+        self.assertIn("python3: command not found", message)
+        self.assertIn("root@h", message)
+
+    def test_a_failed_probe_that_said_nothing_still_refuses(self):
+        message = dd.fingerprint_probe_refusal(1, "", "root@h")
+        self.assertTrue(message.startswith("FATAL:"))
+
+    def test_an_unimportable_deployer_on_the_box_stops_the_deployment(self):
+        # The coupled failure: this file must run on RHEL 9's Python 3.9
+        # while being written on a newer one. One 3.10-only construct and
+        # `import dsr_deploy` raises on every real box -- unit suite green,
+        # --dry-run perfect, guard silently disarmed.
+        ssh = self.ssh(
+            responses={
+                dd.REMOTE_FINGERPRINT_COMMAND: (
+                    1,
+                    "",
+                    "ModuleNotFoundError: No module named 'dsr_deploy'",
+                )
+            }
+        )
+        with self.assertRaises(dd.Refusal) as caught:
+            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
+        message = str(caught.exception)
+        self.assertIn("exit 1", message)
+        self.assertIn("ModuleNotFoundError", message)
+        # Nothing was built and nothing was pushed over the box's bundles.
+        self.assertEqual(self.builds, [])
+        self.assertEqual(ssh.pushed_dirs, [])
+
+    def test_a_genuine_first_deployment_still_goes_ahead(self):
+        # The other half: exit 0 with no output is a box with no .env, and
+        # must stay a first deployment rather than becoming a refusal.
+        code, ssh = self.run_command(dd.cmd_deploy, ["deploy"])
+        self.assertEqual(code, 0)
+        self.assertTrue(ssh.pushed_dirs)
 
 
 class TestAtomicWrite(unittest.TestCase):

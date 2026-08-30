@@ -1260,6 +1260,48 @@ def fingerprint_refusal(
     )
 
 
+def fingerprint_probe_refusal(returncode: int, stderr: str, host: str) -> str:
+    """"" when the fingerprint probe ran; the refusal text when it did not.
+
+    fingerprint_refusal reads an empty remote fingerprint as "this box has
+    no .env yet", which is right -- the probe prints nothing and exits 0 on
+    a first deployment. But every way the probe can *fail* looks identical
+    on stdout: python3 absent, /root/dsr_deploy.py unreadable, an `import
+    dsr_deploy` that raises because one 3.10-only construct reached this
+    file, a read_text that raises. In all of them the traceback goes to
+    stderr and stdout is empty.
+
+    Reading only stdout therefore makes the guard fail open, and the import
+    failure is the case that matters: this file must run on RHEL 9's Python
+    3.9 while being developed on a newer one, so a single 3.10-only
+    construct would keep the unit suite green and --dry-run perfect while
+    disarming the guard on every real box -- exactly the hosts it protects.
+    Writing the wrong .env there orphans every encrypted row in
+    app_settings, and nothing recovers them.
+
+    So the return code decides first, and stdout is only trusted after it.
+    """
+    if returncode == 0:
+        return ""
+    lines = [
+        "FATAL: could not read the CRYPTO_MASTER_KEY already on %s "
+        "(probe exit %d)." % (host, returncode),
+        "       Until that is known, deploying could write a .env whose key",
+        "       differs from the one app_settings was encrypted with, which",
+        "       nothing recovers -- so an unreadable box is a refusal, not a",
+        "       first deployment.",
+        "       The probe runs %s on the box; check python3 is installed and"
+        % REMOTE_SELF,
+        "       that file is readable, then run again. It said:",
+    ]
+    detail = (stderr or "").strip()
+    if not detail:
+        detail = "(nothing on stderr)"
+    for line in detail.splitlines():
+        lines.append("       " + line)
+    return "\n".join(lines)
+
+
 def deploy_needs() -> dict:
     """Bytes required per path for a deployment."""
     return {INSTALL_PREFIX: DEPLOY_BYTES}
@@ -2927,9 +2969,13 @@ def cmd_deploy(args, out=None) -> int:
     # over a different key orphans every encrypted row in app_settings, and
     # nothing recovers them. Both fingerprints come from key_fingerprint --
     # the local one here, the remote one from the copy just pushed.
+    probe = ssh.run(REMOTE_FINGERPRINT_COMMAND, check=False)
+    refusal = fingerprint_probe_refusal(probe.returncode, probe.stderr, host)
+    if refusal:
+        raise Refusal(refusal)
     refusal = fingerprint_refusal(
         key_fingerprint(secrets.get("CRYPTO_MASTER_KEY", "")),
-        ssh.run(REMOTE_FINGERPRINT_COMMAND, check=False).stdout,
+        probe.stdout,
         str(path),
         host,
     )
