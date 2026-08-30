@@ -79,6 +79,9 @@ class SecretsError(Refusal):
 
 
 EMAIL_PROVIDERS = ("graph", "console")
+# The two postgres roles the portal logs in as. Both must be set: see
+# validate_role_passwords for what an empty one costs.
+ROLE_PASSWORD_KEYS = ("DB_PASS", "APP_PASS")
 GRAPH_KEYS = ("PRIVACY_MAILBOX", "GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET")
 
 
@@ -199,15 +202,26 @@ def mount_for(path: str, mounts: list) -> Mount:
 
 
 def human_bytes(n: int) -> str:
+    """Bytes as a binary-unit string, labelled for the divisor it uses.
+
+    The arithmetic is 1024-based, so the labels have to be MiB and GiB. As
+    MB and GB they disagreed with the constants they came from: DEPLOY_BYTES
+    is 420 * 1000 * 1000 and printed "400.5 MB", and the breakdown read
+    "node_modules ~295.6 MB" where the constant says 310 MB. The refusal an
+    operator reads then disagrees with both the spec and the source.
+
+    MiB/GiB is also what `df -h` prints on the box, which is where the
+    refusal sends them next.
+    """
     value = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if unit == "B":
             if value < 1024:
                 return "%d B" % int(value)
         elif value < 1024:
             return "%.1f %s" % (value, unit)
         value /= 1024.0
-    return "%.1f PB" % value
+    return "%.1f PiB" % value
 
 
 def check_budget(mounts: list, needs: dict) -> list:
@@ -1147,11 +1161,19 @@ DEPLOY_BYTES = (
     DEPLOY_NODE_MODULES_BYTES + DEPLOY_DIST_BYTES + DEPLOY_TRANSFER_HEADROOM_BYTES
 )
 
-# Provisioning installs nginx, Node 22, PostgreSQL 16 and the SELinux tooling,
-# and fills the dnf cache doing it (the steps clean it afterwards, not during).
-# An estimate, and labelled as one: being roughly right before the fact beats
+# Provisioning installs nginx, Node 22, PostgreSQL 16 and the SELinux tooling
+# under /usr, and fills the dnf cache doing it -- which downloads to
+# /var/cache/dnf, because the steps clean the cache afterwards rather than
+# during. Two figures rather than one: charging the whole total to /usr is
+# right only by accident on a single-root box, and wrong on a box with a
+# separate /var, which is the layout to expect here. check_budget sums per
+# mount, so a single-root box still sees the total.
+#
+# Estimates, and labelled as such: being roughly right before the fact beats
 # being exactly right halfway through a failed `dnf install`.
-PROVISION_PACKAGE_BYTES = 900 * 1000 * 1000
+PROVISION_INSTALL_BYTES = 600 * 1000 * 1000
+PROVISION_CACHE_BYTES = 300 * 1000 * 1000
+PROVISION_PACKAGE_BYTES = PROVISION_INSTALL_BYTES + PROVISION_CACHE_BYTES
 
 # The keys each command stages on the box. Provisioning only ever needs the
 # two role passwords; nothing else it does touches a secret.
@@ -1223,6 +1245,27 @@ def remote_secrets_content(env: dict, keys) -> str:
     return "".join("%s=%s\n" % (key, shell_quote(env.get(key, ""))) for key in keys)
 
 
+def validate_role_passwords(env: dict) -> None:
+    """Raise unless both database role passwords are actually there.
+
+    An absent key is staged as `''` rather than omitted, and the .env body
+    references a bare `${DB_PASS}` with no `:?`. So a secrets file missing
+    either one produces `postgres://dsr:@127.0.0.1:5432/dsr`, the API fails
+    to authenticate, systemd crash-loops it, and nothing upstream said a
+    word. Provisioning happens to catch this -- its SQL uses `${DB_PASS:?}`
+    -- but deploying did not, and deploying is the command that runs far
+    more often.
+    """
+    missing = [key for key in ROLE_PASSWORD_KEYS if not (env.get(key) or "").strip()]
+    if missing:
+        raise SecretsError(
+            "These database passwords are missing or empty in the secrets "
+            "file: %s. The .env would carry an empty password, the API would "
+            "fail to authenticate against postgres, and systemd would "
+            "crash-loop it." % " ".join(missing)
+        )
+
+
 def validate_secrets(env: dict) -> list:
     """Both of deploy.sh's local guards, in its order. Returns warnings.
 
@@ -1230,8 +1273,12 @@ def validate_secrets(env: dict) -> list:
     a single byte is pushed is the whole point: the alternative is finding
     out from journalctl on a box already serving the public intake form to
     a dead API.
+
+    The master key is checked first because it is the only one of the three
+    whose mistake cannot be undone afterwards.
     """
     validate_master_key(env.get("CRYPTO_MASTER_KEY", ""))
+    validate_role_passwords(env)
     return validate_email_config(env)
 
 
@@ -1308,8 +1355,17 @@ def deploy_needs() -> dict:
 
 
 def provision_needs() -> dict:
-    """Bytes required per path for a provisioning run."""
-    return {"/usr": PROVISION_PACKAGE_BYTES}
+    """Bytes required per path for a provisioning run.
+
+    The packages land under /usr; the downloads that produce them land in
+    /var/cache/dnf. On a box with a separate /var those are two different
+    filesystems, and a budget that names only /usr will happily approve a
+    /var with no room for the download.
+    """
+    return {
+        "/usr": PROVISION_INSTALL_BYTES,
+        "/var/cache": PROVISION_CACHE_BYTES,
+    }
 
 
 def budget_refusal(refusals: list, breakdown: str = "") -> str:
@@ -2937,10 +2993,16 @@ def cmd_provision(args, out=None) -> int:
         "nginx, Node 22, PostgreSQL 16, SELinux tooling and the dnf cache",
     )
 
-    ssh.push_text(
-        remote_secrets_content(secrets, PROVISION_SECRET_KEYS), REMOTE_SECRETS, mode="600"
-    )
+    # Inside the try, not before it: push_text's remote `cat >` can create
+    # the file and then have the transfer die, and the removal below would
+    # never run -- leaving a partial secrets file on the box. The `rm -f` is
+    # already harmless when the file was never created.
     try:
+        ssh.push_text(
+            remote_secrets_content(secrets, PROVISION_SECRET_KEYS),
+            REMOTE_SECRETS,
+            mode="600",
+        )
         run_steps(ssh, steps, out)
     finally:
         ssh.run("rm -f %s" % REMOTE_SECRETS, check=False)
@@ -3000,10 +3062,14 @@ def cmd_deploy(args, out=None) -> int:
         else:
             ssh.push_file(item.local, item.remote)
 
-    ssh.push_text(
-        remote_secrets_content(secrets, DEPLOY_SECRET_KEYS), REMOTE_SECRETS, mode="600"
-    )
+    # Inside the try: see cmd_provision for why a transfer that dies after
+    # the remote `cat >` created the file must still reach the removal.
     try:
+        ssh.push_text(
+            remote_secrets_content(secrets, DEPLOY_SECRET_KEYS),
+            REMOTE_SECRETS,
+            mode="600",
+        )
         run_steps(ssh, deploy_steps(secrets), out)
         out.write("==> health\n")
         if not poll_health(ssh, out):

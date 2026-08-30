@@ -215,8 +215,8 @@ class TestBudget(unittest.TestCase):
         refusals = dd.check_budget(mounts, {"/var": 4_000_000_000})
         self.assertEqual(len(refusals), 1)
         self.assertIn("/var", refusals[0])
-        self.assertIn("1.0 GB", refusals[0])
-        self.assertIn("3.7 GB", refusals[0])
+        self.assertIn("1.0 GiB", refusals[0])
+        self.assertIn("3.7 GiB", refusals[0])
 
     def test_two_paths_on_one_mount_are_summed_not_checked_separately(self):
         # 700MB + 700MB both land on /var, which has 1.0GB free: one refusal.
@@ -231,8 +231,19 @@ class TestHumanBytes(unittest.TestCase):
     def test_scales_and_rounds(self):
         self.assertEqual(dd.human_bytes(0), "0 B")
         self.assertEqual(dd.human_bytes(512), "512 B")
-        self.assertEqual(dd.human_bytes(1024), "1.0 KB")
-        self.assertEqual(dd.human_bytes(1073741824), "1.0 GB")
+        self.assertEqual(dd.human_bytes(1024), "1.0 KiB")
+        self.assertEqual(dd.human_bytes(1073741824), "1.0 GiB")
+
+    def test_the_label_matches_the_divisor(self):
+        # The divisor is 1024. Under an MB/GB label the printed number
+        # disagreed with the constant it came from: DEPLOY_BYTES is
+        # 420 * 1000 * 1000 and printed "400.5 MB", and the breakdown read
+        # "node_modules ~295.6 MB" where the source says 310 MB.
+        self.assertEqual(dd.human_bytes(1024 ** 2), "1.0 MiB")
+        self.assertEqual(dd.human_bytes(1000 * 1000), "976.6 KiB")
+        for text in (dd.human_bytes(dd.DEPLOY_BYTES), dd.deploy_breakdown()):
+            self.assertNotIn(" MB", text)
+            self.assertNotIn(" GB", text)
 
 
 class TestProjection(unittest.TestCase):
@@ -612,6 +623,35 @@ class TestPlans(unittest.TestCase):
         ):
             self.assertIn(expected, names, "provision has no %s step" % expected)
 
+    # `enforce` is not a substring of `enforcing`, which left the officially
+    # documented way to boot RHEL permissive walking straight through this
+    # net: `grubby --update-kernel=ALL --args="enforcing=0"`. One character.
+    FORBIDDEN_SELINUX = re.compile(r"selinux|enforc|permissive", re.IGNORECASE)
+
+    def test_the_prohibition_catches_every_documented_way_to_disable_selinux(self):
+        for command in (
+            'grubby --update-kernel=ALL --args="enforcing=0"',
+            "setenforce 0",
+            "semanage permissive -a httpd_t",
+            "echo 0 > /sys/fs/selinux/enforce",
+            "sed -i 's/SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config",
+        ):
+            self.assertIsNotNone(
+                self.FORBIDDEN_SELINUX.search(command),
+                "%r would slip past the SELinux prohibition" % command,
+            )
+
+    def test_the_prohibition_still_permits_the_commands_this_tool_is_for(self):
+        # A net that catches setsebool and restorecon is a net nobody can
+        # keep, so this is the other half of the pattern's contract.
+        for command in (
+            "setsebool -P httpd_can_network_connect on",
+            "restorecon -R /opt/dsr /var/www/dsr",
+            "dnf install -y policycoreutils-python-utils",
+            "nginx -t && systemctl enable --now nginx",
+        ):
+            self.assertIsNone(self.FORBIDDEN_SELINUX.search(command), command)
+
     def test_provision_never_disables_selinux(self):
         # Widened from three exact substrings to a pattern, because the
         # three had blind spots wide enough to drive through and all of
@@ -624,9 +664,8 @@ class TestPlans(unittest.TestCase):
         #
         # `setsebool -P httpd_can_network_connect on` and `restorecon` are
         # the SELinux commands this tool is *for*, and neither matches.
-        forbidden = re.compile(r"selinux|enforce|permissive", re.IGNORECASE)
         for step in dd.provision_steps() + dd.deploy_steps({}):
-            match = forbidden.search(step.command)
+            match = self.FORBIDDEN_SELINUX.search(step.command)
             self.assertIsNone(
                 match,
                 "step %r reaches for SELinux: %r. Turning it off is the fix "
@@ -742,6 +781,13 @@ class TestPlans(unittest.TestCase):
         self.assertIn("echo hi", text)
         self.assertIn("1", text)
 
+
+# A box with a separate /var: room under / for the installed packages, but
+# not enough in /var/cache for the downloads that produce them.
+DF_SEPARATE_VAR_TOO_SMALL = """Filesystem     1B-blocks       Used  Available Capacity Mounted on
+/dev/vda1     42949672960 4294967296 38654705664      10% /
+/dev/vdb1      2147483648 2040109465  107374183      95% /var
+"""
 
 # The target box: ~10 GB, mostly used. 240 MB free is less than the ~420 MB
 # a deployment spends, so the refusal below is a path an operator will really
@@ -893,6 +939,8 @@ class TestShellQuoting(unittest.TestCase):
 class TestLocalPreflight(unittest.TestCase):
     GOOD = {
         "CRYPTO_MASTER_KEY": base64.b64encode(b"\x01" * 32).decode(),
+        "DB_PASS": "db-pass",
+        "APP_PASS": "app-pass",
         "EMAIL_PROVIDER": "graph",
         "PRIVACY_MAILBOX": "p@e.com",
         "GRAPH_TENANT_ID": "t",
@@ -921,6 +969,32 @@ class TestLocalPreflight(unittest.TestCase):
         # after the fact, so it must be the one reported.
         with self.assertRaises(dd.SecretsError) as caught:
             dd.validate_secrets({"CRYPTO_MASTER_KEY": "", "EMAIL_PROVIDER": "smtp"})
+        self.assertIn("CRYPTO_MASTER_KEY", str(caught.exception))
+
+    def test_a_missing_database_password_is_refused_and_named(self):
+        # Absent keys stage as '' and the .env uses a bare ${DB_PASS} with
+        # no :?, so the service deploys with an empty password and
+        # crash-loops on authentication with nothing upstream warning.
+        for key in dd.ROLE_PASSWORD_KEYS:
+            env = dict(self.GOOD)
+            env.pop(key)
+            with self.assertRaises(dd.SecretsError) as caught:
+                dd.validate_secrets(env)
+            self.assertIn(key, str(caught.exception))
+
+    def test_a_blank_database_password_is_refused_too(self):
+        env = dict(self.GOOD)
+        env["APP_PASS"] = "   "
+        with self.assertRaises(dd.SecretsError) as caught:
+            dd.validate_secrets(env)
+        self.assertIn("APP_PASS", str(caught.exception))
+
+    def test_the_key_is_still_checked_before_the_passwords(self):
+        env = dict(self.GOOD)
+        env["CRYPTO_MASTER_KEY"] = "a" * 64
+        env.pop("DB_PASS")
+        with self.assertRaises(dd.SecretsError) as caught:
+            dd.validate_secrets(env)
         self.assertIn("CRYPTO_MASTER_KEY", str(caught.exception))
 
     def test_a_refusal_is_catchable_as_a_refusal(self):
@@ -1005,8 +1079,28 @@ class TestDiskBudgetRefusal(unittest.TestCase):
         )
 
     def test_provision_budgets_the_package_install(self):
-        self.assertEqual(list(dd.provision_needs()), ["/usr"])
-        self.assertGreater(dd.provision_needs()["/usr"], 0)
+        needs = dd.provision_needs()
+        self.assertEqual(sorted(needs), ["/usr", "/var/cache"])
+        self.assertEqual(sum(needs.values()), dd.PROVISION_PACKAGE_BYTES)
+
+    def test_the_dnf_cache_is_charged_to_var_not_to_usr(self):
+        # dnf downloads to /var/cache/dnf and the steps clean it afterwards,
+        # not during. Charging the whole figure to /usr is right only by
+        # accident on a single-root box, and this one has a separate /var --
+        # the layout to expect here. It has 102 MiB free against a 300 MB
+        # download, and nothing said so before.
+        mounts = dd.parse_df(DF_SEPARATE_VAR_TOO_SMALL)
+        refusals = dd.check_budget(mounts, dd.provision_needs())
+        self.assertEqual(len(refusals), 1, refusals)
+        self.assertIn("/var", refusals[0])
+
+    def test_a_single_root_box_still_sees_the_whole_total(self):
+        # check_budget sums per mount, so splitting the figure must not make
+        # a single-root box think it needs less.
+        mounts = dd.parse_df(DF_SINGLE_ROOT_NEARLY_FULL)
+        refusals = dd.check_budget(mounts, dd.provision_needs())
+        self.assertEqual(len(refusals), 1)
+        self.assertIn(dd.human_bytes(dd.PROVISION_PACKAGE_BYTES), refusals[0])
 
 
 class TestDeployPayload(unittest.TestCase):
@@ -1307,6 +1401,21 @@ class TestCmdProvision(CommandTestCase):
         # both role passwords must not outlive a failed run.
         self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
 
+    def test_a_transfer_that_dies_mid_push_still_removes_the_secrets_file(self):
+        # push_text's remote `cat >` can create the file and then have the
+        # transfer fail. With the push outside the try, the finally never
+        # ran and a partial 0600 secrets file stayed on the box.
+        ssh = self.ssh()
+
+        def exploding_push_text(text, remote, mode=""):
+            ssh.events.append(("push_text", remote))
+            raise RuntimeError("push_text failed for " + remote + ": lost")
+
+        ssh.push_text = exploding_push_text
+        with self.assertRaises(RuntimeError):
+            self.run_command(dd.cmd_provision, ["provision"], ssh=ssh)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+
     def test_it_stages_only_the_two_role_passwords(self):
         _code, ssh = self.run_command(dd.cmd_provision, ["provision"])
         self.assertEqual(len(ssh.pushed_texts), 1)
@@ -1401,6 +1510,21 @@ class TestCmdDeploy(CommandTestCase):
         # It waited the full window rather than giving up on one probe, and
         # it still cleaned the secrets file up on the way out.
         self.assertEqual(len(self.slept), dd.HEALTH_ATTEMPTS - 1)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+
+    def test_a_transfer_that_dies_mid_push_still_removes_the_secrets_file(self):
+        # push_text's remote `cat >` can create the file and then have the
+        # transfer fail. With the push outside the try, the finally never
+        # ran and a partial 0600 secrets file stayed on the box.
+        ssh = self.ssh()
+
+        def exploding_push_text(text, remote, mode=""):
+            ssh.events.append(("push_text", remote))
+            raise RuntimeError("push_text failed for " + remote + ": lost")
+
+        ssh.push_text = exploding_push_text
+        with self.assertRaises(RuntimeError):
+            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
         self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
 
     def test_the_deployer_itself_is_pushed_before_the_probe_that_uses_it(self):
@@ -2048,7 +2172,7 @@ class TestDiskEvaluator(unittest.TestCase):
         space = [f for f in findings if f.severity in (dd.WARN, dd.FAIL)]
         self.assertTrue(space)
         self.assertIn("/", space[0].title)
-        self.assertIn("512.0 MB", space[0].title + space[0].detail)
+        self.assertIn("512.0 MiB", space[0].title + space[0].detail)
 
     def test_the_percentage_thresholds_separate_warn_from_fail(self):
         # Both of these have gigabytes free, so the absolute-bytes rule
