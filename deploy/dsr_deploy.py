@@ -1448,6 +1448,18 @@ def describe_url(value: str) -> str:
     return "%s:%s/%s" % (host, port, database)
 
 
+# What a collector prints instead of an answer when it could not run at all.
+# Folding stderr into stdout is what makes these visible; without it the
+# complaint is discarded and the empty result reads as a clean log, which is
+# a diagnostic asserting health on the strength of having read nothing.
+_UNREADABLE_MARKERS = ("command not found", "Permission denied", "Error opening")
+
+
+def _unreadable(text: str) -> bool:
+    """True when `text` is a collector's complaint rather than its output."""
+    return any(marker in (text or "") for marker in _UNREADABLE_MARKERS)
+
+
 def evaluate_selinux(getenforce: str, booleans: str, avc: str) -> list:
     """Read `getenforce`, `getsebool` and `ausearch` output.
 
@@ -1529,6 +1541,22 @@ def evaluate_selinux(getenforce: str, booleans: str, avc: str) -> list:
         findings.append(
             Finding(group, OK, "%s is on" % SELINUX_BOOLEAN, "", "")
         )
+
+    # Checked before the denial scan, because "Permission denied" contains
+    # the word the scan looks for.
+    if _unreadable(avc):
+        findings.append(
+            Finding(
+                group,
+                WARN,
+                "could not read the audit log",
+                "ausearch answered with an error rather than with denials, so "
+                "the absence of denials here is not evidence that there are "
+                "none. auditd may not be installed or running.",
+                "ausearch -m avc -ts recent -i",
+            )
+        )
+        return findings
 
     denials = [line for line in (avc or "").splitlines() if "denied" in line]
     if denials:
@@ -1694,7 +1722,21 @@ def evaluate_service(is_active: str, show_output: str, journal: str) -> list:
             findings.append(Finding(group, FAIL, title, detail, fix))
     if not matched:
         noisy = [line for line in text.splitlines() if _JOURNAL_ERROR.search(line)]
-        if noisy:
+        if _unreadable(text) or not text.strip():
+            # _JOURNAL_ERROR matches none of "journalctl: command not found",
+            # so without this the complaint would score zero error lines and
+            # be reported as a clean journal.
+            findings.append(
+                Finding(
+                    group,
+                    WARN,
+                    "could not read the recent journal",
+                    "journalctl returned nothing readable, so \"no errors\" "
+                    "would be a claim about a log that was never read.",
+                    "journalctl -u %s -n 50 --no-pager" % SERVICE,
+                )
+            )
+        elif noisy:
             findings.append(
                 Finding(
                     group,
@@ -2495,8 +2537,11 @@ DOCTOR_COMMANDS = (
     ("getenforce", "getenforce 2>&1"),
     ("sebool", "getsebool %s 2>&1" % SELINUX_BOOLEAN),
     # ausearch exits 1 when the audit log holds no denials, which is the good
-    # case and not an error.
-    ("avc", "ausearch -m avc -ts recent 2>/dev/null"),
+    # case and not an error -- but 2>/dev/null also swallowed `command not
+    # found` and permission errors, and the empty stdout that left behind was
+    # then reported as a clean audit log. `<no matches>` contains no "denied",
+    # so folding stderr in costs the healthy path nothing.
+    ("avc", "ausearch -m avc -ts recent 2>&1"),
     ("is_active", "systemctl is-active %s" % SERVICE),
     ("nrestarts", "systemctl show %s -p NRestarts" % SERVICE),
     ("journal", "journalctl -u %s -n 25 --no-pager 2>&1" % SERVICE),
@@ -2522,6 +2567,12 @@ DOCTOR_COMMANDS = (
     ("nginx_t", "nginx -t 2>&1"),
     ("listeners", "ss -lntp 2>&1"),
 )
+
+# Read out of band rather than through collect(), because its result feeds
+# the disk projection rather than an evaluator. A module constant so the
+# "not one collector changes anything" sweep can see it: that guarantee is
+# only worth as much as the set of commands it is allowed to look at.
+STATE_READ_COMMAND = "cat %s 2>/dev/null" % STATE_PATH
 
 
 class LocalRunner:
@@ -2633,7 +2684,7 @@ def cmd_doctor(args, runner, now_epoch=None) -> int:
     capture = collect(runner)
 
     no_state = getattr(args, "no_state", False)
-    samples = {} if no_state else parse_state(runner.run("cat %s 2>/dev/null" % STATE_PATH))
+    samples = {} if no_state else parse_state(runner.run(STATE_READ_COMMAND))
 
     findings = assemble_findings(capture, samples, now_epoch)
     selected = [group for group in DOCTOR_GROUPS if getattr(args, group, False)]

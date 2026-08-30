@@ -1182,10 +1182,25 @@ class TestSelinuxEvaluator(unittest.TestCase):
         self.assertIn("nginx", denials[0].detail)
 
     def test_no_denials_is_not_an_error(self):
-        # ausearch exits 1 and prints nothing to stdout when the audit log is
-        # clean, which is the good case.
-        findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, "")
-        self.assertTrue(all(f.severity == dd.OK for f in findings))
+        # ausearch exits 1 when the audit log is clean, printing nothing or
+        # `<no matches>`. Both are the good case.
+        for avc in ("", "<no matches>\n"):
+            findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, avc)
+            self.assertTrue(findings)
+            self.assertTrue(all(f.severity == dd.OK for f in findings), repr(avc))
+
+    def test_an_unreadable_audit_log_is_not_reported_as_no_denials(self):
+        # With stderr folded in, ausearch's own complaint is the answer. An
+        # empty read is not evidence that there are no denials.
+        for avc in (
+            "bash: ausearch: command not found\n",
+            "Error opening config file (Permission denied)\n",
+            "<no matches>\nError opening /var/log/audit/audit.log (Permission denied)\n",
+        ):
+            findings = dd.evaluate_selinux("Enforcing", SEBOOL_ON, avc)
+            audit = [f for f in findings if "audit log" in f.title]
+            self.assertEqual([f.severity for f in audit], [dd.WARN], repr(avc))
+            self.assertNotIn("no recent SELinux denials", _blob(findings), repr(avc))
 
     def test_an_unreadable_boolean_warns_rather_than_passing(self):
         findings = dd.evaluate_selinux("Enforcing", "", "")
@@ -1223,7 +1238,8 @@ class TestServiceEvaluator(unittest.TestCase):
         self.assertTrue(any(f.severity == dd.FAIL for f in findings))
 
     def test_active_with_no_restarts_is_clean(self):
-        findings = dd.evaluate_service("active", "NRestarts=0", "")
+        findings = dd.evaluate_service("active", "NRestarts=0", JOURNAL_CLEAN)
+        self.assertTrue(findings)
         self.assertTrue(all(f.severity == dd.OK for f in findings))
 
     def test_inactive_is_a_failure(self):
@@ -1259,6 +1275,19 @@ class TestServiceEvaluator(unittest.TestCase):
         )
         findings = dd.evaluate_service("inactive", "NRestarts=3", journal)
         self.assertNotIn("hunter2", _blob(findings))
+
+    def test_an_unreadable_journal_is_not_reported_as_no_errors(self):
+        # _JOURNAL_ERROR matches none of "command not found", so the
+        # complaint would otherwise score zero error lines and read clean.
+        for journal in ("", "bash: journalctl: command not found\n"):
+            findings = dd.evaluate_service("active", "NRestarts=0", journal)
+            journal_findings = [f for f in findings if "journal" in f.title]
+            self.assertEqual(
+                [f.severity for f in journal_findings], [dd.WARN], repr(journal)
+            )
+            self.assertNotIn(
+                "no errors in the recent journal", _blob(findings), repr(journal)
+            )
 
     def test_a_missing_restart_counter_does_not_crash(self):
         self.assertTrue(dd.evaluate_service("active", "", JOURNAL_CLEAN))
@@ -1308,7 +1337,9 @@ class TestEnvEvaluator(unittest.TestCase):
     )
 
     def test_a_good_env_at_mode_600_is_clean(self):
-        self.assertTrue(all(f.severity == dd.OK for f in dd.evaluate_env(self.GOOD, "600")))
+        findings = dd.evaluate_env(self.GOOD, "600")
+        self.assertTrue(findings)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
 
     def test_a_world_readable_env_is_a_failure(self):
         findings = dd.evaluate_env(self.GOOD, "644")
@@ -1322,7 +1353,9 @@ class TestEnvEvaluator(unittest.TestCase):
 
     def test_no_finding_ever_contains_the_key_itself(self):
         key = base64.b64encode(b"\x01" * 32).decode()
-        for f in dd.evaluate_env(self.GOOD, "600"):
+        findings = dd.evaluate_env(self.GOOD, "600")
+        self.assertTrue(findings)
+        for f in findings:
             self.assertNotIn(key, f.title + f.detail + f.fix)
 
     def test_no_finding_ever_contains_the_database_password(self):
@@ -1350,7 +1383,9 @@ class TestEnvEvaluator(unittest.TestCase):
             self.assertIn("127.0.0.1:5432/dsr", title)
 
     def test_a_leading_zero_mode_is_still_owner_only(self):
-        self.assertTrue(all(f.severity == dd.OK for f in dd.evaluate_env(self.GOOD, "0600")))
+        findings = dd.evaluate_env(self.GOOD, "0600")
+        self.assertTrue(findings)
+        self.assertTrue(all(f.severity == dd.OK for f in findings))
 
     def test_a_missing_setting_is_named(self):
         text = "\n".join(
@@ -1524,8 +1559,10 @@ class TestDiskEvaluator(unittest.TestCase):
         self.assertEqual([f.severity for f in snug], [dd.WARN])
 
     def test_a_small_disk_is_judged_on_bytes_not_only_on_percentage(self):
-        # Both of these are comfortable by percentage and cramped in
-        # absolute terms: an npm install needs room, not a share.
+        # Neither disk can be separated by percentage alone: 19% free of
+        # 8 GB is a WARN by bytes but comfortably above the 15% line, and
+        # 9.8% free of 4 GB is a FAIL by bytes where percentage alone would
+        # only warn. The absolute rule is what decides both.
         warn = [f for f in dd.evaluate_disk(DF_SMALL_WARN, {}) if f.severity != dd.OK]
         self.assertEqual([f.severity for f in warn], [dd.WARN])
         fail = [f for f in dd.evaluate_disk(DF_SMALL_FAIL, {}) if f.severity != dd.OK]
@@ -1896,8 +1933,18 @@ class TestDoctorCommands(unittest.TestCase):
         ):
             self.assertIn(expected, blob, "doctor never runs %s" % expected)
 
+    def test_the_audit_and_journal_collectors_keep_their_stderr(self):
+        # Discarding stderr turns "command not found" into an empty answer,
+        # which the evaluators would then read as a clean log.
+        commands = dict(dd.DOCTOR_COMMANDS)
+        for name in ("avc", "journal"):
+            self.assertIn("2>&1", commands[name], name)
+            self.assertNotIn("2>/dev/null", commands[name], name)
+
     def test_not_one_collector_changes_anything(self):
-        for name, command in dd.DOCTOR_COMMANDS:
+        # The state read is included: it is a command this tool runs on the
+        # box, so the guarantee has to cover it too.
+        for name, command in dd.DOCTOR_COMMANDS + (("state", dd.STATE_READ_COMMAND),):
             for forbidden in (
                 "systemctl restart",
                 "systemctl start",
