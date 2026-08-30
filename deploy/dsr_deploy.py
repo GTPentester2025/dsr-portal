@@ -266,6 +266,10 @@ def project_days_until_full(samples: list, free_now: int) -> float:
 
 
 MANAGED_MARKER = "# managed by dsr_deploy"
+PG_HBA_MARKER = (
+    MANAGED_MARKER + " -- loopback host rules set to scram-sha-256; "
+    "the file as it was is beside this one, as pg_hba.conf.orig"
+)
 
 # Loopback, written every way pg_hba accepts. `localhost` and `samehost` are
 # names postgres resolves itself, and a rule using either is as much the
@@ -357,7 +361,18 @@ def rewrite_pg_hba(text: str) -> tuple:
 
     Replication rows are left alone: they are not how the portal connects,
     and changing them is not this tool's business.
+
+    A changed file gets MANAGED_MARKER as its first line, and a file that
+    already carries the marker is returned untouched. Idempotency was
+    already held by a different mechanism -- scram-sha-256 is not in the
+    weak-method set, so a second pass matches nothing -- so what the marker
+    adds is the operator-facing half the spec asks for: without it nothing
+    in pg_hba.conf says this tool edited it, and the .orig beside it is the
+    only clue.
     """
+    if MANAGED_MARKER in text:
+        return text, False
+
     out = []
     changed = False
     for line in text.splitlines():
@@ -376,10 +391,12 @@ def rewrite_pg_hba(text: str) -> tuple:
                 changed = True
                 continue
         out.append(line)
-    result = "\n".join(out)
+    if not changed:
+        return text, False
+    result = "\n".join([PG_HBA_MARKER] + out)
     if text.endswith("\n"):
         result += "\n"
-    return result, changed
+    return result, True
 
 
 _SERVER_OPENER = re.compile(r"^server\b")
@@ -652,6 +669,26 @@ def _cat_heredoc_command(
     return "cat > %s <<%s\n%s%s" % (remote_path, opener, content, marker)
 
 
+def shipped_text(path) -> str:
+    """Read a file this tool ships beside itself and pushes to the box.
+
+    deploy_steps embeds the unit file and nginx.conf in its commands, so
+    even `--dry-run` reads them from disk. A missing one raised
+    FileNotFoundError straight out of main, which showed a traceback to an
+    operator who had only asked what would happen. An incomplete checkout is
+    a refusal like any other, and it says which file.
+    """
+    try:
+        return pathlib.Path(path).read_text()
+    except OSError as exc:
+        raise Refusal(
+            "FATAL: %s is missing from this checkout (%s).\n"
+            "       It ships beside the deployer and is written to the box\n"
+            "       verbatim, so there is nothing to deploy without it."
+            % (path, exc.strerror or exc)
+        )
+
+
 def atomic_write(path: str, text: str) -> None:
     """Replace a file's contents without ever leaving it truncated.
 
@@ -840,18 +877,28 @@ def provision_steps() -> list:
             # same guarantee -- the first failure stops the step -- across
             # all four statements.
             _source_secrets()
+            # shell_quote protects the shell layer; nothing protected the
+            # SQL layer. An apostrophe in DB_PASS closed the string literal,
+            # psql failed, and psql echoes the offending statement back in
+            # its `LINE n:` context -- which step_failure_message then
+            # prints verbatim, password and all. Doubling the quote is the
+            # SQL escape, done once here rather than four times below.
+            + "DB_PASS_SQL=${DB_PASS:?DB_PASS required}\n"
+            "DB_PASS_SQL=${DB_PASS_SQL//\\'/\\'\\'}\n"
+            "APP_PASS_SQL=${APP_PASS:?APP_PASS required}\n"
+            "APP_PASS_SQL=${APP_PASS_SQL//\\'/\\'\\'}\n"
             + "sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL\n"
             "DO \\$\\$\n"
             "BEGIN\n"
             "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'dsr') THEN\n"
-            "    CREATE ROLE dsr LOGIN PASSWORD '${DB_PASS:?DB_PASS required}';\n"
+            "    CREATE ROLE dsr LOGIN PASSWORD '${DB_PASS_SQL}';\n"
             "  ELSE\n"
-            "    ALTER ROLE dsr PASSWORD '${DB_PASS:?DB_PASS required}';\n"
+            "    ALTER ROLE dsr PASSWORD '${DB_PASS_SQL}';\n"
             "  END IF;\n"
             "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'dsr_app') THEN\n"
-            "    CREATE ROLE dsr_app LOGIN PASSWORD '${APP_PASS:?APP_PASS required}';\n"
+            "    CREATE ROLE dsr_app LOGIN PASSWORD '${APP_PASS_SQL}';\n"
             "  ELSE\n"
-            "    ALTER ROLE dsr_app PASSWORD '${APP_PASS:?APP_PASS required}';\n"
+            "    ALTER ROLE dsr_app PASSWORD '${APP_PASS_SQL}';\n"
             "  END IF;\n"
             "END\n"
             "\\$\\$;\n"
@@ -891,7 +938,12 @@ def provision_steps() -> list:
             _backup_once(NGINX_MAIN_CONF_REMOTE)
             + " && "
             + _remote_text_fix(NGINX_MAIN_CONF_REMOTE, "neutralise_default_server")
-            + " && systemctl enable --now nginx",
+            # `nginx -t` before the service is started, not after: the step
+            # above just edited nginx.conf, and starting nginx on a config
+            # it will not parse reports a systemd failure that names the
+            # unit rather than the line. deploy_steps already orders it this
+            # way.
+            + " && nginx -t && systemctl enable --now nginx",
         ),
         Step(
             "firewalld: open ssh, http, https",
@@ -1099,10 +1151,12 @@ def deploy_steps(env: dict) -> list:
             # one's exit code is the step's, and a unit file that never
             # landed would be reported as installed.
             "set -e\n"
-            + _cat_heredoc_command(UNIT_REMOTE, UNIT_FILE_LOCAL.read_text(), "DSR_UNIT_EOF")
+            + _cat_heredoc_command(
+                UNIT_REMOTE, shipped_text(UNIT_FILE_LOCAL), "DSR_UNIT_EOF"
+            )
             + "\n"
             + _cat_heredoc_command(
-                NGINX_SITE_CONF_REMOTE, NGINX_CONF_LOCAL.read_text(), "DSR_NGINX_EOF"
+                NGINX_SITE_CONF_REMOTE, shipped_text(NGINX_CONF_LOCAL), "DSR_NGINX_EOF"
             ),
         ),
         Step(
@@ -2864,8 +2918,9 @@ def target_ssh():
     """(Ssh, host) from deploy/.target.env, or a refusal naming the file."""
     if not TARGET_ENV_LOCAL.exists():
         raise SecretsError(
-            "No ssh target. Copy deploy/target.example.env to deploy/.target.env, "
-            "or run this on the box itself with --remote."
+            "No ssh target. Copy deploy/target.example.env to deploy/.target.env "
+            "and fill in HOST. (To read a box you are already logged in to, run "
+            "`doctor --remote` there; provision and deploy always work over ssh.)"
         )
     target = load_target(TARGET_ENV_LOCAL.read_text())
     host = (target.get("HOST") or "").strip()
@@ -3103,10 +3158,13 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="print what would happen, touch nothing",
         )
-        # Internal: how the local half invokes the copy it pushed to the box.
-        # Hidden because an operator never types it.
-        p.add_argument("--remote", action="store_true", help=argparse.SUPPRESS)
         if name == "doctor":
+            # Internal: how the local half invokes the copy it pushed to the
+            # box. Hidden because an operator never types it, and only on
+            # doctor because only doctor has a local runner. provision and
+            # deploy accepted it and then died on target_ssh's "No ssh
+            # target", which is the least useful way to say "not supported".
+            p.add_argument("--remote", action="store_true", help=argparse.SUPPRESS)
             p.add_argument(
                 "--no-state",
                 action="store_true",

@@ -19,6 +19,33 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import dsr_deploy as dd
 
 
+def is_ancestor_of(candidate: str, path: str) -> bool:
+    """True when `candidate` is `path` or a directory containing it.
+
+    push_dir mirrors a directory by removing its destination first, so a
+    payload entry targeting /opt/dsr destroys /opt/dsr/uploads without the
+    string "uploads" appearing anywhere in it.
+    """
+    candidate = candidate.rstrip("/")
+    return path == candidate or path.startswith(candidate + "/")
+
+
+class TestUploadsAncestry(unittest.TestCase):
+    """Holds is_ancestor_of up, so the payload tests below cannot pass by
+    calling a helper that always answers False."""
+
+    def test_the_path_itself_and_its_parents_count(self):
+        self.assertTrue(is_ancestor_of("/opt/dsr/uploads", dd.UPLOADS_DIR))
+        self.assertTrue(is_ancestor_of("/opt/dsr/uploads/", dd.UPLOADS_DIR))
+        self.assertTrue(is_ancestor_of("/opt/dsr", dd.UPLOADS_DIR))
+        self.assertTrue(is_ancestor_of("/", dd.UPLOADS_DIR))
+
+    def test_a_sibling_or_a_child_does_not(self):
+        self.assertFalse(is_ancestor_of("/opt/dsr/server/dist", dd.UPLOADS_DIR))
+        self.assertFalse(is_ancestor_of("/opt/dsrx", dd.UPLOADS_DIR))
+        self.assertFalse(is_ancestor_of("/var/www/dsr/admin", dd.UPLOADS_DIR))
+
+
 class TestCli(unittest.TestCase):
     def test_commands_are_the_three_the_spec_names(self):
         for command in ("provision", "deploy", "doctor"):
@@ -39,6 +66,24 @@ class TestCli(unittest.TestCase):
         subparsers_action = dd.build_parser()._subparsers._group_actions[0]
         doctor_help = subparsers_action.choices["doctor"].format_help()
         self.assertNotIn("--remote", doctor_help)
+
+    def test_remote_is_a_doctor_only_flag(self):
+        # provision --remote and deploy --remote used to parse and then die
+        # on target_ssh's "No ssh target", because nothing but doctor has a
+        # local runner. Rejecting them at the parser says so at once.
+        for command in ("provision", "deploy"):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    dd.build_parser().parse_args([command, "--remote"])
+
+    def test_the_missing_target_message_names_the_command_that_takes_remote(self):
+        missing = pathlib.Path(tempfile.gettempdir()) / "dsr-no-such-target.env"
+        with unittest.mock.patch.object(dd, "TARGET_ENV_LOCAL", missing):
+            with self.assertRaises(dd.SecretsError) as caught:
+                dd.target_ssh()
+        message = str(caught.exception)
+        self.assertIn(".target.env", message)
+        self.assertIn("doctor --remote", message)
 
     def test_doctor_takes_no_state_and_group_filters(self):
         args = dd.build_parser().parse_args(["doctor", "--no-state", "--disk"])
@@ -279,8 +324,43 @@ host    replication     all             127.0.0.1/32            ident
 
 
 class TestPgHba(unittest.TestCase):
+    @staticmethod
+    def body(text):
+        """rewrite_pg_hba's output with the managed-marker header split off.
+
+        The marker is the operator-facing half of the spec's promise --
+        nothing in pg_hba.conf said this tool had edited it -- and every
+        assertion below is about the rules underneath it.
+        """
+        new, changed = dd.rewrite_pg_hba(text)
+        if changed:
+            assert new.startswith(dd.PG_HBA_MARKER + "\n"), new[:80]
+            return new.split("\n", 1)[1], changed
+        return new, changed
+
+    def test_a_changed_file_says_who_changed_it(self):
+        new, changed = dd.rewrite_pg_hba("host all all 127.0.0.1/32 ident\n")
+        self.assertTrue(changed)
+        self.assertTrue(new.startswith(dd.MANAGED_MARKER))
+        self.assertIn("pg_hba.conf.orig", new.splitlines()[0])
+
+    def test_an_unchanged_file_gains_no_marker(self):
+        text = "host all all 127.0.0.1/32 scram-sha-256\n"
+        new, changed = dd.rewrite_pg_hba(text)
+        self.assertFalse(changed)
+        self.assertNotIn(dd.MANAGED_MARKER, new)
+
+    def test_a_marked_file_is_left_entirely_alone(self):
+        # Even one that has since had a weak rule added by hand: this tool
+        # has said its piece about the file, and re-editing a file an
+        # operator has taken over is not its business.
+        text = dd.PG_HBA_MARKER + "\nhost all all 127.0.0.1/32 md5\n"
+        new, changed = dd.rewrite_pg_hba(text)
+        self.assertFalse(changed)
+        self.assertEqual(new, text)
+
     def test_loopback_ident_becomes_scram(self):
-        new, changed = dd.rewrite_pg_hba(PG_HBA_RHEL_DEFAULT)
+        new, changed = self.body(PG_HBA_RHEL_DEFAULT)
         self.assertTrue(changed)
         for line in new.splitlines():
             if (
@@ -292,11 +372,11 @@ class TestPgHba(unittest.TestCase):
                 self.assertNotIn("ident", line)
 
     def test_local_peer_line_is_left_alone(self):
-        new, _ = dd.rewrite_pg_hba(PG_HBA_RHEL_DEFAULT)
+        new, _ = self.body(PG_HBA_RHEL_DEFAULT)
         self.assertIn("local   all             all                                     peer", new)
 
     def test_replication_line_is_left_alone(self):
-        new, _ = dd.rewrite_pg_hba(PG_HBA_RHEL_DEFAULT)
+        new, _ = self.body(PG_HBA_RHEL_DEFAULT)
         replication = [l for l in new.splitlines() if "replication" in l][0]
         self.assertIn("ident", replication)
 
@@ -319,7 +399,7 @@ class TestPgHba(unittest.TestCase):
         self.assertEqual(new, text)
 
     def test_md5_is_also_upgraded(self):
-        new, changed = dd.rewrite_pg_hba("host all all 127.0.0.1/32 md5\n")
+        new, changed = self.body("host all all 127.0.0.1/32 md5\n")
         self.assertTrue(changed)
         self.assertIn("scram-sha-256", new)
 
@@ -329,25 +409,25 @@ class TestPgHba(unittest.TestCase):
     # the symptom names the file.
 
     def test_the_plain_cidr_rule_is_rewritten(self):
-        new, changed = dd.rewrite_pg_hba("host all all 127.0.0.1/32 ident\n")
+        new, changed = self.body("host all all 127.0.0.1/32 ident\n")
         self.assertTrue(changed)
         self.assertEqual(new, "host all all 127.0.0.1/32 scram-sha-256\n")
 
     def test_a_trailing_comment_does_not_hide_the_method(self):
-        new, changed = dd.rewrite_pg_hba("host all all 127.0.0.1/32 ident  # legacy\n")
+        new, changed = self.body("host all all 127.0.0.1/32 ident  # legacy\n")
         self.assertTrue(changed)
         self.assertIn("scram-sha-256", new)
         self.assertIn("# legacy", new)
 
     def test_a_trailing_option_does_not_hide_the_method(self):
-        new, changed = dd.rewrite_pg_hba(
+        new, changed = self.body(
             "host all all 127.0.0.1/32 md5 clientcert=verify-full\n"
         )
         self.assertTrue(changed)
         self.assertIn("scram-sha-256 clientcert=verify-full", new)
 
     def test_the_address_netmask_form_counts_as_loopback(self):
-        new, changed = dd.rewrite_pg_hba(
+        new, changed = self.body(
             "host all all 127.0.0.1 255.255.255.255 ident\n"
         )
         self.assertTrue(changed)
@@ -355,7 +435,7 @@ class TestPgHba(unittest.TestCase):
 
     def test_localhost_and_samehost_count_as_loopback(self):
         for address in ("localhost", "samehost"):
-            new, changed = dd.rewrite_pg_hba("host all all %s ident\n" % address)
+            new, changed = self.body("host all all %s ident\n" % address)
             self.assertTrue(changed, address)
             self.assertIn("scram-sha-256", new)
 
@@ -395,7 +475,7 @@ class TestPgHba(unittest.TestCase):
 
     def test_every_tcp_connection_type_is_rewritten(self):
         for kind in ("host", "hostssl", "hostnossl"):
-            new, changed = dd.rewrite_pg_hba("%s all all 127.0.0.1/32 ident\n" % kind)
+            new, changed = self.body("%s all all 127.0.0.1/32 ident\n" % kind)
             self.assertTrue(changed, kind)
             self.assertEqual(new, "%s all all 127.0.0.1/32 scram-sha-256\n" % kind)
 
@@ -415,14 +495,17 @@ class TestPgHba(unittest.TestCase):
                 ("%s all all samehost md5" % kind, "scram-sha-256"),
                 ("%s all all ::1/128 ident" % kind, "scram-sha-256"),
             ):
-                new, changed = dd.rewrite_pg_hba(line + "\n")
+                new, changed = self.body(line + "\n")
                 self.assertTrue(changed, line)
                 self.assertIn("scram-sha-256", new, line)
                 self.assertIn(expected, new, line)
                 self.assertTrue(new.startswith(kind), line)
-                twice, again = dd.rewrite_pg_hba(new)
+                # Idempotency is checked on the real output, marker and
+                # all: the marker is now what stops the second pass.
+                marked, _ = dd.rewrite_pg_hba(line + "\n")
+                twice, again = dd.rewrite_pg_hba(marked)
                 self.assertFalse(again, line)
-                self.assertEqual(new, twice, line)
+                self.assertEqual(marked, twice, line)
 
     def test_replication_is_left_alone_for_every_tcp_connection_type(self):
         for kind in ("host", "hostssl", "hostnossl"):
@@ -452,7 +535,7 @@ class TestPgHba(unittest.TestCase):
         self.assertEqual(new, text)
 
     def test_column_alignment_survives_the_rewrite(self):
-        new, _ = dd.rewrite_pg_hba(
+        new, _ = self.body(
             "host    all             all             127.0.0.1/32            ident\n"
         )
         self.assertEqual(
@@ -674,6 +757,33 @@ class TestPlans(unittest.TestCase):
                 "instead." % (step.name, match.group(0) if match else ""),
             )
 
+    def test_the_role_sql_escapes_the_password_for_sql_not_just_for_the_shell(self):
+        # shell_quote protects the shell layer. Nothing protected the SQL
+        # layer: an apostrophe closed the string literal, psql failed, and
+        # psql echoes the offending statement in its `LINE n:` context --
+        # which step_failure_message prints verbatim, password and all.
+        step = [s for s in dd.provision_steps() if "role" in s.name][0]
+        doubling = "//\\'/\\'\\'}"
+        self.assertIn("DB_PASS_SQL=${DB_PASS_SQL" + doubling, step.command)
+        self.assertIn("APP_PASS_SQL=${APP_PASS_SQL" + doubling, step.command)
+
+    def test_no_sql_password_literal_interpolates_the_raw_value(self):
+        step = [s for s in dd.provision_steps() if "role" in s.name][0]
+        literals = [l for l in step.command.splitlines() if "PASSWORD '" in l]
+        self.assertEqual(len(literals), 4)
+        for line in literals:
+            self.assertIn("_SQL}", line, line)
+            self.assertNotIn("${DB_PASS}", line)
+            self.assertNotIn("${APP_PASS}", line)
+            self.assertNotIn(":?", line)
+
+    def test_the_required_check_moved_up_rather_than_being_dropped(self):
+        # `${DB_PASS:?}` was what stopped an empty password reaching the
+        # role; it now guards the assignment instead of the SQL.
+        step = [s for s in dd.provision_steps() if "role" in s.name][0]
+        self.assertIn("DB_PASS_SQL=${DB_PASS:?DB_PASS required}", step.command)
+        self.assertIn("APP_PASS_SQL=${APP_PASS:?APP_PASS required}", step.command)
+
     def test_provision_turns_the_proxy_boolean_on(self):
         blob = " ".join(s.command for s in dd.provision_steps())
         self.assertIn("httpd_can_network_connect", blob)
@@ -708,9 +818,15 @@ class TestPlans(unittest.TestCase):
     def test_no_payload_destination_is_the_uploads_directory(self):
         # push_dir mirrors by removing the destination first, so this is the
         # other way uploads could be deleted without a step ever saying rm.
+        # Substring matching is not enough: a future entry pushing to
+        # /opt/dsr would take the identity documents with it while
+        # containing no "uploads" at all.
         for item in dd.deploy_payload("/repo"):
             self.assertIsNone(self.DESTRUCTIVE_NEAR_UPLOADS.search(item.remote))
-            self.assertNotIn("uploads", item.remote)
+            self.assertFalse(
+                is_ancestor_of(item.remote, dd.UPLOADS_DIR),
+                "%s is %s or contains it" % (item.remote, dd.UPLOADS_DIR),
+            )
 
     def test_deploy_migrates_before_it_restarts(self):
         names = [s.name for s in dd.deploy_steps({"EMAIL_PROVIDER": "console"})]
@@ -734,6 +850,17 @@ class TestPlans(unittest.TestCase):
     def test_the_pg_hba_step_joins_its_reload_with_and(self):
         step = [s for s in dd.provision_steps() if "pg_hba" in s.name][0]
         self.assertIn("&& systemctl reload postgresql", step.command)
+
+    def test_nginx_is_validated_before_it_is_started(self):
+        # The step just edited nginx.conf. Starting nginx on a config it
+        # cannot parse reports a systemd failure naming the unit, not the
+        # line. deploy_steps already orders it this way.
+        step = [s for s in dd.provision_steps() if s.name.startswith("nginx")][0]
+        self.assertIn("nginx -t", step.command)
+        self.assertLess(
+            step.command.index("nginx -t"),
+            step.command.index("systemctl enable --now nginx"),
+        )
 
     def test_the_initdb_step_joins_its_enable_with_and(self):
         step = [s for s in dd.provision_steps() if "initdb" in s.name][0]
@@ -774,6 +901,26 @@ class TestPlans(unittest.TestCase):
         for step in rewrites:
             self.assertIn("atomic_write", step.command, step.name)
             self.assertNotIn("write_text", step.command, step.name)
+
+    def test_a_missing_shipped_file_is_a_refusal_not_a_traceback(self):
+        # deploy_steps embeds nginx.conf and the unit file, so --dry-run
+        # reads them too, and a missing one raised FileNotFoundError out of
+        # main at an operator who had only asked what would happen.
+        missing = pathlib.Path(tempfile.gettempdir()) / "dsr-no-such-nginx.conf"
+        with unittest.mock.patch.object(dd, "NGINX_CONF_LOCAL", missing):
+            with self.assertRaises(dd.Refusal) as caught:
+                dd.deploy_steps({})
+        self.assertIn("dsr-no-such-nginx.conf", str(caught.exception))
+
+    def test_main_turns_a_missing_shipped_file_into_an_exit_code(self):
+        missing = pathlib.Path(tempfile.gettempdir()) / "dsr-no-such-unit.service"
+        err = io.StringIO()
+        with unittest.mock.patch.object(dd, "UNIT_FILE_LOCAL", missing):
+            with contextlib.redirect_stderr(err):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = dd.main(["deploy", "--dry-run"])
+        self.assertEqual(code, 1)
+        self.assertIn("dsr-no-such-unit.service", err.getvalue())
 
     def test_render_plan_numbers_the_steps_and_shows_commands(self):
         text = dd.render_plan([dd.Step("do a thing", "echo hi")])
@@ -1127,9 +1274,13 @@ class TestDeployPayload(unittest.TestCase):
 
     def test_nothing_is_ever_pushed_over_the_uploads_directory(self):
         # push_dir mirrors by removing the destination first, so a payload
-        # entry pointing at uploads would delete regulatory records.
+        # entry pointing at uploads -- or at any directory above it --
+        # would delete regulatory records.
         for item in self.payload():
-            self.assertNotIn("uploads", item.remote)
+            self.assertFalse(
+                is_ancestor_of(item.remote, dd.UPLOADS_DIR),
+                "%s is %s or contains it" % (item.remote, dd.UPLOADS_DIR),
+            )
 
     def test_every_destination_is_under_a_path_this_tool_owns(self):
         for item in self.payload():
