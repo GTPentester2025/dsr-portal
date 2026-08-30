@@ -4217,6 +4217,108 @@ class TestDoctorAssembly(unittest.TestCase):
         self.assertEqual(set(dd.DOCTOR_GROUPS), {f.group for f in findings})
 
 
+class TestEveryEvaluatorReachesTheAssembledReport(unittest.TestCase):
+    """Closes a hole a mutation sweep found: seven of the thirteen
+    evaluate_* calls could be deleted from assemble_findings and the whole
+    suite stayed green. The healthy-box tests above pass by checking for
+    the *absence* of anything worse than OK -- and deleting a call removes
+    findings without adding a bad one, so they cannot see the deletion.
+
+    Two properties are checked, deliberately kept separate, because either
+    can hold without the other:
+
+    1. Every evaluate_* function defined in the module is called somewhere
+       inside assemble_findings (a static AST fact -- discovered, not
+       hard-coded, so a future evaluator is covered automatically).
+    2. Every one of those calls actually contributes to the assembled
+       report. A call is not enough on its own: `evaluate_x(...)` as a
+       bare expression, or a result computed and never folded into
+       `findings`, would satisfy property 1 while still hiding a whole
+       category of checks from the operator who runs `doctor`.
+    """
+
+    def source(self):
+        return pathlib.Path(dd.__file__).read_text(encoding="utf-8")
+
+    def evaluator_names(self):
+        tree = ast.parse(self.source())
+        names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("evaluate_")
+        }
+        # A discovery step that finds nothing would make both tests below
+        # pass vacuously.
+        self.assertTrue(names, "found no evaluate_* functions in dsr_deploy.py")
+        return names
+
+    def test_every_evaluate_function_is_called_inside_assemble_findings(self):
+        tree = ast.parse(self.source())
+        evaluators = self.evaluator_names()
+        called = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "assemble_findings":
+                for call in ast.walk(node):
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                        called.add(call.func.id)
+        missing = evaluators - called
+        self.assertEqual(
+            missing,
+            set(),
+            "assemble_findings never calls: %s" % ", ".join(sorted(missing)),
+        )
+
+    def test_every_evaluators_findings_land_in_the_assembled_report(self):
+        # A static call is not enough -- see the class docstring. Wrap every
+        # evaluate_* function in place so each one records what it actually
+        # returned, then let assemble_findings run for real. The wrapping
+        # works because assemble_findings looks `evaluate_host` (etc.) up as
+        # a module global at call time, not at definition time -- replacing
+        # dd.evaluate_host here is exactly what assemble_findings sees.
+        #
+        # Nothing here reimplements how assemble_findings turns a capture
+        # into each evaluator's arguments; the real function does that, with
+        # a real healthy capture, so this cannot drift from what doctor
+        # actually runs.
+        names = self.evaluator_names()
+        recorded = []
+        originals = {name: getattr(dd, name) for name in names}
+
+        def make_wrapper(name, original):
+            def wrapper(*args, **kwargs):
+                result = original(*args, **kwargs)
+                recorded.append((name, list(result)))
+                return result
+
+            return wrapper
+
+        for name in names:
+            setattr(dd, name, make_wrapper(name, originals[name]))
+        try:
+            capture = dd.collect(FakeRunner(HEALTHY_REPLIES))
+            findings = dd.assemble_findings(capture, {}, NOW)
+        finally:
+            for name, original in originals.items():
+                setattr(dd, name, original)
+
+        called = {name for name, _ in recorded}
+        missing = names - called
+        self.assertEqual(
+            missing,
+            set(),
+            "assemble_findings ran without calling: %s" % ", ".join(sorted(missing)),
+        )
+
+        for name, evaluator_findings in recorded:
+            for finding in evaluator_findings:
+                self.assertIn(
+                    finding,
+                    findings,
+                    "%s's finding %r never reached the assembled report"
+                    % (name, finding.title),
+                )
+
+
 class TestCmdDoctor(unittest.TestCase):
     def run_doctor(self, argv, replies=HEALTHY_REPLIES):
         args = dd.build_parser().parse_args(argv)
