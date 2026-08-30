@@ -290,9 +290,14 @@ _WEAK_METHODS = ("ident", "md5", "trust", "password")
 # whether the rule uses CIDR or the older `address netmask` pair.
 _ADDRESS_FIELD = 3
 
-# The three TCP connection types pg_hba.conf accepts. `local` is a unix
-# socket and stays on peer; the portal connects over TCP to 127.0.0.1.
-_HOST_TYPES = ("host", "hostssl", "hostnossl")
+# Every TCP connection type pg_hba.conf accepts. `local` is a unix socket
+# and stays on peer; the portal connects over TCP to 127.0.0.1.
+#
+# hostgssenc and hostnogssenc are here because they are host rules too: on a
+# box where one of them covers 127.0.0.1 with `ident`, leaving it alone
+# leaves the API authenticating against nothing, which is the exact failure
+# the rewrite exists to prevent.
+_HOST_TYPES = ("host", "hostssl", "hostnossl", "hostgssenc", "hostnogssenc")
 
 
 def _split_comment(line: str) -> tuple:
@@ -1208,9 +1213,14 @@ DEFAULT_SECRETS_NAME = ".secrets.blr.env"
 # What deploy actually spends under the install prefix. Numbers from the
 # spec's refusal example; the host has ~10 GB and is mostly full, so this
 # refusal is a path an operator will really take.
-DEPLOY_NODE_MODULES_BYTES = 310 * 1000 * 1000
-DEPLOY_DIST_BYTES = 40 * 1000 * 1000
-DEPLOY_TRANSFER_HEADROOM_BYTES = 70 * 1000 * 1000
+#
+# 1024-based, because human_bytes is: as `* 1000 * 1000` the breakdown an
+# operator reads said "node_modules ~295.6 MiB" under a constant named 310,
+# and a refusal that disagrees with its own source is a refusal nobody can
+# check.
+DEPLOY_NODE_MODULES_BYTES = 310 * 1024 * 1024
+DEPLOY_DIST_BYTES = 40 * 1024 * 1024
+DEPLOY_TRANSFER_HEADROOM_BYTES = 70 * 1024 * 1024
 DEPLOY_BYTES = (
     DEPLOY_NODE_MODULES_BYTES + DEPLOY_DIST_BYTES + DEPLOY_TRANSFER_HEADROOM_BYTES
 )

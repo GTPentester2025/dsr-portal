@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import collections
 import contextlib
@@ -44,6 +45,167 @@ class TestUploadsAncestry(unittest.TestCase):
         self.assertFalse(is_ancestor_of("/opt/dsr/server/dist", dd.UPLOADS_DIR))
         self.assertFalse(is_ancestor_of("/opt/dsrx", dd.UPLOADS_DIR))
         self.assertFalse(is_ancestor_of("/var/www/dsr/admin", dd.UPLOADS_DIR))
+
+
+# ---------------------------------------------------------------------------
+# The Python 3.9 target, enforced rather than reviewed
+# ---------------------------------------------------------------------------
+
+# RHEL 9 ships Python 3.9 as /usr/bin/python3, and this file is developed and
+# tested on a much newer interpreter. That gap has been held closed by
+# reviewers reading carefully, which is not a mechanism: one 3.10-only
+# construct makes `import dsr_deploy` raise on every real RHEL 9 box while
+# this suite stays green and --dry-run looks perfect, because neither ever
+# runs on 3.9.
+#
+# ast.parse(feature_version=(3, 9)) is the parser refusing grammar 3.9 does
+# not have. The walk below covers what parses everywhere and only exists
+# later: modules, attributes and names added after 3.9.
+
+PY39_FORBIDDEN_MODULES = ("tomllib", "graphlib")
+
+# (module, attribute) pairs. Written as a module attribute rather than a
+# bare name so `hashlib.file_digest` is caught and a local variable called
+# file_digest is not.
+PY39_FORBIDDEN_ATTRIBUTES = (
+    ("datetime", "UTC"),
+    ("hashlib", "file_digest"),
+    ("itertools", "pairwise"),
+)
+
+PY39_FORBIDDEN_NAMES = ("ExceptionGroup", "BaseExceptionGroup")
+
+
+def python39_violations(source: str) -> list:
+    """Everything in `source` that Python 3.9 could not run. [] when clean."""
+    try:
+        tree = ast.parse(source, feature_version=(3, 9))
+    except SyntaxError as error:
+        return ["line %s: %s" % (error.lineno, error.msg)]
+
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in PY39_FORBIDDEN_MODULES:
+                    found.append("line %d: imports %s" % (node.lineno, root))
+        elif isinstance(node, ast.ImportFrom):
+            module = (node.module or "").split(".")[0]
+            if module in PY39_FORBIDDEN_MODULES:
+                found.append("line %d: imports from %s" % (node.lineno, module))
+            for alias in node.names:
+                if (module, alias.name) in PY39_FORBIDDEN_ATTRIBUTES:
+                    found.append(
+                        "line %d: imports %s.%s" % (node.lineno, module, alias.name)
+                    )
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name):
+                if (node.value.id, node.attr) in PY39_FORBIDDEN_ATTRIBUTES:
+                    found.append(
+                        "line %d: uses %s.%s"
+                        % (node.lineno, node.value.id, node.attr)
+                    )
+        elif isinstance(node, ast.Name):
+            if node.id in PY39_FORBIDDEN_NAMES:
+                found.append("line %d: uses %s" % (node.lineno, node.id))
+    return found
+
+
+# Hand-written samples of each thing the check is meant to reject, so the
+# check is provably able to fail without anyone editing the deployer.
+PY39_REJECTS = (
+    ("a match statement", "def f(x):\n    match x:\n        case 1:\n            return 2\n"),
+    ("an except* clause", "try:\n    pass\nexcept* ValueError:\n    pass\n"),
+    ("a generic type parameter list", "def f[T](x: T) -> T:\n    return x\n"),
+    ("import tomllib", "import tomllib\n"),
+    ("import graphlib", "import graphlib\n"),
+    ("from graphlib import", "from graphlib import TopologicalSorter\n"),
+    ("datetime.UTC", "import datetime\nnow = datetime.datetime.now(datetime.UTC)\n"),
+    ("from datetime import UTC", "from datetime import UTC\n"),
+    ("hashlib.file_digest", "import hashlib\nd = hashlib.file_digest(f, 'sha256')\n"),
+    ("itertools.pairwise", "import itertools\nps = list(itertools.pairwise([1, 2]))\n"),
+    ("ExceptionGroup", "raise ExceptionGroup('boom', [ValueError()])\n"),
+    ("BaseExceptionGroup", "def f(e):\n    return isinstance(e, BaseExceptionGroup)\n"),
+)
+
+PY39_ACCEPTS = (
+    ("a dict merge, which is 3.9 itself", "a = {}\nb = {}\nc = a | b\n"),
+    ("a walrus", "if (n := 3) > 2:\n    pass\n"),
+    ("f-strings and comprehensions", "xs = [f'{i}' for i in range(3)]\n"),
+    ("a local named pairwise", "def pairwise(xs):\n    return xs\n"),
+    ("a local named file_digest", "file_digest = 1\n"),
+    ("str.removeprefix, added in 3.9", "s = 'ab'.removeprefix('a')\n"),
+)
+
+
+class TestPython39Target(unittest.TestCase):
+    """The deployer must import on RHEL 9's stock interpreter.
+
+    This is the only coupling in the sub-project that a green suite and a
+    clean --dry-run cannot detect, because both run on the developer's
+    interpreter and neither ever runs on 3.9.
+    """
+
+    def source(self):
+        with io.open(dd.__file__, "r", encoding="utf-8", newline="") as handle:
+            return handle.read()
+
+    def test_the_deployer_is_clean(self):
+        self.assertEqual(python39_violations(self.source()), [])
+
+    def test_the_deployer_parses_under_the_39_grammar(self):
+        # Separately from the walk, because a SyntaxError short-circuits it:
+        # a file that will not parse must fail loudly and by itself.
+        try:
+            ast.parse(self.source(), feature_version=(3, 9))
+        except SyntaxError as error:
+            self.fail(
+                "deploy/dsr_deploy.py line %s is not Python 3.9: %s"
+                % (error.lineno, error.msg)
+            )
+
+    def test_the_check_rejects_every_construct_it_claims_to(self):
+        # Without this, "the deployer is clean" is a test that would pass
+        # against a checker that returns [] for everything.
+        for label, snippet in PY39_REJECTS:
+            self.assertTrue(python39_violations(snippet), label)
+
+    def test_the_check_accepts_what_39_can_actually_run(self):
+        for label, snippet in PY39_ACCEPTS:
+            self.assertEqual(python39_violations(snippet), [], label)
+
+    def test_a_violation_names_a_line(self):
+        found = python39_violations("import os\nimport tomllib\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn("line 2", found[0])
+        self.assertIn("tomllib", found[0])
+
+    def test_a_grammar_violation_names_a_line_too(self):
+        # "this file is not 3.9" without a line number sends the reader
+        # through three thousand lines by eye. CPython reports the token
+        # after the construct, so the number is not asserted exactly -- only
+        # that there is one.
+        found = python39_violations(
+            "x = 1\ndef f(y):\n    match y:\n        case 1:\n            return 2\n"
+        )
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0].startswith("line "), found[0])
+        self.assertTrue(found[0].split()[1].rstrip(":").isdigit(), found[0])
+        self.assertIn("Pattern matching", found[0])
+
+    def test_the_future_annotations_import_is_still_there(self):
+        # It is what makes the annotations lazy, and therefore what makes a
+        # `str | None` annotation harmless on 3.9 rather than a TypeError at
+        # import time. Removing it is a 3.9 break the walk above cannot see,
+        # because `X | Y` is valid grammar in every version.
+        self.assertIn("from __future__ import annotations", self.source())
+
+    def test_the_test_file_itself_is_not_the_thing_being_checked(self):
+        # This file is only ever run on the developer's machine, and it uses
+        # feature_version, which 3.9 does have. The guarantee is about the
+        # one file that is copied to the box.
+        self.assertTrue(dd.__file__.endswith("dsr_deploy.py"))
 
 
 class TestCli(unittest.TestCase):
@@ -473,14 +635,23 @@ class TestPgHba(unittest.TestCase):
     # exactly the way this function exists to prevent: the portal boots, and
     # cannot read its own database.
 
+    def test_the_host_types_are_all_five_postgres_accepts(self):
+        # f576932's subject claimed "every pg_hba host type" while the tuple
+        # held three of the five. The GSS-encrypted forms are host rules too,
+        # and one of them covering 127.0.0.1 with ident is the same failure.
+        self.assertEqual(
+            dd._HOST_TYPES,
+            ("host", "hostssl", "hostnossl", "hostgssenc", "hostnogssenc"),
+        )
+
     def test_every_tcp_connection_type_is_rewritten(self):
-        for kind in ("host", "hostssl", "hostnossl"):
+        for kind in dd._HOST_TYPES:
             new, changed = self.body("%s all all 127.0.0.1/32 ident\n" % kind)
             self.assertTrue(changed, kind)
             self.assertEqual(new, "%s all all 127.0.0.1/32 scram-sha-256\n" % kind)
 
     def test_every_tcp_connection_type_survives_every_shape(self):
-        for kind in ("hostssl", "hostnossl"):
+        for kind in [k for k in dd._HOST_TYPES if k != "host"]:
             for line, expected in (
                 ("%s all all 127.0.0.1/32 ident  # legacy" % kind, "# legacy"),
                 (
@@ -508,7 +679,7 @@ class TestPgHba(unittest.TestCase):
                 self.assertEqual(marked, twice, line)
 
     def test_replication_is_left_alone_for_every_tcp_connection_type(self):
-        for kind in ("host", "hostssl", "hostnossl"):
+        for kind in dd._HOST_TYPES:
             line = "%s replication all 127.0.0.1/32 ident\n" % kind
             new, changed = dd.rewrite_pg_hba(line)
             self.assertFalse(changed, kind)
@@ -1207,7 +1378,16 @@ class TestFingerprintGuard(unittest.TestCase):
 
 class TestDiskBudgetRefusal(unittest.TestCase):
     def test_deploy_budgets_the_documented_total(self):
-        self.assertEqual(dd.deploy_needs(), {dd.INSTALL_PREFIX: 420 * 1000 * 1000})
+        self.assertEqual(dd.deploy_needs(), {dd.INSTALL_PREFIX: 420 * 1024 * 1024})
+
+    def test_the_breakdown_prints_the_numbers_its_constants_are_named_for(self):
+        # The refusal is the number an operator plans against. It read
+        # "node_modules ~295.6 MiB" while the constant said 310, because the
+        # constants counted in millions and human_bytes counts in mebibytes.
+        self.assertEqual(
+            dd.deploy_breakdown(),
+            "node_modules ~310.0 MiB, dist ~40.0 MiB, transfer headroom ~70.0 MiB",
+        )
 
     def test_a_full_box_is_refused_with_both_numbers(self):
         mounts = dd.parse_df(DF_SINGLE_ROOT_NEARLY_FULL)
