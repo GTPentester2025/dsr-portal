@@ -1974,9 +1974,35 @@ class TestCmdDoctor(unittest.TestCase):
         self.assertIn("setsebool -P httpd_can_network_connect on", text)
 
     def test_a_group_filter_narrows_the_report(self):
-        _code, text, _runner = self.run_doctor(["doctor", "--no-state", "--selinux"])
+        code, text, _runner = self.run_doctor(["doctor", "--no-state", "--selinux"])
         self.assertIn("[selinux]", text)
         self.assertNotIn("[disk]", text)
+        self.assertEqual(code, 0)
+        self.assertIn("All selinux checks passed.", text)
+        self.assertNotIn("All checks passed.", text)
+
+    def test_a_filtered_run_never_claims_the_whole_box_is_healthy(self):
+        # This box has a SELinux FAIL. Exit 0 is defensible for a disk-scoped
+        # cron check; the word "All" is not -- it asserts something about the
+        # whole box that this run never established.
+        code, text, _runner = self.run_doctor(
+            ["doctor", "--no-state", "--disk"], BROKEN_REPLIES
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("[disk]", text)
+        self.assertNotIn("[selinux]", text)
+        self.assertIn("All disk checks passed.", text)
+        self.assertNotIn("All checks passed.", text)
+
+    def test_two_filters_name_both_groups(self):
+        _code, text, _runner = self.run_doctor(
+            ["doctor", "--no-state", "--disk", "--web"]
+        )
+        self.assertIn("All disk and web checks passed.", text)
+
+    def test_an_unfiltered_clean_run_still_says_all_checks_passed(self):
+        _code, text, _runner = self.run_doctor(["doctor", "--no-state"])
+        self.assertIn("All checks passed.", text)
 
     def test_it_records_a_sample_by_default(self):
         _code, _text, runner = self.run_doctor(["doctor"])

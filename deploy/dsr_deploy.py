@@ -467,7 +467,22 @@ def exit_code_for(findings: list) -> int:
     return max(_SEVERITY_RANK.get(f.severity, 0) for f in findings)
 
 
-def render_findings(findings: list) -> str:
+def _english_list(items: list) -> str:
+    """`a`, `a and b`, `a, b and c` -- for a summary line a human reads."""
+    items = list(items)
+    if len(items) < 2:
+        return "".join(items)
+    return "%s and %s" % (", ".join(items[:-1]), items[-1])
+
+
+def render_findings(findings: list, groups: list = None) -> str:
+    """Render the report. `groups` names the filter the run was narrowed to.
+
+    The clean summary has to say which groups it is speaking for. `doctor
+    --disk` against a box with a SELinux failure printing "All checks passed."
+    asserts something about the whole box that the run never established, and
+    an operator who reads it believes they ran a full check.
+    """
     if not findings:
         return "No checks ran.\n"
     lines = []
@@ -481,7 +496,9 @@ def render_findings(findings: list) -> str:
                 lines.append("       fix: %s" % f.fix)
         lines.append("")
     worst = exit_code_for(findings)
-    lines.append(["All checks passed.", "Warnings above.", "Failures above."][worst])
+    scope = _english_list(groups or [])
+    passed = "All %s checks passed." % scope if scope else "All checks passed."
+    lines.append([passed, "Warnings above.", "Failures above."][worst])
     return "\n".join(lines) + "\n"
 
 
@@ -2629,7 +2646,7 @@ def cmd_doctor(args, runner, now_epoch=None) -> int:
             render_state(update_samples(samples, parse_df(capture.get("df", "")), now_epoch)),
         )
 
-    sys.stdout.write(render_findings(findings))
+    sys.stdout.write(render_findings(findings, selected))
     return exit_code_for(findings)
 
 
