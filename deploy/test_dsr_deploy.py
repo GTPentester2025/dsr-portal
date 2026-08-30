@@ -1310,6 +1310,73 @@ class TestLocalPreflight(unittest.TestCase):
             dd.validate_secrets(env)
         self.assertIn("APP_PASS", str(caught.exception))
 
+    def test_a_url_reserved_character_in_a_password_is_refused_and_named(self):
+        # `validate_role_passwords` exists to stop "the .env would carry a
+        # bad password, the API would fail to authenticate, and systemd
+        # would crash-loop it". A `/` produces exactly that ending and the
+        # emptiness check walked past it: run under bash, the real .env body
+        # with APP_PASS=pw/with/slash expands to
+        #   postgres://dsr_app:pw/with/slash@127.0.0.1:5432/dsr
+        # which node-postgres reads as host `dsr_app` with no port.
+        for key in dd.ROLE_PASSWORD_KEYS:
+            for character in "/@:?#":
+                env = dict(self.GOOD)
+                env[key] = "pw" + character + "tail"
+                with self.assertRaises(dd.SecretsError) as caught:
+                    dd.validate_secrets(env)
+                message = str(caught.exception)
+                self.assertIn(key, message)
+                # Which character, not just that there was one: an operator
+                # staring at 32 base64 characters cannot spot it otherwise.
+                self.assertIn(character, message)
+
+    def test_the_refusal_points_at_a_generator_that_cannot_produce_one(self):
+        # `openssl rand -base64 32` is what this file's other messages
+        # recommend and it emits `/`. A refusal that does not offer a way
+        # out sends the operator back to the generator that caused it.
+        env = dict(self.GOOD)
+        env["DB_PASS"] = "7/xK9pQz"
+        with self.assertRaises(dd.SecretsError) as caught:
+            dd.validate_secrets(env)
+        message = str(caught.exception)
+        self.assertIn("openssl rand -hex 32", message)
+        self.assertIn("tr -d", message)
+
+    def test_the_password_itself_is_not_quoted_back(self):
+        # The refusal names the character and the key. Printing the value
+        # would put the password in the operator's scrollback, which is the
+        # bug the two commits before this one were about.
+        env = dict(self.GOOD)
+        env["DB_PASS"] = "7/xK9pQzSecret"
+        with self.assertRaises(dd.SecretsError) as caught:
+            dd.validate_secrets(env)
+        self.assertNotIn("xK9pQzSecret", str(caught.exception))
+
+    def test_ordinary_password_characters_are_not_refused(self):
+        # The refusal has to be narrow enough to leave a hex or a stripped
+        # base64 password alone, or operators route around it.
+        for value in (
+            "0123456789abcdef" * 4,
+            "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHRlc3Q",
+            "pw+with=plus-and_underscore.dots~",
+            "correct horse battery staple",
+        ):
+            env = dict(self.GOOD)
+            env["DB_PASS"] = value
+            env["APP_PASS"] = value
+            self.assertEqual(dd.validate_secrets(env), [], value)
+
+    def test_the_emptiness_check_still_runs_first(self):
+        # An empty password has no reserved character in it, so the order
+        # only matters the other way: a missing key must not be reported as
+        # a character problem.
+        env = dict(self.GOOD)
+        env["DB_PASS"] = ""
+        env["APP_PASS"] = "pw/slash"
+        with self.assertRaises(dd.SecretsError) as caught:
+            dd.validate_secrets(env)
+        self.assertIn("missing or empty", str(caught.exception))
+
     def test_the_key_is_still_checked_before_the_passwords(self):
         env = dict(self.GOOD)
         env["CRYPTO_MASTER_KEY"] = "a" * 64

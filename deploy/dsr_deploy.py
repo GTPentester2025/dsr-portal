@@ -1309,8 +1309,34 @@ def remote_secrets_content(env: dict, keys) -> str:
     return "".join("%s=%s\n" % (key, shell_quote(env.get(key, ""))) for key in keys)
 
 
+# The characters that mean something to a URL parser between the `://` and
+# the path. The .env writes `postgres://dsr:${DB_PASS}@127.0.0.1:5432/dsr`
+# with no percent-encoding, so any of these inside a password is read as
+# structure rather than as a character:
+#
+#   /  ends the netloc, so the rest of the password becomes the path
+#   @  ends the userinfo, so the rest of the password becomes the host
+#   :  starts the port, so the rest of the password has to be digits
+#   ?  starts the query, #  starts the fragment
+#
+# `openssl rand -base64 32` -- what this file's own error messages
+# recommend -- emits `/` and `+`, so this is not a hypothetical class of
+# password. Run under bash with APP_PASS=pw/with/slash the real .env body
+# expands to `postgres://dsr_app:pw/with/slash@127.0.0.1:5432/dsr`, which
+# node-postgres reads as host `dsr_app` with no port at all.
+URL_RESERVED_IN_PASSWORD = "/@:?#"
+
+# A generator that cannot emit any of the above. Both are 32 bytes of
+# entropy; the second is the first with the offending base64 characters
+# stripped, which shortens the string without weakening the source.
+PASSWORD_GENERATOR_ADVICE = (
+    "Generate one with `openssl rand -hex 32`, or "
+    "`openssl rand -base64 32 | tr -d '/+='`."
+)
+
+
 def validate_role_passwords(env: dict) -> None:
-    """Raise unless both database role passwords are actually there.
+    """Raise unless both database role passwords are there and URL-safe.
 
     An absent key is staged as `''` rather than omitted, and the .env body
     references a bare `${DB_PASS}` with no `:?`. So a secrets file missing
@@ -1319,6 +1345,19 @@ def validate_role_passwords(env: dict) -> None:
     word. Provisioning happens to catch this -- its SQL uses `${DB_PASS:?}`
     -- but deploying did not, and deploying is the command that runs far
     more often.
+
+    A password holding a URL-reserved character produces the *same* ending
+    by a different route: the .env interpolates it raw, node-postgres parses
+    the structure rather than the password, the API cannot authenticate and
+    systemd crash-loops it. This function existed to stop exactly that
+    outcome and only ever checked for emptiness, which is one of the two
+    ways in.
+
+    It is also the trigger for two other bugs -- doctor printing a password
+    that contains a `/`, and the journal dump that follows the crash-loop it
+    causes. Refusing here removes the trigger; both of those are fixed
+    anyway, because a bug that has recurred three times is one to hold at
+    more than one line.
     """
     missing = [key for key in ROLE_PASSWORD_KEYS if not (env.get(key) or "").strip()]
     if missing:
@@ -1328,6 +1367,23 @@ def validate_role_passwords(env: dict) -> None:
             "fail to authenticate against postgres, and systemd would "
             "crash-loop it." % " ".join(missing)
         )
+    for key in ROLE_PASSWORD_KEYS:
+        value = (env.get(key) or "").strip()
+        bad = [c for c in URL_RESERVED_IN_PASSWORD if c in value]
+        if bad:
+            raise SecretsError(
+                "%s contains %s, which the connection string cannot carry. "
+                "The .env writes postgres://user:${%s}@127.0.0.1:5432/dsr "
+                "with no percent-encoding, so node-postgres reads that "
+                "character as structure: the API would fail to authenticate "
+                "and systemd would crash-loop it. %s"
+                % (
+                    key,
+                    " and ".join("`%s`" % c for c in bad),
+                    key,
+                    PASSWORD_GENERATOR_ADVICE,
+                )
+            )
 
 
 def validate_secrets(env: dict) -> list:
