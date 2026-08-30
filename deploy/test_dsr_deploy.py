@@ -2422,20 +2422,58 @@ class TestRedaction(unittest.TestCase):
         self.assertNotIn("pw1", out)
         self.assertNotIn("pw2", out)
 
-    def test_a_credential_free_host_and_port_is_not_over_matched(self):
-        # The `@` further along the line must not drag the host:port before
-        # it into the match: widening the password class to cross `/` is
-        # exactly the mistake that would.
+    def test_a_slash_inside_the_password_does_not_leave_the_tail_visible(self):
+        # `openssl rand -base64` -- the generator this file's own messages
+        # recommend -- emits `/`. The password class used to stop there, so
+        # the whole secret stayed on the line while the redactor reported
+        # success. This is the third variant of that bug in this file.
+        out = dd.redact_url("postgres://dsr:7/xK9pQzSecret@127.0.0.1:5432/dsr")
+        self.assertNotIn("xK9pQzSecret", out)
+        self.assertNotIn("7/xK9", out)
+        self.assertEqual(out, "postgres://dsr:***@127.0.0.1:5432/dsr")
+
+    def test_a_password_that_is_only_slashes_and_pluses_is_redacted(self):
+        out = dd.redact_url("could not connect to postgres://dsr:/AbCdEf9+@h:5432/dsr")
+        self.assertNotIn("AbCdEf9", out)
+        self.assertEqual(
+            out, "could not connect to postgres://dsr:***@h:5432/dsr"
+        )
+
+    def test_text_with_no_url_at_all_is_not_over_matched(self):
         for text in (
-            "conninfo=postgres://127.0.0.1:5432/dsr,notify=root@localhost",
             "psql: could not connect to postgres://127.0.0.1:5432/dsr",
             "nginx: [emerg] bind() to 0.0.0.0:80 failed",
+            "Failed to start dsr-api.service: Unit not found",
         ):
             self.assertEqual(dd.redact_url(text), text)
 
+    def test_a_credential_free_url_before_an_at_sign_is_over_redacted(self):
+        # The deliberate cost of letting the password cross `/`. `a:b/c@d` is
+        # ambiguous -- password `b/c`, or path `/c` and a stray `@d` -- and
+        # resolving it in favour of printing is what leaked the password
+        # three times. This asserts the trade rather than mourning it: what
+        # is lost is a database name, what would be lost the other way is a
+        # secret. `[^\s]` keeps the loss inside one token, so the rest of
+        # the line survives.
+        self.assertEqual(
+            dd.redact_url("conninfo=postgres://127.0.0.1:5432/dsr,notify=root@localhost"),
+            "conninfo=postgres://127.0.0.1:***@localhost",
+        )
+        self.assertEqual(
+            dd.redact_url("postgres://127.0.0.1:5432/dsr and mail to root@localhost"),
+            "postgres://127.0.0.1:5432/dsr and mail to root@localhost",
+        )
+
 
 class TestDescribeUrl(unittest.TestCase):
-    """describe_url never reads the secret, which is why it cannot leak it."""
+    """describe_url builds its answer, then checks what it built.
+
+    An earlier version of this docstring said the function "never reads the
+    secret, which is why it cannot leak it". That was wrong. `urlsplit` ends
+    the netloc at the first `/`, so a `/` in the password pushes the rest of
+    it into `.path`, and `.path` was printed back as the database name. A
+    construction is only as safe as the parts it is built from.
+    """
 
     def test_it_reports_host_port_and_database(self):
         self.assertEqual(
@@ -2444,7 +2482,18 @@ class TestDescribeUrl(unittest.TestCase):
         )
 
     def test_no_shape_of_password_survives(self):
+        # The four shapes this list held before all kept the password inside
+        # the netloc, where `urlsplit` never let it out. None of them tried a
+        # `/`, which is the one character that moves the password somewhere
+        # this function prints -- so the list asserted the claim it was least
+        # able to check. The `/` shapes are first now.
         for url in (
+            "postgres://dsr:7/hunter2@127.0.0.1:5432/dsr",
+            "postgres://dsr:/hunter2@127.0.0.1:5432/dsr",
+            "postgres://dsr:hun/ter2@127.0.0.1:5432/dsr",
+            "postgres://dsr:hun/ter2/more@127.0.0.1:5432/dsr",
+            "postgres://dsr:7/hun#ter2@127.0.0.1:5432/dsr",
+            "postgres://dsr:7/hun?ter2@127.0.0.1:5432/dsr",
             "postgres://dsr:hunter2@127.0.0.1:5432/dsr",
             "postgres://dsr:hun@ter2@127.0.0.1:5432/dsr",
             "postgres://:hunter2@127.0.0.1:5432/dsr",
@@ -2452,6 +2501,59 @@ class TestDescribeUrl(unittest.TestCase):
         ):
             self.assertNotIn("hunter2", dd.describe_url(url), url)
             self.assertNotIn("ter2", dd.describe_url(url), url)
+            self.assertNotIn("hun", dd.describe_url(url), url)
+
+    def test_the_reproduced_leak_is_the_fixed_string(self):
+        # Exactly what the reviewer saw on a healthy `doctor` run, at
+        # severity `ok`, on stdout: "ok DATABASE_URL -> dsr:7/xK9..."
+        for url in (
+            "postgres://dsr:7/xK9pQzSecret@127.0.0.1:5432/dsr",
+            "postgres://dsr:/AbCdEf9+@127.0.0.1:5432/dsr",
+        ):
+            self.assertEqual(dd.describe_url(url), "unparseable connection string")
+
+    def test_a_slashed_password_does_not_reach_a_finding(self):
+        # The sink, not just the function: this is the line doctor prints.
+        findings = dd.evaluate_env(
+            "DATABASE_URL=postgres://dsr:7/xK9pQzSecret@127.0.0.1:5432/dsr\n",
+            "600",
+        )
+        rendered = " ".join(f.title + " " + f.detail + " " + f.fix for f in findings)
+        self.assertNotIn("xK9pQzSecret", rendered)
+        self.assertNotIn("7/xK9", rendered)
+
+    def test_a_password_holding_both_an_at_and_a_slash_is_caught(self):
+        # This shape gets past the `@`-in-the-netloc guard on its own: the
+        # first `@` keeps the netloc looking normal while the `/` before the
+        # second one pushes the rest of the password into `.path`. Only
+        # checking that the database name is a database name catches it.
+        #     netloc `dsr:p@ss`, host `ss`, path `/word@h:5432/dsr`
+        url = "postgres://dsr:p@ss/word@h:5432/dsr"
+        self.assertEqual(dd.describe_url(url), "unparseable connection string")
+
+    def test_a_host_that_is_not_a_host_is_refused(self):
+        # The host half of the same rule. `h*st` is not a name, an address or
+        # a bracketed IPv6 literal, so the netloc is not what it looks like.
+        # An anchorless pattern would match the leading `h` and print it.
+        self.assertEqual(
+            dd.describe_url("postgres://dsr:pw@h*st:5432/dsr"),
+            "unparseable connection string",
+        )
+        # And a URL with no host at all: `?:5432/dsr` was the old answer, and
+        # a placeholder host is not a diagnosis.
+        self.assertEqual(
+            dd.describe_url("postgres:///dsr"), "unparseable connection string"
+        )
+
+    def test_ordinary_hosts_and_databases_still_describe(self):
+        # The validation must not turn every healthy line into the refusal.
+        for url, want in (
+            ("postgres://dsr:pw@127.0.0.1:5432/dsr", "127.0.0.1:5432/dsr"),
+            ("postgres://dsr_app:pw@db.internal:5432/dsr_app", "db.internal:5432/dsr_app"),
+            ("postgresql://dsr:pw@[::1]:5432/dsr-2", "::1:5432/dsr-2"),
+            ("postgres://127.0.0.1:5432/dsr", "127.0.0.1:5432/dsr"),
+        ):
+            self.assertEqual(dd.describe_url(url), want, url)
 
     def test_the_port_defaults_rather_than_disappearing(self):
         self.assertEqual(

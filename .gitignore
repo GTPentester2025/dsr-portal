@@ -42,3 +42,4 @@ Thumbs.db
 
 # Subagent-driven-development scratch (ledger, briefs, review packages)
 .superpowers/
+deploy/__pycache__/

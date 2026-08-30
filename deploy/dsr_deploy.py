@@ -1593,22 +1593,44 @@ def redact_url(text: str) -> str:
     userinfo. Where the URL is the subject rather than something buried in an
     error message, use describe_url, which never reads the secret at all.
 
-    The password class stops at `/` rather than at `@`, so an `@` inside the
-    password -- ordinary, and something node-postgres cannot parse either --
-    no longer ends the match early and leaves the tail of the password
-    visible. The username class allows the empty string, because
-    `postgres://:pw@host` is a legal URL that the earlier form left untouched.
+    The password runs from the first `:` after the scheme to the *last* `@`
+    in the token, and it crosses `/`. Both are deliberate. An `@` inside the
+    password is ordinary; so is a `/`, which is one of the three characters
+    `openssl rand -base64` emits and which the earlier password class stopped
+    at, leaving the tail of the password in plain sight. The username class
+    excludes `@` so that a second URL later on the line cannot be swallowed,
+    and it allows the empty string, because `postgres://:pw@host` is a legal
+    URL that the earliest form left untouched.
+
+    The cost is over-redaction: `postgres://h:5432/db,notify=root@localhost`
+    carries no password at all, yet the `@` at the end makes the whole middle
+    look like one and it is starred out. That is the direction to err in.
+    `a:b/c@d` is genuinely ambiguous -- password `b/c`, or path `/c` and a
+    stray `@d` -- and a redactor that resolves the ambiguity in favour of
+    printing loses a password the one time it is wrong. Stopping the password
+    at whitespace keeps the over-redaction inside a single token.
     """
-    return re.sub(r"(://[^\s:/]*):[^\s/]*@", r"\1:***@", text or "")
+    return re.sub(r"(://[^\s:/@]*):[^\s]*@", r"\1:***@", text or "")
 
 
 def describe_url(value: str) -> str:
     """`host:port/database` out of a connection string. Never the credentials.
 
-    Nothing here reads userinfo or the query string, so no shape of password
-    -- an `@` inside it, an empty username, `?password=` -- can reach a
-    Finding through this function. That is the whole point: redaction is a
-    filter that can miss, and this is a construction with nothing to miss.
+    Constructing the answer out of named parts is safer than filtering the
+    whole string, but it is not safe on its own, and an earlier version of
+    this docstring claimed that it was. `urlsplit` ends the netloc at the
+    first `/`, so a `/` inside the password -- one of the three characters
+    `openssl rand -base64` emits -- moves the rest of the password into
+    `.path`, and `.path` is what this function prints as the database name:
+
+        postgres://dsr:7/xK9pQ@127.0.0.1:5432/dsr
+            -> host `dsr`, port 7, path `/xK9pQ@127.0.0.1:5432/dsr`
+
+    A construction is only as trustworthy as the parts it is built from, so
+    the two parts that get printed are checked against what a host and a
+    database name can actually contain before either one is, and the `@` is
+    checked to be where the netloc is. Anything else becomes the fixed
+    string, and nothing derived from the input is echoed back.
     """
     try:
         parsed = urlsplit(value or "")
@@ -1623,6 +1645,20 @@ def describe_url(value: str) -> str:
         # A non-numeric port makes .port raise rather than return None.
         return "unparseable connection string"
     database = (parsed.path or "/").lstrip("/") or "?"
+    if not re.match(r"^[A-Za-z0-9_$-]+$", database) or not re.match(
+        r"^[A-Za-z0-9_.:\[\]-]+$", host
+    ):
+        # A database name outside the identifier characters, or a host that is
+        # not a name, an IPv4 address or a bracketed IPv6 one, means the split
+        # did not land where the shape of the string suggests it did.
+        return "unparseable connection string"
+    if "@" in (value or "") and "@" not in (parsed.netloc or ""):
+        # The separator between the credentials and the host ended up outside
+        # the netloc, so whatever `urlsplit` called the netloc is not it. A `#`
+        # or a `?` in the password does this while leaving both parts above
+        # looking respectable: `postgres://dsr:7/ab#cd@h/dsr` splits into host
+        # `dsr`, port 7, path `/ab` -- and `ab` is half of the password.
+        return "unparseable connection string"
     return "%s:%s/%s" % (host, port, database)
 
 
