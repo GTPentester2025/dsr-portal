@@ -1796,6 +1796,13 @@ def scrub(text: str, values) -> str:
     return text
 
 
+# The fixed refusal string. A module constant rather than a literal repeated
+# at every `return` in describe_url, so a caller (doctor's DATABASE_URL
+# check, among others) can tell "refused to parse" apart from a real answer
+# without restating the string and risking the two drifting apart.
+UNPARSEABLE_URL = "unparseable connection string"
+
+
 def describe_url(value: str) -> str:
     """`host:port/database` out of a connection string. Never the credentials.
 
@@ -1814,6 +1821,17 @@ def describe_url(value: str) -> str:
     database name can actually contain before either one is, and the `@` is
     checked to be where the netloc is. Anything else becomes the fixed
     string, and nothing derived from the input is echoed back.
+
+    A URL with no path at all -- `postgres://host:5432`, which libpq accepts
+    and defaults to a database named after the connecting role -- is a
+    legitimate shape, not a malformed one, so it is not folded into the same
+    refusal a bad host or database name gets. It prints as `host:port/?`:
+    `?` is already this function's placeholder for "not named" (a missing
+    host prints the same way), and a distinct message for "no database was
+    given" would be one more string for a caller to special-case for no
+    operator benefit. A missing *host*, by contrast, still refuses -- `?` is
+    where the answer is asking for scrutiny, not where it stands in for an
+    everyday omission.
     """
     try:
         parsed = urlsplit(value or "")
@@ -1821,27 +1839,29 @@ def describe_url(value: str) -> str:
             # Without a scheme this is not a URL, and echoing it back would
             # print whatever the env file actually holds -- which, for a
             # malformed value, can be the bare password.
-            return "unparseable connection string"
+            return UNPARSEABLE_URL
         host = parsed.hostname or "?"
         port = parsed.port or 5432
     except ValueError:
         # A non-numeric port makes .port raise rather than return None.
-        return "unparseable connection string"
+        return UNPARSEABLE_URL
+    if not re.match(r"^[A-Za-z0-9_.:\[\]-]+$", host):
+        # A host that is not a name, an IPv4 address or a bracketed IPv6 one
+        # means the split did not land where the shape of the string
+        # suggests it did.
+        return UNPARSEABLE_URL
     database = (parsed.path or "/").lstrip("/") or "?"
-    if not re.match(r"^[A-Za-z0-9_$-]+$", database) or not re.match(
-        r"^[A-Za-z0-9_.:\[\]-]+$", host
-    ):
-        # A database name outside the identifier characters, or a host that is
-        # not a name, an IPv4 address or a bracketed IPv6 one, means the split
-        # did not land where the shape of the string suggests it did.
-        return "unparseable connection string"
+    if database != "?" and not re.match(r"^[A-Za-z0-9_$-]+$", database):
+        # A database name outside the identifier characters -- but not the
+        # `?` this function put there itself for "no path given".
+        return UNPARSEABLE_URL
     if "@" in (value or "") and "@" not in (parsed.netloc or ""):
         # The separator between the credentials and the host ended up outside
         # the netloc, so whatever `urlsplit` called the netloc is not it. A `#`
         # or a `?` in the password does this while leaving both parts above
         # looking respectable: `postgres://dsr:7/ab#cd@h/dsr` splits into host
         # `dsr`, port 7, path `/ab` -- and `ab` is half of the password.
-        return "unparseable connection string"
+        return UNPARSEABLE_URL
     return "%s:%s/%s" % (host, port, database)
 
 
@@ -2355,9 +2375,37 @@ def evaluate_env(env_text: str, mode: str) -> list:
                 )
             )
         else:
-            findings.append(
-                Finding(group, OK, "%s -> %s" % (key, describe_url(value)), "", "")
-            )
+            described = describe_url(value)
+            if described == UNPARSEABLE_URL:
+                # describe_url refused. That is not "nothing to report" --
+                # the commonest way a postgres:// URL built by string
+                # interpolation ends up unparseable is a URL-reserved
+                # character sitting inside the password, and that is
+                # precisely the failure validate_role_passwords exists to
+                # keep out of a freshly-provisioned box. It reaches a
+                # doctor run anyway when the .env was written by
+                # deploy.sh's older, unguarded path. Never echo `value`
+                # here: it is the connection string describe_url just
+                # declined to vouch for, which is exactly the string that
+                # can be carrying the raw password.
+                findings.append(
+                    Finding(
+                        group,
+                        WARN,
+                        "%s could not be parsed" % key,
+                        "Likely cause: the password it embeds contains "
+                        "%s, which node-postgres reads as structure "
+                        "rather than as a password character. The API "
+                        "would fail to authenticate and systemd would "
+                        "crash-loop it."
+                        % " or ".join("`%s`" % c for c in URL_RESERVED_IN_PASSWORD),
+                        PASSWORD_GENERATOR_ADVICE,
+                    )
+                )
+            else:
+                findings.append(
+                    Finding(group, OK, "%s -> %s" % (key, described), "", "")
+                )
 
     cookie = (env.get("COOKIE_SECURE") or "").strip().lower()
     if cookie and cookie != "true":

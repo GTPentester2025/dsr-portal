@@ -2860,6 +2860,52 @@ class TestEnvEvaluator(unittest.TestCase):
         for title in titles:
             self.assertIn("127.0.0.1:5432/dsr", title)
 
+    def test_an_unparseable_database_url_warns_instead_of_passing(self):
+        # deploy.sh writes DATABASE_URL by raw string interpolation with no
+        # guard, so a `/` in DB_PASS reaches the .env exactly as typed. That
+        # produces the crash-loop validate_role_passwords exists to stop,
+        # and it used to reach the operator as "ok DATABASE_URL ->
+        # unparseable connection string" -- a diagnostic asserting health on
+        # the strength of having read nothing.
+        text = self.GOOD.replace(
+            "DATABASE_URL=postgres://dsr:p@127.0.0.1:5432/dsr",
+            "DATABASE_URL=postgres://dsr:p/word@127.0.0.1:5432/dsr",
+        )
+        findings = dd.evaluate_env(text, "600")
+        matches = [f for f in findings if f.title.startswith("DATABASE_URL ")]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].severity, dd.WARN)
+        self.assertNotEqual(matches[0].severity, dd.OK)
+
+    def test_the_unparseable_database_url_warning_names_the_cause_not_the_value(self):
+        text = self.GOOD.replace(
+            "DATABASE_URL=postgres://dsr:p@127.0.0.1:5432/dsr",
+            "DATABASE_URL=postgres://dsr:p/word@127.0.0.1:5432/dsr",
+        )
+        findings = dd.evaluate_env(text, "600")
+        rendered = _blob(findings)
+        # The refused connection string itself never appears: it is exactly
+        # the string describe_url declined to vouch for, and it can be
+        # carrying the raw password.
+        self.assertNotIn("p/word", rendered)
+        # But the operator is told what to look for and how to fix it.
+        self.assertIn("`/`", rendered)
+        self.assertIn("openssl rand -hex 32", rendered)
+
+    def test_a_path_less_database_url_is_not_warned_about(self):
+        # A DATABASE_URL naming no database at all is a legitimate libpq
+        # shape (see describe_url), and must not be swept into the same
+        # WARN as a genuinely unparseable one now that both share the same
+        # refusal string check.
+        text = self.GOOD.replace(
+            "DATABASE_URL=postgres://dsr:p@127.0.0.1:5432/dsr",
+            "DATABASE_URL=postgres://dsr:p@127.0.0.1:5432",
+        )
+        findings = dd.evaluate_env(text, "600")
+        matches = [f for f in findings if f.title.startswith("DATABASE_URL ")]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].severity, dd.OK)
+
     def test_a_leading_zero_mode_is_still_owner_only(self):
         findings = dd.evaluate_env(self.GOOD, "0600")
         self.assertTrue(findings)
@@ -3092,6 +3138,26 @@ class TestDescribeUrl(unittest.TestCase):
         out = dd.describe_url("postgres://dsr:hunter2@127.0.0.1:notaport/dsr")
         self.assertEqual(out, "unparseable connection string")
         self.assertNotIn("hunter2", out)
+
+    def test_a_path_less_url_is_a_legitimate_shape_not_a_refusal(self):
+        # libpq accepts `postgres://host:5432` -- no path at all -- and
+        # defaults to a database named after the connecting role. Before
+        # this was fixed, `database` fell back to this function's own `?`
+        # placeholder and then failed its own identifier check, so a
+        # perfectly ordinary connection string came back "unparseable".
+        self.assertEqual(dd.describe_url("postgres://dsr:pw@host:5432"), "host:5432/?")
+        # A trailing slash with nothing after it is the same shape.
+        self.assertEqual(dd.describe_url("postgres://dsr:pw@host:5432/"), "host:5432/?")
+
+    def test_a_missing_host_still_refuses_unlike_a_missing_database(self):
+        # The `?` placeholder is reused for two different absences, and only
+        # one of them is business as usual. A URL with no host at all is not
+        # a shape libpq treats as meaningful, so it keeps refusing even
+        # though the rendered placeholder would look identical to the
+        # path-less case above.
+        self.assertEqual(
+            dd.describe_url("postgres://:5432/dsr"), "unparseable connection string"
+        )
 
 
 DF_ALMOST_FULL = """Filesystem     1B-blocks        Used  Available Capacity Mounted on
