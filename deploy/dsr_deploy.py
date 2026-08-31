@@ -4453,6 +4453,43 @@ def missing_graph_keys(env: dict) -> list:
     return [key for key in GRAPH_KEYS if not ((env or {}).get(key) or "").strip()]
 
 
+def graph_credentials_deferred(path, missing: list, written: bool) -> str:
+    """What to print when deploying with the mailer switched off.
+
+    Deliberately not a refusal. Seeing the portal answer on its own address
+    is what tells an operator the box is right, and that is worth having
+    before they go and find a client secret. So the deployment continues
+    under EMAIL_PROVIDER=console -- a value the API boots on -- and says
+    plainly which half of the portal is not working yet.
+    """
+    out = [
+        "",
+        "-" * 66,
+        "  Mail is not configured -- deploying without it",
+        "-" * 66,
+        "",
+        "  Still empty in %s:" % path,
+        "",
+    ]
+    out += ["      %s" % key for key in missing]
+    out += [
+        "",
+        "  The portal, the admin console and signing in will all work.",
+        "  Outbound email will not be sent, so a data subject cannot finish",
+        "  the email-verification step of the public form.",
+        "",
+    ]
+    if written:
+        out.append("  A template has been written to %s." % path)
+    out += [
+        "  Fill those values in and run this script again to switch mail on.",
+        "  Nothing else about the deployment changes.",
+        "",
+    ]
+    nl = chr(10)
+    return nl.join(out) + nl
+
+
 def graph_credentials_refusal(path, missing: list, written: bool) -> str:
     """What to print when the mail credentials are not there yet.
 
@@ -4998,13 +5035,21 @@ def run_deployment(options, out=None, err=None, target=None, log=None,
     operator = read_operator_secrets(path)
     absent = missing_graph_keys(operator)
     if absent:
+        # Deploy anyway, with the mailer switched off rather than the run
+        # stopped. The portal, the admin console and sign-in all work without
+        # Graph credentials -- only outbound mail does not -- so a first run
+        # can prove the box is serving before anyone goes hunting for a client
+        # secret. EMAIL_PROVIDER=console is a value the API boots on, so it
+        # starts cleanly instead of crash-looping the way blank Graph keys
+        # would. Filling the four values in and re-running turns mail on;
+        # nothing else about the deployment changes.
         written = write_secrets_template(path)
-        out.write("\n")
-        out.write(graph_credentials_refusal(path, absent, written))
-        log.line("stopped: %s needs %s" % (path, " ".join(absent)))
-        log.close()
-        return 2
-    ok("mail credentials read from %s" % path, out)
+        operator["EMAIL_PROVIDER"] = "console"
+        out.write(graph_credentials_deferred(path, absent, written))
+        log.line("continuing without mail: %s still needs %s"
+                 % (path, " ".join(absent)))
+    else:
+        ok("mail credentials read from %s" % path, out)
 
     secrets, generated = assemble_env(installed, operator)
     log.add_values([secrets.get(key, "") for key in GENERATED_KEYS])
