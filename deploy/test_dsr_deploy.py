@@ -219,56 +219,6 @@ class TestCli(unittest.TestCase):
         self.assertFalse(dd.build_parser().parse_args(["deploy"]).dry_run)
         self.assertTrue(dd.build_parser().parse_args(["deploy", "--dry-run"]).dry_run)
 
-    def test_remote_is_listed_in_doctors_own_help(self):
-        # It was hidden with argparse.SUPPRESS as an internal flag the local
-        # half used. The local half does not use it: nothing pushes the tool
-        # for doctor and doctor never runs itself remotely. Meanwhile
-        # target_ssh's refusal tells the operator to run `doctor --remote`,
-        # so `--help` denying it exists made the advice unfollowable.
-        args = dd.build_parser().parse_args(["doctor", "--remote"])
-        self.assertTrue(args.remote)
-        # format_help() on the top-level parser never lists a subparser's own
-        # arguments, so asserting against it proves nothing -- --remote has
-        # to be checked against the "doctor" subcommand's own help text.
-        subparsers_action = dd.build_parser()._subparsers._group_actions[0]
-        doctor_help = subparsers_action.choices["doctor"].format_help()
-        self.assertIn("--remote", doctor_help)
-
-    def test_the_flag_the_refusal_names_is_a_flag_help_admits_to(self):
-        # The pair, asserted together: whichever way this is settled, the
-        # refusal and the help text have to agree.
-        missing = pathlib.Path(tempfile.gettempdir()) / "dsr-no-such-target.env"
-        with unittest.mock.patch.object(dd, "TARGET_ENV_LOCAL", missing):
-            with self.assertRaises(dd.SecretsError) as caught:
-                dd.target_ssh()
-        named = "--remote" in str(caught.exception)
-        subparsers_action = dd.build_parser()._subparsers._group_actions[0]
-        listed = "--remote" in subparsers_action.choices["doctor"].format_help()
-        self.assertEqual(
-            named,
-            listed,
-            "target_ssh names --remote but doctor --help does not list it, "
-            "or the other way round.",
-        )
-
-    def test_remote_is_a_doctor_only_flag(self):
-        # provision --remote and deploy --remote used to parse and then die
-        # on target_ssh's "No ssh target", because nothing but doctor has a
-        # local runner. Rejecting them at the parser says so at once.
-        for command in ("provision", "deploy"):
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit):
-                    dd.build_parser().parse_args([command, "--remote"])
-
-    def test_the_missing_target_message_names_the_command_that_takes_remote(self):
-        missing = pathlib.Path(tempfile.gettempdir()) / "dsr-no-such-target.env"
-        with unittest.mock.patch.object(dd, "TARGET_ENV_LOCAL", missing):
-            with self.assertRaises(dd.SecretsError) as caught:
-                dd.target_ssh()
-        message = str(caught.exception)
-        self.assertIn(".target.env", message)
-        self.assertIn("doctor --remote", message)
-
     def test_doctor_takes_no_state_and_group_filters(self):
         args = dd.build_parser().parse_args(["doctor", "--no-state", "--disk"])
         self.assertTrue(args.no_state)
@@ -1009,14 +959,15 @@ class TestPlans(unittest.TestCase):
         installed = step.command.split("dnf install -y ", 1)[1].split(" &&")[0].split()
         self.assertEqual(installed, list(dd.BASE_PACKAGES))
 
-    def test_the_transport_still_needs_the_package_the_list_carries(self):
-        # The other half of the coupling, read off the command itself rather
-        # than off push_dir's docstring -- which also says "tar -xzf -" and
-        # would have kept this passing over a transport that had stopped
-        # using it. push_dir is what makes tar a dependency; if that ever
-        # changes, this says so rather than leaving an unexplained package
-        # on the list forever.
-        self.assertIn("tar -xzf -", dd.unpack_command("/opt/dsr/server"))
+    def test_the_thing_that_needs_tar_still_needs_it(self):
+        # The other half of the coupling, read off the file that creates the
+        # dependency rather than off a comment claiming it. The transport
+        # used to be what needed tar (`tar -xzf -` on the far side of an
+        # ssh pipe); with the tool running on the box itself, the backup
+        # timer is. If deploy/backup.sh ever stops using tar, this says so
+        # rather than leaving an unexplained package on the list forever.
+        backup = pathlib.Path(dd.__file__).resolve().parent / "backup.sh"
+        self.assertIn("tar -czf", backup.read_text(encoding="utf-8"))
         self.assertIn("tar", dd.BASE_PACKAGES)
 
     def test_the_base_package_list_is_the_whole_list(self):
@@ -1203,6 +1154,25 @@ class TestPlans(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("dsr-no-such-unit.service", err.getvalue())
 
+    def test_the_copied_deployer_is_used_for_exactly_the_two_stated_jobs(self):
+        # /root/dsr_deploy.py earns its place for these two rewrites and
+        # nothing else: they reuse this file's tested, comment-aware
+        # transforms instead of a sed re-deriving them on the box. A third
+        # user would be a step running code nobody reviewed as a step.
+        uses = [
+            command
+            for command in (
+                [s.command for s in dd.provision_steps()]
+                + [s.command for s in dd.deploy_steps({})]
+            )
+            if dd.REMOTE_SELF.rsplit("/", 1)[0] in command and "dsr_deploy" in command
+        ]
+        self.assertEqual(len(uses), 2, uses)
+        self.assertEqual(sum(1 for u in uses if "rewrite_pg_hba" in u), 1)
+        self.assertEqual(
+            sum(1 for u in uses if "neutralise_default_server" in u), 1
+        )
+
     def test_render_plan_numbers_the_steps_and_shows_commands(self):
         text = dd.render_plan([dd.Step("do a thing", "echo hi")])
         self.assertIn("do a thing", text)
@@ -1232,17 +1202,17 @@ DF_PLENTY = """Filesystem     1B-blocks       Used  Available Capacity Mounted o
 """
 
 
-class FakeSsh:
-    """Records commands instead of running them. No host, by design.
+class FakeTarget:
+    """Records commands instead of running them. Nothing is executed here.
 
     `fail_until` makes the first N calls fail, which is how a slow-starting
     API is simulated; `fail_on` fails one specific command. `responses` maps
     an exact command to the (returncode, stdout, stderr) it should answer
-    with, which is how the fingerprint probe and `df -PB1` are driven.
+    with, which is how `df -PB1` is driven.
 
-    push_file / push_text / push_dir record rather than move bytes: the
-    destination of a push is the thing worth asserting on, and one of them
-    mirrors a directory by deleting it first.
+    write / copy_file / copy_dir record rather than move bytes: the
+    destination is the thing worth asserting on, and one of them mirrors a
+    directory by deleting it first.
     """
 
     Result = collections.namedtuple("Result", "returncode stdout stderr")
@@ -1253,12 +1223,12 @@ class FakeSsh:
         self.fail_on = fail_on
         self.stderr = stderr
         self.responses = dict(responses or {})
-        self.pushed_files = []
-        self.pushed_texts = []
-        self.pushed_dirs = []
-        # One ordered log across runs and pushes. Two separate lists cannot
-        # answer "did the fingerprint probe happen before the first
-        # push_dir", and that ordering is the thing worth pinning: push_dir
+        self.copied_files = []
+        self.written = []
+        self.copied_dirs = []
+        # One ordered log across runs, writes and copies. Two separate lists
+        # cannot answer "did the disk budget happen before the first
+        # copy_dir", and that ordering is the thing worth pinning: copy_dir
         # mirrors a directory by deleting it first, so every guard has to
         # come before it.
         self.events = []
@@ -1271,17 +1241,17 @@ class FakeSsh:
         failed = len(self.commands) <= self.fail_until or command == self.fail_on
         return self.Result(1 if failed else 0, "", self.stderr if failed else "")
 
-    def push_file(self, local, remote):
-        self.pushed_files.append((local, remote))
-        self.events.append(("push_file", remote))
+    def copy_file(self, local, remote):
+        self.copied_files.append((local, remote))
+        self.events.append(("copy_file", remote))
 
-    def push_text(self, text, remote, mode=""):
-        self.pushed_texts.append((text, remote, mode))
-        self.events.append(("push_text", remote))
+    def write(self, path, text, mode=""):
+        self.written.append((text, path, mode))
+        self.events.append(("write", path))
 
-    def push_dir(self, local, remote):
-        self.pushed_dirs.append((local, remote))
-        self.events.append(("push_dir", remote))
+    def copy_dir(self, local, remote):
+        self.copied_dirs.append((local, remote))
+        self.events.append(("copy_dir", remote))
 
     def index_of_run(self, command):
         return self.events.index(("run", command))
@@ -1555,26 +1525,47 @@ class TestFingerprintGuard(unittest.TestCase):
         self.assertNotIn(self.KEY, message)
         self.assertNotIn(self.OTHER, message)
 
-    def test_trailing_newlines_from_ssh_do_not_look_like_a_mismatch(self):
+    def test_a_trailing_newline_does_not_look_like_a_mismatch(self):
         fp = dd.key_fingerprint(self.KEY)
         self.assertEqual(dd.fingerprint_refusal(fp, fp + "\n", "s.env", "h"), "")
 
-    def test_the_remote_side_computes_it_with_key_fingerprint_too(self):
-        # deploy.sh uses `md5sum | cut -c1-8`. key_fingerprint is sha256, so
-        # a shell fingerprint would never match a local one and the guard
-        # would refuse every single deployment. Both sides must be this
-        # function, run by the copy of this tool that was just pushed.
-        command = dd.REMOTE_FINGERPRINT_COMMAND
-        self.assertIn("key_fingerprint", command)
-        self.assertIn("parse_env_text", command)
-        self.assertIn(dd.ENV_PATH, command)
-        self.assertNotIn("md5sum", command)
-        self.assertNotIn("sha256sum", command)
+    def test_no_env_yet_fingerprints_as_nothing_rather_than_as_a_hash(self):
+        # key_fingerprint('') is a perfectly good hash of nothing, and
+        # handing it to fingerprint_refusal would mismatch every real key
+        # and block every first deployment.
+        self.assertEqual(dd.key_fingerprint_or_blank(""), "")
+        self.assertEqual(dd.key_fingerprint_or_blank("   \n"), "")
+        self.assertEqual(dd.key_fingerprint_or_blank(None), "")
+        self.assertEqual(
+            dd.key_fingerprint_or_blank(self.KEY), dd.key_fingerprint(self.KEY)
+        )
 
-    def test_a_box_with_no_env_prints_nothing_rather_than_a_hash_of_nothing(self):
-        # key_fingerprint('') is a perfectly good hash, and returning it
-        # would mismatch every real key and block every first deployment.
-        self.assertIn("if k.strip() else ''", dd.REMOTE_FINGERPRINT_COMMAND)
+    def test_both_sides_of_the_comparison_are_the_same_function(self):
+        # deploy.sh compares with `md5sum | cut -c1-8`. key_fingerprint is
+        # sha256, so mixing the two would never match and the guard would
+        # refuse every single deployment.
+        installed = "%s=%s\n" % ("CRYPTO_MASTER_KEY", self.KEY)
+        self.assertEqual(
+            dd.key_fingerprint_or_blank(
+                dd.parse_env_text(installed)["CRYPTO_MASTER_KEY"]
+            ),
+            dd.key_fingerprint(self.KEY),
+        )
+
+    def test_a_key_that_is_kept_is_never_a_refusal(self):
+        # The shape of a redeploy now: the key comes off the installed .env
+        # and goes straight back into it, so the two fingerprints are the
+        # same value read twice.
+        installed = {"CRYPTO_MASTER_KEY": self.KEY}
+        self.assertEqual(
+            dd.fingerprint_refusal(
+                dd.key_fingerprint_or_blank(installed["CRYPTO_MASTER_KEY"]),
+                dd.key_fingerprint_or_blank(installed["CRYPTO_MASTER_KEY"]),
+                "s.env",
+                "h",
+            ),
+            "",
+        )
 
 
 class TestDiskBudgetRefusal(unittest.TestCase):
@@ -1747,43 +1738,43 @@ class TestHealthPoll(unittest.TestCase):
         # The reason this polls at all: on a 1-vCPU box Nest can take well
         # over four seconds to bind, and a one-shot probe calls a working
         # deployment broken.
-        ssh = FakeSsh(fail_until=4)  # the fifth probe is the one that answers
+        target = FakeTarget(fail_until=4)  # the fifth probe is the one that answers
         slept = []
-        self.assertTrue(dd.poll_health(ssh, io.StringIO(), sleep=slept.append))
-        self.assertEqual(len(ssh.commands), 5)
+        self.assertTrue(dd.poll_health(target, io.StringIO(), sleep=slept.append))
+        self.assertEqual(len(target.commands), 5)
         self.assertEqual(slept, [dd.HEALTH_INTERVAL_SECONDS] * 4)
 
     def test_an_api_that_never_binds_gives_up_after_twenty(self):
-        ssh = FakeSsh(fail_until=10 ** 6)
+        target = FakeTarget(fail_until=10 ** 6)
         slept = []
-        self.assertFalse(dd.poll_health(ssh, io.StringIO(), sleep=slept.append))
-        self.assertEqual(len(ssh.commands), dd.HEALTH_ATTEMPTS)
+        self.assertFalse(dd.poll_health(target, io.StringIO(), sleep=slept.append))
+        self.assertEqual(len(target.commands), dd.HEALTH_ATTEMPTS)
         self.assertEqual(len(slept), dd.HEALTH_ATTEMPTS - 1)
 
 
 class TestRunSteps(unittest.TestCase):
     def test_it_names_every_step_as_it_runs(self):
-        ssh = FakeSsh()
+        target = FakeTarget()
         out = io.StringIO()
-        dd.run_steps(ssh, [dd.Step("first", "a"), dd.Step("second", "b")], out)
+        dd.run_steps(target, [dd.Step("first", "a"), dd.Step("second", "b")], out)
         self.assertIn("first", out.getvalue())
         self.assertIn("second", out.getvalue())
-        self.assertEqual(ssh.commands, ["a", "b"])
+        self.assertEqual(target.commands, ["a", "b"])
 
     def test_it_stops_at_the_first_failure(self):
-        ssh = FakeSsh(fail_on="b")
+        target = FakeTarget(fail_on="b")
         with self.assertRaises(dd.Refusal):
             dd.run_steps(
-                ssh,
+                target,
                 [dd.Step("first", "a"), dd.Step("second", "b"), dd.Step("third", "c")],
                 io.StringIO(),
             )
-        self.assertEqual(ssh.commands, ["a", "b"])
+        self.assertEqual(target.commands, ["a", "b"])
 
     def test_the_refusal_names_the_step_and_quotes_the_stderr(self):
-        ssh = FakeSsh(fail_on="b", stderr="pg_hba.conf: permission denied")
+        target = FakeTarget(fail_on="b", stderr="pg_hba.conf: permission denied")
         with self.assertRaises(dd.Refusal) as caught:
-            dd.run_steps(ssh, [dd.Step("second", "b")], io.StringIO())
+            dd.run_steps(target, [dd.Step("second", "b")], io.StringIO())
         self.assertIn("second", str(caught.exception))
         self.assertIn("permission denied", str(caught.exception))
 
@@ -1800,10 +1791,10 @@ class TestRunSteps(unittest.TestCase):
             "psql:<stdin>:3: ERROR:  syntax error at or near \"xK9pQzSecret\"\n"
             "LINE 3:   CREATE ROLE dsr LOGIN PASSWORD '%s';\n" % password
         )
-        ssh = FakeSsh(fail_on="b", stderr=echoed)
+        target = FakeTarget(fail_on="b", stderr=echoed)
         with self.assertRaises(dd.Refusal) as caught:
             dd.run_steps(
-                ssh,
+                target,
                 [dd.Step("create the roles", "b")],
                 io.StringIO(),
                 {"DB_PASS": password, "APP_PASS": "app-pass-value"},
@@ -1819,18 +1810,18 @@ class TestRunSteps(unittest.TestCase):
         # scrub only knows the values it was handed. redact_url catches a
         # password that was never staged locally -- one already in a .env on
         # the box -- so both filters run, not one.
-        ssh = FakeSsh(
+        target = FakeTarget(
             fail_on="b",
             stderr="could not connect to postgres://dsr:onTheBox9@127.0.0.1:5432/dsr",
         )
         with self.assertRaises(dd.Refusal) as caught:
-            dd.run_steps(ssh, [dd.Step("migrate", "b")], io.StringIO(), {})
+            dd.run_steps(target, [dd.Step("migrate", "b")], io.StringIO(), {})
         self.assertNotIn("onTheBox9", str(caught.exception))
 
     def test_a_failure_with_no_secrets_staged_still_refuses_readably(self):
-        ssh = FakeSsh(fail_on="b", stderr="pg_hba.conf: permission denied")
+        target = FakeTarget(fail_on="b", stderr="pg_hba.conf: permission denied")
         with self.assertRaises(dd.Refusal) as caught:
-            dd.run_steps(ssh, [dd.Step("second", "b")], io.StringIO(), None)
+            dd.run_steps(target, [dd.Step("second", "b")], io.StringIO(), None)
         self.assertIn("permission denied", str(caught.exception))
 
 
@@ -1909,14 +1900,16 @@ class TestScrub(unittest.TestCase):
 
 
 class CommandTestCase(unittest.TestCase):
-    """Base for the cmd_provision / cmd_deploy tests. No host, no secrets file.
+    """Base for the cmd_provision / cmd_deploy tests. Nothing runs, nothing
+    is read.
 
-    Everything that would reach the world is replaced: target_ssh (so no
-    deploy/.target.env is read), read_secrets (so no secrets file on this
-    machine is opened), subprocess.run (so no npm build runs) and
-    time.sleep (so a health-poll timeout costs no wall clock). What is left
-    is the *order* of the decisions these two functions make, which is the
-    region the fail-open fingerprint guard lived in.
+    Everything that would reach the machine is replaced: the target (so no
+    command executes and no file is written), read_secrets and
+    read_existing_env (so no secrets file and no /opt/dsr/server/.env is
+    opened), subprocess.run (so no npm build runs) and time.sleep (so a
+    health-poll timeout costs no wall clock). What is left is the *order* of
+    the decisions these two functions make, which is the region the
+    fail-open fingerprint guard lived in.
     """
 
     SECRETS = {
@@ -1946,16 +1939,14 @@ class CommandTestCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def ssh(self, responses=None, **kwargs):
+    def target(self, responses=None, **kwargs):
         answers = dict(responses or {})
         answers.setdefault("df -PB1", (0, DF_PLENTY, ""))
-        # A box with no .env yet: the probe ran (exit 0) and printed nothing.
-        answers.setdefault(dd.REMOTE_FINGERPRINT_COMMAND, (0, "", ""))
         answers.setdefault(dd.health_command(), (0, "", ""))
-        return FakeSsh(responses=answers, **kwargs)
+        return FakeTarget(responses=answers, **kwargs)
 
-    def run_command(self, func, argv, ssh=None, secrets=None):
-        ssh = ssh if ssh is not None else self.ssh()
+    def run_command(self, func, argv, target=None, secrets=None, installed=None):
+        target = target if target is not None else self.target()
 
         def fake_subprocess_run(command, **kwargs):
             self.builds.append((command, kwargs.get("cwd")))
@@ -1968,7 +1959,9 @@ class CommandTestCase(unittest.TestCase):
         args = dd.build_parser().parse_args(argv)
         with contextlib.ExitStack() as stack:
             stack.enter_context(
-                unittest.mock.patch.object(dd, "target_ssh", lambda: (ssh, self.HOST))
+                unittest.mock.patch.object(
+                    dd, "read_existing_env", lambda *a, **k: dict(installed or {})
+                )
             )
             stack.enter_context(
                 unittest.mock.patch.object(dd, "read_secrets", fake_read_secrets)
@@ -1980,205 +1973,56 @@ class CommandTestCase(unittest.TestCase):
                 unittest.mock.patch.object(dd.time, "sleep", self.slept.append)
             )
             stack.enter_context(unittest.mock.patch.object(sys, "stderr", self.err))
-            code = func(args, out=self.out)
-        return code, ssh
-
-
-class TestConnectionCountMatchesTheSpec(CommandTestCase):
-    """The spec's connection table, checked against the real command bodies.
-
-    The spec used to describe a different tool: one pushed copy re-invoked
-    as `ssh host "python3 /root/dsr_deploy.py --remote deploy"`, printing
-    one JSON document -- and it *rejected* per-step SSH on the grounds that
-    Windows OpenSSH has no ControlMaster. Per-step SSH is what was built.
-    That is a defensible outcome and the spec now says so, with the counts
-    written down. A number in prose rots the moment a step is added, so it
-    is read back out of the spec here rather than restated.
-    """
-
-    SPEC = (
-        pathlib.Path(__file__).resolve().parent.parent
-        / "docs"
-        / "superpowers"
-        / "specs"
-        / "2026-08-30-rhel-deployer-design.md"
-    )
-
-    def spec_text(self):
-        if not self.SPEC.exists():  # pragma: no cover - the spec is in-repo
-            self.skipTest("spec not present: %s" % self.SPEC)
-        return self.SPEC.read_text(encoding="utf-8")
-
-    def test_provision_opens_the_number_of_connections_the_spec_claims(self):
-        _code, ssh = self.run_command(dd.cmd_provision, ["provision"])
-        self.assertIn("| `provision` | %d |" % len(ssh.events), self.spec_text())
-
-    def test_deploy_opens_the_number_of_connections_the_spec_claims(self):
-        _code, healthy = self.run_command(dd.cmd_deploy, ["deploy"])
-        slow = self.ssh(responses={dd.health_command(): (1, "", "")})
-        self.run_command(dd.cmd_deploy, ["deploy"], ssh=slow)
-        self.assertIn(
-            "| `deploy` | %d on the healthy path, up to %d when the health "
-            "poll runs its full twenty probes |"
-            % (len(healthy.events), len(slow.events)),
-            self.spec_text(),
-        )
-
-    def test_doctor_opens_the_number_of_connections_the_spec_claims(self):
-        ssh = FakeSsh()
-        with contextlib.redirect_stdout(io.StringIO()):
-            dd.cmd_doctor(
-                dd.build_parser().parse_args(["doctor"]),
-                dd.SshRunner(ssh),
-                now_epoch=1700000000,
-            )
-        self.assertIn("| `doctor` | %d |" % len(ssh.events), self.spec_text())
-
-    def test_the_spec_no_longer_promises_a_json_document(self):
-        # The one sentence that described output the tool never produces.
-        text = self.spec_text()
-        self.assertNotIn("prints one JSON document", text)
-        self.assertIn("No JSON document is produced", text)
-
-    def test_doctor_neither_pushes_itself_nor_invokes_itself_remotely(self):
-        # What the spec's "first act of every command" claimed, and what is
-        # actually true: push_self is provision and deploy only.
-        ssh = FakeSsh()
-        with contextlib.redirect_stdout(io.StringIO()):
-            dd.cmd_doctor(
-                dd.build_parser().parse_args(["doctor"]),
-                dd.SshRunner(ssh),
-                now_epoch=1700000000,
-            )
-        self.assertEqual(ssh.pushed_files, [])
-        for command in ssh.commands:
-            self.assertNotIn(dd.REMOTE_SELF, command, command)
-
-    def test_the_pushed_copy_is_used_for_exactly_the_two_stated_jobs(self):
-        # REMOTE_SELF earns its place in the spec only for these two.
-        uses = [
-            command
-            for command in (
-                [s.command for s in dd.provision_steps()]
-                + [s.command for s in dd.deploy_steps({})]
-                + [dd.REMOTE_FINGERPRINT_COMMAND]
-            )
-            if dd.REMOTE_SELF.rsplit("/", 1)[0] in command and "dsr_deploy" in command
-        ]
-        self.assertEqual(len(uses), 3, uses)
-        self.assertEqual(
-            sum(1 for u in uses if "rewrite_pg_hba" in u),
-            1,
-        )
-        self.assertEqual(
-            sum(1 for u in uses if "neutralise_default_server" in u),
-            1,
-        )
-        self.assertEqual(sum(1 for u in uses if "key_fingerprint" in u), 1)
-
-
-class TestFingerprintProbeGuard(CommandTestCase):
-    """The probe's *return code*, not just what it printed.
-
-    fingerprint_refusal reads an empty remote fingerprint as a first
-    deployment, which is right when the box genuinely has no .env. Every way
-    the probe can fail looks exactly the same on stdout, so before this the
-    guard passed on a box where it had never run -- and the box where it
-    cannot run is the RHEL 9 box with Python 3.9, the one it exists for.
-    """
-
-    def test_a_clean_probe_is_not_a_refusal(self):
-        self.assertEqual(dd.fingerprint_probe_refusal(0, "", "root@h"), "")
-
-    def test_a_failed_probe_names_the_exit_code_and_quotes_the_stderr(self):
-        message = dd.fingerprint_probe_refusal(
-            127, "bash: python3: command not found", "root@h"
-        )
-        self.assertIn("127", message)
-        self.assertIn("python3: command not found", message)
-        self.assertIn("root@h", message)
-
-    def test_a_failed_probe_that_said_nothing_still_refuses(self):
-        message = dd.fingerprint_probe_refusal(1, "", "root@h")
-        self.assertTrue(message.startswith("FATAL:"))
-
-    def test_an_unimportable_deployer_on_the_box_stops_the_deployment(self):
-        # The coupled failure: this file must run on RHEL 9's Python 3.9
-        # while being written on a newer one. One 3.10-only construct and
-        # `import dsr_deploy` raises on every real box -- unit suite green,
-        # --dry-run perfect, guard silently disarmed.
-        ssh = self.ssh(
-            responses={
-                dd.REMOTE_FINGERPRINT_COMMAND: (
-                    1,
-                    "",
-                    "ModuleNotFoundError: No module named 'dsr_deploy'",
-                )
-            }
-        )
-        with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
-        message = str(caught.exception)
-        self.assertIn("exit 1", message)
-        self.assertIn("ModuleNotFoundError", message)
-        # Nothing was built and nothing was pushed over the box's bundles.
-        self.assertEqual(self.builds, [])
-        self.assertEqual(ssh.pushed_dirs, [])
-
-    def test_a_genuine_first_deployment_still_goes_ahead(self):
-        # The other half: exit 0 with no output is a box with no .env, and
-        # must stay a first deployment rather than becoming a refusal.
-        code, ssh = self.run_command(dd.cmd_deploy, ["deploy"])
-        self.assertEqual(code, 0)
-        self.assertTrue(ssh.pushed_dirs)
+            code = func(args, out=self.out, target=target)
+        return code, target
 
 
 class TestCmdProvision(CommandTestCase):
     """The function this task existed to create, which had no test at all."""
 
     def test_dry_run_reads_no_secrets_and_never_touches_the_box(self):
-        code, ssh = self.run_command(dd.cmd_provision, ["provision", "--dry-run"])
+        code, target = self.run_command(dd.cmd_provision, ["provision", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(self.secrets_read, [])
-        self.assertEqual(ssh.events, [])
+        self.assertEqual(target.events, [])
         self.assertIn("install base packages", self.out.getvalue())
 
     def test_it_runs_every_provisioning_step_in_order(self):
-        code, ssh = self.run_command(dd.cmd_provision, ["provision"])
+        code, target = self.run_command(dd.cmd_provision, ["provision"])
         self.assertEqual(code, 0)
         expected = [s.command for s in dd.provision_steps()]
-        ran = [c for _kind, c in [e for e in ssh.events if e[0] == "run"]]
+        ran = [c for _kind, c in [e for e in target.events if e[0] == "run"]]
         for command in expected:
             self.assertIn(command, ran)
         self.assertIn("PROVISION_OK", self.out.getvalue())
 
     def test_the_budget_is_checked_before_a_single_step_runs(self):
-        _code, ssh = self.run_command(dd.cmd_provision, ["provision"])
+        _code, target = self.run_command(dd.cmd_provision, ["provision"])
         first_step = dd.provision_steps()[0].command
-        self.assertLess(ssh.index_of_run("df -PB1"), ssh.index_of_run(first_step))
+        self.assertLess(target.index_of_run("df -PB1"), target.index_of_run(first_step))
 
     def test_a_full_box_is_refused_before_anything_is_staged(self):
-        ssh = self.ssh(responses={"df -PB1": (0, DF_SINGLE_ROOT_NEARLY_FULL, "")})
+        target = self.target(responses={"df -PB1": (0, DF_SINGLE_ROOT_NEARLY_FULL, "")})
         with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_provision, ["provision"], ssh=ssh)
+            self.run_command(dd.cmd_provision, ["provision"], target=target)
         self.assertIn("FATAL:", str(caught.exception))
-        self.assertEqual(ssh.pushed_texts, [])
+        self.assertEqual(target.written, [])
 
     def test_the_staged_secrets_are_removed_even_when_a_step_fails(self):
         failing = dd.provision_steps()[1].command
-        ssh = self.ssh(responses={failing: (1, "", "No package nginx available")})
+        target = self.target(responses={failing: (1, "", "No package nginx available")})
         with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_provision, ["provision"], ssh=ssh)
+            self.run_command(dd.cmd_provision, ["provision"], target=target)
         self.assertIn("No package nginx available", str(caught.exception))
         # The whole reason the removal is in a `finally`: a 0600 file with
         # both role passwords must not outlive a failed run.
-        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
 
     def test_a_failing_deploy_step_does_not_quote_the_staged_password(self):
         secrets = dict(self.SECRETS)
         secrets["DB_PASS"] = "7xK9pQzSecretValue"
         failing = dd.deploy_steps(secrets)[3].command
-        ssh = self.ssh(
+        target = self.target(
             responses={
                 failing: (
                     1,
@@ -2188,7 +2032,7 @@ class TestCmdProvision(CommandTestCase):
             }
         )
         with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh, secrets=secrets)
+            self.run_command(dd.cmd_deploy, ["deploy"], target=target, secrets=secrets)
         self.assertNotIn("7xK9pQzSecretValue", str(caught.exception))
 
     def test_a_failing_provision_step_does_not_quote_the_staged_password(self):
@@ -2196,7 +2040,7 @@ class TestCmdProvision(CommandTestCase):
         secrets = dict(self.SECRETS)
         secrets["APP_PASS"] = "appQzSecretValue42"
         failing = [s for s in dd.provision_steps() if "role" in s.name][0].command
-        ssh = self.ssh(
+        target = self.target(
             responses={
                 failing: (
                     1,
@@ -2207,7 +2051,7 @@ class TestCmdProvision(CommandTestCase):
             }
         )
         with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_provision, ["provision"], ssh=ssh, secrets=secrets)
+            self.run_command(dd.cmd_provision, ["provision"], target=target, secrets=secrets)
         self.assertNotIn("appQzSecretValue42", str(caught.exception))
         self.assertIn("role", str(caught.exception))
 
@@ -2225,18 +2069,18 @@ class TestCmdProvision(CommandTestCase):
             "dsr-api[981]:     at new NodeError (node:internal/errors:399:5)\n"
             "dsr-api[981]: DATABASE_URL_APP=postgres://dsr_app:appQzSecret42@h/dsr\n"
         )
-        ssh = self.ssh(
+        target = self.target(
             responses={
                 dd.health_command(): (1, "", ""),
                 dd.JOURNAL_TAIL_COMMAND: (0, journal, ""),
             }
         )
-        code, ssh = self.run_command(
-            dd.cmd_deploy, ["deploy"], ssh=ssh, secrets=secrets
+        code, target = self.run_command(
+            dd.cmd_deploy, ["deploy"], target=target, secrets=secrets
         )
         self.assertEqual(code, 1)
         printed = self.err.getvalue()
-        self.assertIn(dd.JOURNAL_TAIL_COMMAND, ssh.commands)
+        self.assertIn(dd.JOURNAL_TAIL_COMMAND, target.commands)
         self.assertNotIn("7xK9pQzSecret", printed)
         self.assertNotIn("appQzSecret42", printed)
         self.assertNotIn(secrets["CRYPTO_MASTER_KEY"], printed)
@@ -2245,24 +2089,24 @@ class TestCmdProvision(CommandTestCase):
         self.assertIn("did not come up", printed)
 
     def test_a_transfer_that_dies_mid_push_still_removes_the_secrets_file(self):
-        # push_text's remote `cat >` can create the file and then have the
-        # transfer fail. With the push outside the try, the finally never
-        # ran and a partial 0600 secrets file stayed on the box.
-        ssh = self.ssh()
+        # The write can create the file and then fail. With it outside the
+        # try, the finally never ran and a partial 0600 secrets file stayed
+        # on the box.
+        target = self.target()
 
-        def exploding_push_text(text, remote, mode=""):
-            ssh.events.append(("push_text", remote))
-            raise RuntimeError("push_text failed for " + remote + ": lost")
+        def exploding_write(path, text, mode=""):
+            target.events.append(("write", path))
+            raise RuntimeError("write failed for " + path + ": no space left")
 
-        ssh.push_text = exploding_push_text
+        target.write = exploding_write
         with self.assertRaises(RuntimeError):
-            self.run_command(dd.cmd_provision, ["provision"], ssh=ssh)
-        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+            self.run_command(dd.cmd_provision, ["provision"], target=target)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
 
     def test_it_stages_only_the_two_role_passwords(self):
-        _code, ssh = self.run_command(dd.cmd_provision, ["provision"])
-        self.assertEqual(len(ssh.pushed_texts), 1)
-        text, remote, mode = ssh.pushed_texts[0]
+        _code, target = self.run_command(dd.cmd_provision, ["provision"])
+        self.assertEqual(len(target.written), 1)
+        text, remote, mode = target.written[0]
         self.assertEqual(remote, dd.REMOTE_SECRETS)
         self.assertEqual(mode, "600")
         self.assertEqual(sorted(dd.parse_env_text(text)), ["APP_PASS", "DB_PASS"])
@@ -2273,43 +2117,43 @@ class TestCmdDeploy(CommandTestCase):
     """The other untested half, and the one the Critical lived in."""
 
     def test_dry_run_reads_no_secrets_and_never_touches_the_box(self):
-        code, ssh = self.run_command(dd.cmd_deploy, ["deploy", "--dry-run"])
+        code, target = self.run_command(dd.cmd_deploy, ["deploy", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(self.secrets_read, [])
-        self.assertEqual(ssh.events, [])
+        self.assertEqual(target.events, [])
         self.assertEqual(self.builds, [])
         self.assertIn("restart dsr-api", self.out.getvalue())
 
     def test_a_successful_deployment_runs_every_step_and_reports_ok(self):
-        code, ssh = self.run_command(dd.cmd_deploy, ["deploy"])
+        code, target = self.run_command(dd.cmd_deploy, ["deploy"])
         self.assertEqual(code, 0)
-        ran = [c for _k, c in [e for e in ssh.events if e[0] == "run"]]
+        ran = [c for _k, c in [e for e in target.events if e[0] == "run"]]
         for step in dd.deploy_steps(dict(self.SECRETS)):
             self.assertIn(step.command, ran)
         self.assertIn("DEPLOY_OK", self.out.getvalue())
 
-    def test_both_guards_run_before_the_first_directory_is_mirrored(self):
-        # push_dir removes its destination before it unpacks, so a guard
-        # that fires after the first push has already cost the box a
-        # working install. Both must precede it, and the fingerprint --
-        # the unrecoverable one -- must precede the disk check.
-        _code, ssh = self.run_command(dd.cmd_deploy, ["deploy"])
-        fingerprint = ssh.index_of_run(dd.REMOTE_FINGERPRINT_COMMAND)
-        disk = ssh.index_of_run("df -PB1")
-        first_push = ssh.first_index_of("push_dir")
-        self.assertIsNotNone(first_push)
-        self.assertLess(fingerprint, disk)
-        self.assertLess(disk, first_push)
+    def test_the_disk_budget_runs_before_the_first_directory_is_mirrored(self):
+        # copy_dir removes its destination before it copies, so a guard
+        # that fires after the first copy has already cost the box a
+        # working install.
+        _code, target = self.run_command(dd.cmd_deploy, ["deploy"])
+        disk = target.index_of_run("df -PB1")
+        first_copy = target.first_index_of("copy_dir")
+        self.assertIsNotNone(first_copy)
+        self.assertLess(disk, first_copy)
 
     def test_a_mismatched_key_refuses_before_anything_is_pushed(self):
-        other = dd.key_fingerprint(base64.b64encode(b"\x09" * 32).decode())
-        ssh = self.ssh(
-            responses={dd.REMOTE_FINGERPRINT_COMMAND: (0, other + "\n", "")}
-        )
+        # The .env already on the box was written with a different key. Its
+        # encrypted rows cannot be read with any other one, so this refuses
+        # rather than overwriting it.
+        installed = {"CRYPTO_MASTER_KEY": base64.b64encode(b"\x09" * 32).decode()}
+        target = self.target()
         with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
+            self.run_command(
+                dd.cmd_deploy, ["deploy"], target=target, installed=installed
+            )
         self.assertIn("app_settings", str(caught.exception))
-        self.assertEqual(ssh.pushed_dirs, [])
+        self.assertEqual(target.copied_dirs, [])
         self.assertEqual(self.builds, [])
 
     def test_a_failed_build_pushes_nothing(self):
@@ -2317,11 +2161,11 @@ class TestCmdDeploy(CommandTestCase):
             self.builds.append((command, kwargs.get("cwd")))
             return dd.subprocess.CompletedProcess(command, 1)
 
-        ssh = self.ssh()
+        target = self.target()
         args = dd.build_parser().parse_args(["deploy"])
         with contextlib.ExitStack() as stack:
             stack.enter_context(
-                unittest.mock.patch.object(dd, "target_ssh", lambda: (ssh, self.HOST))
+                unittest.mock.patch.object(dd, "read_existing_env", lambda *a, **k: {})
             )
             stack.enter_context(
                 unittest.mock.patch.object(
@@ -2332,50 +2176,53 @@ class TestCmdDeploy(CommandTestCase):
                 unittest.mock.patch.object(dd.subprocess, "run", failing_build)
             )
             with self.assertRaises(dd.Refusal) as caught:
-                dd.cmd_deploy(args, out=self.out)
-        self.assertIn("Nothing was pushed", str(caught.exception))
-        self.assertEqual(ssh.pushed_dirs, [])
+                dd.cmd_deploy(args, out=self.out, target=target)
+        self.assertIn("Nothing was installed", str(caught.exception))
+        self.assertEqual(target.copied_dirs, [])
 
     def test_the_staged_secrets_are_removed_even_when_a_step_fails(self):
         failing = dd.deploy_steps(dict(self.SECRETS))[3].command
-        ssh = self.ssh(responses={failing: (1, "", "relation does not exist")})
+        target = self.target(responses={failing: (1, "", "relation does not exist")})
         with self.assertRaises(dd.Refusal):
-            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
-        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+            self.run_command(dd.cmd_deploy, ["deploy"], target=target)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
 
     def test_an_api_that_never_comes_up_fails_and_shows_the_journal(self):
-        ssh = self.ssh(responses={dd.health_command(): (1, "", "")})
-        code, ssh = self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
+        target = self.target(responses={dd.health_command(): (1, "", "")})
+        code, target = self.run_command(dd.cmd_deploy, ["deploy"], target=target)
         self.assertEqual(code, 1)
-        self.assertIn(dd.JOURNAL_TAIL_COMMAND, ssh.commands)
+        self.assertIn(dd.JOURNAL_TAIL_COMMAND, target.commands)
         self.assertNotIn("DEPLOY_OK", self.out.getvalue())
         self.assertIn("did not come up", self.err.getvalue())
         # It waited the full window rather than giving up on one probe, and
         # it still cleaned the secrets file up on the way out.
         self.assertEqual(len(self.slept), dd.HEALTH_ATTEMPTS - 1)
-        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
 
     def test_a_transfer_that_dies_mid_push_still_removes_the_secrets_file(self):
-        # push_text's remote `cat >` can create the file and then have the
-        # transfer fail. With the push outside the try, the finally never
-        # ran and a partial 0600 secrets file stayed on the box.
-        ssh = self.ssh()
+        # The write can create the file and then fail. With it outside the
+        # try, the finally never ran and a partial 0600 secrets file stayed
+        # on the box.
+        target = self.target()
 
-        def exploding_push_text(text, remote, mode=""):
-            ssh.events.append(("push_text", remote))
-            raise RuntimeError("push_text failed for " + remote + ": lost")
+        def exploding_write(path, text, mode=""):
+            target.events.append(("write", path))
+            raise RuntimeError("write failed for " + path + ": no space left")
 
-        ssh.push_text = exploding_push_text
+        target.write = exploding_write
         with self.assertRaises(RuntimeError):
-            self.run_command(dd.cmd_deploy, ["deploy"], ssh=ssh)
-        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, ssh.commands)
+            self.run_command(dd.cmd_deploy, ["deploy"], target=target)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
 
-    def test_the_deployer_itself_is_pushed_before_the_probe_that_uses_it(self):
-        _code, ssh = self.run_command(dd.cmd_deploy, ["deploy"])
-        self.assertIn(("push_file", dd.REMOTE_SELF), ssh.events)
+    def test_the_deployer_copies_itself_before_any_step_can_invoke_it(self):
+        # Two provisioning steps run `python3 /root/dsr_deploy.py`; deploy
+        # copies it too, so the copy on the box is never the previous
+        # release's while this release's steps are running.
+        _code, target = self.run_command(dd.cmd_deploy, ["deploy"])
+        self.assertIn(("copy_file", dd.REMOTE_SELF), target.events)
         self.assertLess(
-            ssh.events.index(("push_file", dd.REMOTE_SELF)),
-            ssh.index_of_run(dd.REMOTE_FINGERPRINT_COMMAND),
+            target.events.index(("copy_file", dd.REMOTE_SELF)),
+            target.first_index_of("copy_dir"),
         )
 
 
@@ -2493,27 +2340,139 @@ class TestAtomicWrite(unittest.TestCase):
         )
 
 
-class TestTarget(unittest.TestCase):
-    def test_reads_host_and_key(self):
-        target = dd.load_target('HOST=root@1.2.3.4\nSSH_KEY=~/.ssh/id_ed25519\n')
-        self.assertEqual(target["HOST"], "root@1.2.3.4")
+class TestLocalTarget(unittest.TestCase):
+    """The transport, which is now a subprocess and a file copy.
 
-    def test_deploy_host_is_accepted_as_an_alias(self):
-        self.assertEqual(dd.load_target("DEPLOY_HOST=root@x\n")["HOST"], "root@x")
+    Nothing here runs a step: the argv is asserted, and the two that touch
+    the filesystem are given a temporary directory of their own.
+    """
+
+    def setUp(self):
+        self.directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.directory), True)
+        self.target = dd.LocalTarget()
+
+    def test_the_command_is_one_argv_element_handed_to_bash(self):
+        # Not shell=True: the steps use `${x//a/b}`, brace expansion and
+        # `set -o pipefail`, none of which a POSIX /bin/sh has to have.
+        argv = self.target.argv("echo 'a b'; rm -rf /nope")
+        self.assertEqual(argv[0], "/bin/bash")
+        self.assertEqual(argv[1], "-c")
+        self.assertEqual(argv[2], "echo 'a b'; rm -rf /nope")
+        self.assertEqual(len(argv), 3)
+
+    def test_write_creates_the_parent_directory(self):
+        path = self.directory / "nested" / "deeper" / "file.env"
+        self.target.write(str(path), "A=1\n")
+        self.assertEqual(path.read_text(), "A=1\n")
+
+    def test_a_moded_write_never_exists_readable_even_for_an_instant(self):
+        # REMOTE_SECRETS holds both role passwords. chmod after the fact
+        # leaves a window in which another user can open it, so the mode
+        # has to be the one the file is created with.
+        opened = []
+        real_open = os.open
+
+        def recording_open(path, flags, mode=0o777, **kwargs):
+            opened.append((str(path), mode))
+            return real_open(path, flags, mode, **kwargs)
+
+        path = self.directory / "secrets.env"
+        with unittest.mock.patch.object(os, "open", recording_open):
+            self.target.write(str(path), "DB_PASS='x'\n", mode="600")
+        self.assertEqual(opened, [(str(path), 0o600)])
+        self.assertEqual(path.read_text(), "DB_PASS='x'\n")
+
+    def test_a_moded_write_fixes_the_mode_of_a_file_that_already_existed(self):
+        # O_CREAT's mode applies only at creation, so a secrets file left
+        # over from an older run would keep whatever mode it had.
+        path = self.directory / "secrets.env"
+        path.write_text("old\n")
+        chmodded = []
+        with unittest.mock.patch.object(os, "chmod", lambda *a: chmodded.append(a)):
+            self.target.write(str(path), "new\n", mode="600")
+        self.assertEqual(chmodded, [(str(path), 0o600)])
+        self.assertEqual(path.read_text(), "new\n")
+
+    def test_copy_file_creates_the_destination_directory(self):
+        source = self.directory / "dsr_deploy.py"
+        source.write_text("# tool\n")
+        destination = self.directory / "root" / "dsr_deploy.py"
+        self.target.copy_file(str(source), str(destination))
+        self.assertEqual(destination.read_text(), "# tool\n")
+
+    def test_copy_file_refuses_a_source_that_is_not_there(self):
+        with self.assertRaises(dd.Refusal) as caught:
+            self.target.copy_file(
+                str(self.directory / "absent"), str(self.directory / "out")
+            )
+        self.assertIn("absent", str(caught.exception))
+
+    def test_copy_dir_mirrors_rather_than_merges(self):
+        source = self.directory / "dist"
+        (source / "assets").mkdir(parents=True)
+        (source / "index.html").write_text("new\n")
+        destination = self.directory / "www"
+        destination.mkdir()
+        (destination / "stale.js").write_text("from the last deploy\n")
+        self.target.copy_dir(str(source), str(destination))
+        self.assertEqual((destination / "index.html").read_text(), "new\n")
+        self.assertFalse((destination / "stale.js").exists())
+        self.assertTrue((destination / "assets").is_dir())
+
+    def test_copy_dir_refuses_the_uploads_directory_and_every_parent(self):
+        # The removal is the danger: mirroring onto /opt/dsr takes
+        # /opt/dsr/uploads with it, and those are identity documents held
+        # as regulatory records. deploy_payload has never named such a
+        # path, and a test walks it -- but the check belongs at the point
+        # of deletion too, where a future caller cannot get round it.
+        source = self.directory / "dist"
+        source.mkdir()
+        for destination in (dd.UPLOADS_DIR, dd.UPLOADS_DIR + "/", "/opt/dsr", "/"):
+            with self.assertRaises(dd.Refusal) as caught:
+                self.target.copy_dir(str(source), destination)
+            self.assertIn("uploads", str(caught.exception))
+
+    def test_copy_dir_still_allows_the_real_destinations(self):
+        # The other half of the guard's contract: everything deploy_payload
+        # actually names has to pass it.
+        source = self.directory / "dist"
+        source.mkdir()
+        for item in dd.deploy_payload("/repo"):
+            if item.kind != "dir":
+                continue
+            self.assertFalse(
+                dd.is_ancestor_of(item.remote, dd.UPLOADS_DIR), item.remote
+            )
+
+    def test_copy_dir_refuses_a_source_that_was_never_built(self):
+        with self.assertRaises(dd.Refusal) as caught:
+            self.target.copy_dir(
+                str(self.directory / "dist"), str(self.directory / "www")
+            )
+        self.assertIn("--skip-build", str(caught.exception))
 
 
-class TestSsh(unittest.TestCase):
-    def test_builds_a_command_with_the_key_and_no_host_key_prompt(self):
-        argv = dd.Ssh("root@h", "/k/id").argv("uptime")
-        self.assertIn("-i", argv)
-        self.assertIn("/k/id", argv)
-        self.assertIn("root@h", argv)
-        self.assertIn("uptime", argv)
+class TestAncestry(unittest.TestCase):
+    """dsr_deploy's own copy of the ancestry test, which copy_dir refuses on."""
 
-    def test_the_remote_command_is_one_argv_element_not_shell_spliced(self):
-        # The whole point of pushing the tool to the box: no nested quoting.
-        argv = dd.Ssh("root@h", "/k/id").argv("echo 'a b'; rm -rf /")
-        self.assertIn("echo 'a b'; rm -rf /", argv)
+    def test_the_path_itself_and_its_parents_count(self):
+        self.assertTrue(dd.is_ancestor_of("/opt/dsr/uploads", dd.UPLOADS_DIR))
+        self.assertTrue(dd.is_ancestor_of("/opt/dsr/uploads/", dd.UPLOADS_DIR))
+        self.assertTrue(dd.is_ancestor_of("/opt/dsr", dd.UPLOADS_DIR))
+        self.assertTrue(dd.is_ancestor_of("/", dd.UPLOADS_DIR))
+
+    def test_a_sibling_or_a_child_does_not(self):
+        self.assertFalse(dd.is_ancestor_of("/opt/dsr/server/dist", dd.UPLOADS_DIR))
+        self.assertFalse(dd.is_ancestor_of("/opt/dsrx", dd.UPLOADS_DIR))
+        self.assertFalse(dd.is_ancestor_of("/var/www/dsr/admin", dd.UPLOADS_DIR))
+
+    def test_an_empty_candidate_answers_the_way_a_deletion_should(self):
+        # "" .rstrip("/") is "", and "" + "/" prefixes every absolute path,
+        # so an empty destination answers True exactly as "/" does. That is
+        # the right way round: the question is "may I delete this?", and an
+        # empty path is not one this tool should be mirroring onto.
+        self.assertTrue(dd.is_ancestor_of("", dd.UPLOADS_DIR))
 
 
 # ---------------------------------------------------------------------------

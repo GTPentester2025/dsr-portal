@@ -25,6 +25,8 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -36,14 +38,16 @@ INSTALL_PREFIX = "/opt/dsr"
 WEB_ROOT = "/var/www/dsr"
 UPLOADS_DIR = "/opt/dsr/uploads"
 ENV_PATH = "/opt/dsr/server/.env"
-# /root rather than the install prefix: provision runs against a bare host
-# where /opt/dsr and the dsr user do not exist yet, and .target.env already
-# assumes a root@host ssh target.
+# A copy of this file, kept where the steps can find it. /root rather than
+# the install prefix: the copy is made before /opt/dsr or the dsr user
+# exist, and the run is root's either way. Two provisioning steps invoke
+# `python3 /root/dsr_deploy.py` to reuse the pg_hba and nginx transforms
+# rather than re-deriving them in sed, so this copy is load bearing.
 REMOTE_SELF = "/root/dsr_deploy.py"
-# Where the secret values a step needs are staged on the box, mode 0600 and
-# deleted when the run ends. A file rather than a `DB_PASS=... command`
-# prefix because the second form puts the password in the box's process
-# table for anyone with `ps` to read.
+# Where the secret values a step needs are staged, mode 0600 and deleted
+# when the run ends. A file rather than a `DB_PASS=... command` prefix
+# because the second form puts the password in the process table for
+# anyone with `ps` to read.
 REMOTE_SECRETS = "/root/.dsr-secrets.env"
 STATE_PATH = "/var/lib/dsr-deploy/state.json"
 SERVICE = "dsr-api"
@@ -139,6 +143,18 @@ def validate_master_key(raw: str) -> None:
 def key_fingerprint(raw: str) -> str:
     """Eight hex characters identifying a key, without revealing any of it."""
     return hashlib.sha256((raw or "").strip().encode()).hexdigest()[:8]
+
+
+def key_fingerprint_or_blank(raw: str) -> str:
+    """The fingerprint of a key, or "" when there is no key at all.
+
+    key_fingerprint("") is a perfectly good hash of nothing. Handing it to
+    fingerprint_refusal as "what is already installed" would mismatch every
+    real key and refuse every first deployment, so absence has to stay
+    distinguishable from a hash.
+    """
+    raw = (raw or "").strip()
+    return key_fingerprint(raw) if raw else ""
 
 
 def validate_email_config(env: dict) -> list:
@@ -560,111 +576,112 @@ def render_plan(steps: list) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def load_target(text: str) -> dict:
-    """Parse deploy/.target.env. DEPLOY_HOST is accepted as an alias for HOST,
-    matching what deploy.sh already does (`HOST="${HOST:-${DEPLOY_HOST:-}}"`).
+def is_ancestor_of(candidate: str, path: str) -> bool:
+    """True when `candidate` is `path` or a directory containing it.
+
+    copy_dir mirrors a directory by removing its destination first, so a
+    destination of /opt/dsr destroys /opt/dsr/uploads without the string
+    "uploads" appearing anywhere in it. Comparing prefixes textually rather
+    than resolving the paths on disk is deliberate: this has to answer the
+    same way on a machine where neither path exists.
+
+    "" answers True for the same reason "/" does -- `"".rstrip("/") + "/"`
+    prefixes every absolute path. An empty destination is not a path this
+    tool should be mirroring onto either, and the safe answer to a question
+    about deletion is the one that refuses.
     """
-    env = parse_env_text(text)
-    if "HOST" not in env and "DEPLOY_HOST" in env:
-        env["HOST"] = env["DEPLOY_HOST"]
-    return env
+    candidate = (candidate or "").rstrip("/")
+    return path == candidate or path.startswith(candidate + "/")
 
 
-def unpack_command(remote: str) -> str:
-    """The far side of push_dir: replace `remote` with what arrives on stdin.
+class LocalTarget:
+    """Runs a step, or puts a file in place, on this machine.
 
-    A module-level function rather than a literal inside push_dir so that a
-    test can read the actual command instead of the docstring above it --
-    and so the `tar` it needs is one grep away from BASE_PACKAGES, which is
-    what has to carry it.
-    """
-    return "rm -rf '%s' && mkdir -p '%s' && tar -xzf - -C '%s'" % (
-        remote,
-        remote,
-        remote,
-    )
+    This tool runs on the server, as root, from the checkout that is already
+    there. What used to travel over ssh is now a subprocess and a file copy,
+    which is why every caller below takes one of these rather than reaching
+    for subprocess itself: `run`, `write`, `copy_file` and `copy_dir` are
+    the whole surface, and a test can substitute an object with the same
+    four methods and assert on what a run would have done.
 
-
-class Ssh:
-    """Runs a command on the target over ssh, or copies a file/directory to it.
-
-    The remote command is always a single argv element, never spliced into a
-    local shell string. That is the whole reason this tool copies itself to
-    the box: reading a file in Python beats a sed expression nested inside
-    three levels of shell quoting, and it means a command containing quotes,
-    semicolons or `$(...)` travels intact instead of being re-parsed twice.
+    Bash by name, not `shell=True`. /bin/sh is bash on RHEL 9 today, but the
+    steps use `${x//a/b}`, `{ssh,http,https}` and `set -o pipefail`, and a
+    box where /bin/sh became dash would fail them one at a time in ways that
+    read like the step, not like the shell.
     """
 
-    def __init__(self, target: str, key: str):
-        self.target = target
-        self.key = key
+    SHELL = "/bin/bash"
 
     def argv(self, command: str) -> list:
-        return ["ssh", "-o", "StrictHostKeyChecking=no", "-i", self.key, self.target, command]
+        return [self.SHELL, "-c", command]
 
     def run(self, command: str, check: bool = True):
         result = subprocess.run(self.argv(command), capture_output=True, text=True)
         if check and result.returncode != 0:
             raise RuntimeError(
-                "ssh command failed (exit %d): %s\n%s"
+                "command failed (exit %d): %s\n%s"
                 % (result.returncode, command, result.stderr)
             )
         return result
 
-    def push_file(self, local: str, remote: str) -> None:
-        """`cat > remote` fed from local's bytes -- matches deploy.sh's push_file."""
-        with open(local, "rb") as fh:
-            result = subprocess.run(
-                self.argv("cat > '%s'" % remote), stdin=fh, capture_output=True
-            )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "push_file failed for %s: %s"
-                % (remote, result.stderr.decode(errors="replace"))
-            )
+    def write(self, path: str, text: str, mode: str = "") -> None:
+        """Write text to a path, creating the parent directory.
 
-    def push_text(self, text: str, remote: str, mode: str = "") -> None:
-        """Write text to a remote path, fed over stdin.
-
-        The bytes travel on the pipe, never in the command. That matters
-        for REMOTE_SECRETS: a heredoc carrying a password would put it in
-        the argv of the remote shell, where `ps` on the box can read it for
-        as long as the connection lasts.
+        With `mode`, the file is created with those permissions rather than
+        chmod'ed into them afterwards: REMOTE_SECRETS holds both role
+        passwords, and a file that is 0644 for the instant between creation
+        and chmod is a file another user can open in that instant.
         """
-        command = "cat > '%s'" % remote
-        if mode:
-            command = "umask 077 && %s && chmod %s '%s'" % (command, mode, remote)
-        result = subprocess.run(
-            self.argv(command), input=text.encode(), capture_output=True
+        destination = pathlib.Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not mode:
+            destination.write_text(text)
+            return
+        bits = int(mode, 8)
+        handle = os.open(
+            str(destination), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, bits
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "push_text failed for %s: %s"
-                % (remote, result.stderr.decode(errors="replace"))
-            )
+        with os.fdopen(handle, "w") as stream:
+            stream.write(text)
+        # O_CREAT's mode applies only when the file did not already exist,
+        # so a pre-existing 0644 file needs saying again.
+        os.chmod(str(destination), bits)
 
-    def push_dir(self, local: str, remote: str) -> None:
-        """Mirror a directory: `tar -czf - -C local .` piped into a remote
-        `rm -rf dest && mkdir -p dest && tar -xzf - -C dest`, exactly what
-        deploy.sh does today so it keeps working from Git Bash on Windows.
+    def copy_file(self, local: str, remote: str) -> None:
+        source = pathlib.Path(local)
+        if not source.is_file():
+            raise Refusal("FATAL: %s is missing; nothing to copy to %s." % (local, remote))
+        destination = pathlib.Path(remote)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(source), str(destination))
+
+    def copy_dir(self, local: str, remote: str) -> None:
+        """Mirror a directory: the destination ends up holding exactly what
+        the source holds, which means removing what was there first.
+
+        That removal is why this refuses a destination that is, or contains,
+        the uploads directory. Those are identity documents held as
+        regulatory records; deploy_payload has never named such a path and a
+        test walks it, but the check belongs where the deletion happens too.
         """
-        tar = subprocess.Popen(["tar", "-czf", "-", "-C", local, "."], stdout=subprocess.PIPE)
-        ssh_proc = subprocess.Popen(
-            self.argv(unpack_command(remote)),
-            stdin=tar.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if tar.stdout is not None:
-            tar.stdout.close()
-        _out, err = ssh_proc.communicate()
-        tar.wait()
-        if tar.returncode != 0:
-            raise RuntimeError("tar failed for %s (exit %d)" % (local, tar.returncode))
-        if ssh_proc.returncode != 0:
-            raise RuntimeError(
-                "push_dir failed for %s: %s" % (remote, (err or b"").decode(errors="replace"))
+        if is_ancestor_of(remote, UPLOADS_DIR):
+            raise Refusal(
+                "FATAL: refusing to mirror %s onto %s -- that is %s or a "
+                "directory containing it, and mirroring removes the "
+                "destination first. Those are uploaded identity documents "
+                "held as regulatory records." % (local, remote, UPLOADS_DIR)
             )
+        source = pathlib.Path(local)
+        if not source.is_dir():
+            raise Refusal(
+                "FATAL: %s does not exist, so there is nothing to install at "
+                "%s. Run without --skip-build to build it." % (local, remote)
+            )
+        destination = pathlib.Path(remote)
+        if destination.exists():
+            shutil.rmtree(str(destination))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(source), str(destination))
 
 
 def _cat_heredoc_command(
@@ -672,13 +689,13 @@ def _cat_heredoc_command(
 ) -> str:
     """A `cat > remote_path <<MARKER` fragment carrying file content.
 
-    The delimiter is quoted by default, so the remote shell expands nothing
-    inside and the content lands byte-for-byte without a second SSH round
-    trip for what push_file would otherwise do.
+    The delimiter is quoted by default, so the shell expands nothing inside
+    and the content lands byte-for-byte, which is what lets a config file
+    holding `$` and backticks travel inside a step at all.
 
     `expand=True` unquotes it, which is how the service .env is written:
     the body holds `${DB_PASS}` rather than the password itself, and the
-    remote shell substitutes values it read from REMOTE_SECRETS. That is
+    shell substitutes values it read from REMOTE_SECRETS. That is
     what keeps a secret out of every Step, and so out of `--dry-run`.
     """
     if not content.endswith("\n"):
@@ -840,12 +857,12 @@ PG_MAJOR_TEST = (
 
 # What every later step and every deploy assumes is already there.
 #
-# `tar` is on this list because `push_dir` runs `tar -xzf -` on the box, and
-# a RHEL 9 minimal install does not reliably ship it. Without it provision
-# succeeds, reports success, and deploy then dies on its first payload
-# transfer -- which is the worst place to find out, because the operator has
-# already been told the host is ready. It is one package and it is load
-# bearing; do not trim it.
+# `tar` is on this list because deploy/backup.sh runs `tar -czf` over
+# /opt/dsr/uploads and the database dump on a timer, and a RHEL 9 minimal
+# install does not reliably ship it. Without it provisioning succeeds,
+# reports success, and the first backup is the one that fails -- which
+# nobody is watching. It is one package and it is load bearing; do not
+# trim it.
 BASE_PACKAGES = (
     "curl",
     "ca-certificates",
@@ -1159,9 +1176,9 @@ _ENSURE_URLS_COMMAND = (
 def deploy_steps(env: dict) -> list:
     """The deployment sequence, in order.
 
-    Building/syncing the compiled bundles is the operator's runner's job
-    (Ssh.push_file / push_dir move bytes; they are not steps here). This is
-    everything that happens once those bytes are already on the box.
+    Putting the compiled bundles in place is LocalTarget's job (copy_file
+    and copy_dir move bytes; they are not steps here). This is everything
+    that happens once those bytes are where they belong.
     Migration must precede the restart -- an old process serving a schema
     it does not understand is worse than a few extra seconds of downtime.
 
@@ -1342,25 +1359,6 @@ HEALTH_INTERVAL_SECONDS = 3
 
 JOURNAL_TAIL_COMMAND = "journalctl -u %s -n 25 --no-pager" % SERVICE
 
-# Asks the pushed copy of this tool for the fingerprint of the key already on
-# the box. Both sides of the comparison therefore run key_fingerprint over a
-# value parse_env_text extracted -- the same function, the same normalisation.
-#
-# deploy.sh does this with an `md5sum | cut -c1-8` shell one-liner. This tool
-# must not: key_fingerprint is sha256, so a shell fingerprint would never
-# equal a local one and the guard would refuse every deployment. The only
-# reason a sha256 fingerprint is safe here is that the tool computes both
-# sides. An empty result means the box has no .env yet, which is a first
-# deployment rather than a mismatch, so an absent key prints nothing at all
-# instead of the hash of an empty string.
-REMOTE_FINGERPRINT_COMMAND = (
-    "python3 -c \""
-    "import sys; sys.path.insert(0, '%s'); import dsr_deploy as d, pathlib; "
-    "p = pathlib.Path('%s'); "
-    "k = d.parse_env_text(p.read_text()).get('CRYPTO_MASTER_KEY', '') if p.exists() else ''; "
-    "print(d.key_fingerprint(k) if k.strip() else '')\""
-) % (REMOTE_SELF.rsplit("/", 1)[0], ENV_PATH)
-
 PayloadItem = collections.namedtuple("PayloadItem", "kind local remote")
 
 # Directories the operator builds before anything is pushed.
@@ -1519,48 +1517,6 @@ def fingerprint_refusal(
     )
 
 
-def fingerprint_probe_refusal(returncode: int, stderr: str, host: str) -> str:
-    """"" when the fingerprint probe ran; the refusal text when it did not.
-
-    fingerprint_refusal reads an empty remote fingerprint as "this box has
-    no .env yet", which is right -- the probe prints nothing and exits 0 on
-    a first deployment. But every way the probe can *fail* looks identical
-    on stdout: python3 absent, /root/dsr_deploy.py unreadable, an `import
-    dsr_deploy` that raises because one 3.10-only construct reached this
-    file, a read_text that raises. In all of them the traceback goes to
-    stderr and stdout is empty.
-
-    Reading only stdout therefore makes the guard fail open, and the import
-    failure is the case that matters: this file must run on RHEL 9's Python
-    3.9 while being developed on a newer one, so a single 3.10-only
-    construct would keep the unit suite green and --dry-run perfect while
-    disarming the guard on every real box -- exactly the hosts it protects.
-    Writing the wrong .env there orphans every encrypted row in
-    app_settings, and nothing recovers them.
-
-    So the return code decides first, and stdout is only trusted after it.
-    """
-    if returncode == 0:
-        return ""
-    lines = [
-        "FATAL: could not read the CRYPTO_MASTER_KEY already on %s "
-        "(probe exit %d)." % (host, returncode),
-        "       Until that is known, deploying could write a .env whose key",
-        "       differs from the one app_settings was encrypted with, which",
-        "       nothing recovers -- so an unreadable box is a refusal, not a",
-        "       first deployment.",
-        "       The probe runs %s on the box; check python3 is installed and"
-        % REMOTE_SELF,
-        "       that file is readable, then run again. It said:",
-    ]
-    detail = (stderr or "").strip()
-    if not detail:
-        detail = "(nothing on stderr)"
-    for line in detail.splitlines():
-        lines.append("       " + line)
-    return "\n".join(lines)
-
-
 def deploy_needs() -> dict:
     """Bytes required per path for a deployment."""
     return {INSTALL_PREFIX: DEPLOY_BYTES}
@@ -1617,10 +1573,10 @@ def build_commands(root: str) -> list:
 
 
 def deploy_payload(root: str) -> list:
-    """Every local path pushed to the box, and where it lands.
+    """Every path copied out of the checkout, and where it lands.
 
     The same set deploy.sh syncs, in the same order. Note what is not here:
-    UPLOADS_DIR is never a destination. push_dir mirrors a directory by
+    UPLOADS_DIR is never a destination. copy_dir mirrors a directory by
     removing it first, so listing the uploads directory here would delete
     identity documents held as regulatory records -- which is why the
     destinations are a data structure a test can walk rather than a
@@ -3847,7 +3803,12 @@ STATE_READ_COMMAND = "cat %s 2>/dev/null" % STATE_PATH
 
 
 class LocalRunner:
-    """Runs collectors on this machine -- what `doctor --remote` uses.
+    """Runs collectors on this machine, which is the box.
+
+    Separate from LocalTarget on purpose: a collector's answer is whatever
+    it printed, so this returns text and never raises, while a step's answer
+    is an exit code. Folding the two together would mean either a collector
+    that can abort the diagnosis or a step whose failure goes unnoticed.
 
     A collector that fails is not an error. `ausearch -m avc -ts recent`
     exits 1 when there are no denials, which is the good case, and a missing
@@ -3871,24 +3832,6 @@ class LocalRunner:
             # A read-only /var is a reason to skip the sample, not to fail
             # the diagnosis the operator asked for.
             pass
-
-
-class SshRunner:
-    """Runs collectors on the target over ssh; evaluation stays local."""
-
-    def __init__(self, ssh: "Ssh"):
-        self.ssh = ssh
-
-    def run(self, command: str) -> str:
-        return self.ssh.run(command, check=False).stdout
-
-    def write(self, path: str, text: str) -> None:
-        directory = path.rsplit("/", 1)[0]
-        self.ssh.run(
-            "mkdir -p '%s' && %s"
-            % (directory, _cat_heredoc_command(path, text, "DSR_STATE")),
-            check=False,
-        )
 
 
 def collect(runner) -> dict:
@@ -3983,31 +3926,37 @@ def cmd_doctor(args, runner, now_epoch=None) -> int:
     return exit_code_for(findings)
 
 
-TARGET_ENV_LOCAL = _DEPLOY_DIR / ".target.env"
+def this_host() -> str:
+    """The name to print for the box being changed: it is this one."""
+    try:
+        return socket.gethostname() or "this host"
+    except OSError:
+        return "this host"
 
 
-def target_ssh():
-    """(Ssh, host) from deploy/.target.env, or a refusal naming the file."""
-    if not TARGET_ENV_LOCAL.exists():
+def read_existing_env(path: str = ENV_PATH) -> dict:
+    """Everything already in the service .env. {} when there is none yet.
+
+    An unreadable .env is a refusal, not a first deployment. The two look
+    identical to a caller that only checks for {} -- and the wrong answer
+    costs the CRYPTO_MASTER_KEY that every encrypted row in app_settings was
+    written with, which nothing recovers.
+    """
+    candidate = pathlib.Path(path)
+    try:
+        text = candidate.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
         raise SecretsError(
-            "No ssh target. Copy deploy/target.example.env to deploy/.target.env "
-            "and fill in HOST. (To read a box you are already logged in to, run "
-            "`doctor --remote` there; provision and deploy always work over ssh.)"
+            "FATAL: %s exists but could not be read (%s).\n"
+            "       Until its CRYPTO_MASTER_KEY is known, deploying could\n"
+            "       write a different one, and every encrypted setting in\n"
+            "       app_settings is unreadable from that moment on. An\n"
+            "       unreadable .env is a refusal, not a first deployment."
+            % (path, exc.strerror or exc)
         )
-    target = load_target(TARGET_ENV_LOCAL.read_text())
-    host = (target.get("HOST") or "").strip()
-    if not host:
-        raise SecretsError("deploy/.target.env has no HOST (or DEPLOY_HOST).")
-    key = (target.get("SSH_KEY") or "").strip() or os.path.expanduser("~/.ssh/id_ed25519")
-    return Ssh(host, os.path.expanduser(key)), host
-
-
-def doctor_runner(args):
-    """Local when already on the box, ssh otherwise. Evaluation is always local."""
-    if getattr(args, "remote", False):
-        return LocalRunner()
-    ssh, _host = target_ssh()
-    return SshRunner(ssh)
+    return parse_env_text(text)
 
 
 def secrets_path() -> pathlib.Path:
@@ -4037,20 +3986,23 @@ def local_preflight(secrets: dict, err=None) -> None:
         err.write("WARNING: %s\n" % warning)
 
 
-def push_self(ssh, out) -> None:
-    """Copy this file to the box. The first act of every command.
+def copy_self(target, out) -> None:
+    """Put a copy of this file at REMOTE_SELF, before anything needs it.
 
-    Everything afterwards that reads machine state -- the fingerprint of
-    the key already installed, the pg_hba and nginx rewrites -- runs through
-    this copy, so both halves of every comparison come from the same code.
+    Two provisioning steps run `python3 /root/dsr_deploy.py` to apply the
+    pg_hba and nginx rewrites, so that the same tested, idempotent,
+    comment-aware transforms decide what changes -- never a sed re-deriving
+    that logic, where a wrong regex leaves an unbalanced config file. The
+    checkout this is running from may be anywhere; the copy is where the
+    steps say it is.
     """
-    out.write("==> pushing the deployer to %s\n" % REMOTE_SELF)
-    ssh.push_file(str(pathlib.Path(__file__).resolve()), REMOTE_SELF)
+    out.write("copying the deployer to %s\n" % REMOTE_SELF)
+    target.copy_file(str(pathlib.Path(__file__).resolve()), REMOTE_SELF)
 
 
-def check_remote_budget(ssh, needs: dict, breakdown: str = "") -> None:
-    """Measure the box's filesystems and refuse with the numbers, not halfway."""
-    mounts = parse_df(ssh.run("df -PB1", check=False).stdout)
+def check_disk_budget(target, needs: dict, breakdown: str = "") -> None:
+    """Measure the filesystems and refuse with the numbers, not halfway."""
+    mounts = parse_df(target.run("df -PB1", check=False).stdout)
     if not mounts:
         # Better a warning than a refusal: a box whose df cannot be read is
         # not a box that is known to be full.
@@ -4061,7 +4013,7 @@ def check_remote_budget(ssh, needs: dict, breakdown: str = "") -> None:
         raise Refusal(refusal)
 
 
-def run_steps(ssh, steps: list, out, secrets: dict = None) -> None:
+def run_steps(target, steps: list, out, secrets: dict = None) -> None:
     """Execute a plan, naming each step, stopping at the first failure.
 
     `secrets` is the staged values, and it is not optional in practice. A
@@ -4073,16 +4025,16 @@ def run_steps(ssh, steps: list, out, secrets: dict = None) -> None:
     a third. The sink is the thing to close.
     """
     total = len(steps)
-    for index, step in enumerate(steps, 1):
-        out.write("==> [%d/%d] %s\n" % (index, total, step.name))
+    for index, entry in enumerate(steps, 1):
+        out.write("==> [%d/%d] %s\n" % (index, total, entry.name))
         out.flush()
-        result = ssh.run(step.command, check=False)
+        result = target.run(entry.command, check=False)
         if result.returncode != 0:
             raise Refusal(
                 scrub(
                     redact_url(
                         step_failure_message(
-                            step.name, result.returncode, result.stderr, result.stdout
+                            entry.name, result.returncode, result.stderr, result.stdout
                         )
                     ),
                     (secrets or {}).values(),
@@ -4090,7 +4042,7 @@ def run_steps(ssh, steps: list, out, secrets: dict = None) -> None:
             )
 
 
-def poll_health(ssh, out, sleep=None) -> bool:
+def poll_health(target, out, sleep=None) -> bool:
     """Poll for the API, twenty times, three seconds apart.
 
     One probe is not enough: on a 1-vCPU box Nest can take well over four
@@ -4100,7 +4052,7 @@ def poll_health(ssh, out, sleep=None) -> bool:
     if sleep is None:
         sleep = time.sleep
     for attempt in range(1, HEALTH_ATTEMPTS + 1):
-        if ssh.run(health_command(), check=False).returncode == 0:
+        if target.run(health_command(), check=False).returncode == 0:
             out.write("==> healthy after %d probe%s\n" % (attempt, "" if attempt == 1 else "s"))
             return True
         delay = poll_delay(attempt)
@@ -4110,7 +4062,7 @@ def poll_health(ssh, out, sleep=None) -> bool:
     return False
 
 
-def cmd_provision(args, out=None) -> int:
+def cmd_provision(args, out=None, target=None) -> int:
     """Take a bare RHEL 9 host to one ready to receive a deployment."""
     if out is None:
         out = sys.stdout
@@ -4119,40 +4071,40 @@ def cmd_provision(args, out=None) -> int:
         out.write(render_plan(steps))
         return 0
 
-    # Local first, so a secrets file that cannot deploy never gets as far as
-    # creating roles from it.
+    # The secrets are read before anything is installed, so a secrets file
+    # that cannot deploy never gets as far as creating roles from it.
     path = secrets_path()
     secrets = read_secrets(path)
     local_preflight(secrets)
 
-    ssh, host = target_ssh()
-    out.write("==> provisioning %s\n" % host)
-    push_self(ssh, out)
-    check_remote_budget(
-        ssh,
+    if target is None:
+        target = LocalTarget()
+    out.write("==> provisioning %s\n" % this_host())
+    copy_self(target, out)
+    check_disk_budget(
+        target,
         provision_needs(),
         "nginx, Node 22, PostgreSQL 16, SELinux tooling and the dnf cache",
     )
 
-    # Inside the try, not before it: push_text's remote `cat >` can create
-    # the file and then have the transfer die, and the removal below would
-    # never run -- leaving a partial secrets file on the box. The `rm -f` is
-    # already harmless when the file was never created.
+    # Inside the try, not before it: the write can create the file and then
+    # fail, and the removal below would never run -- leaving a secrets file
+    # behind. The `rm -f` is already harmless when it was never created.
     try:
-        ssh.push_text(
-            remote_secrets_content(secrets, PROVISION_SECRET_KEYS),
+        target.write(
             REMOTE_SECRETS,
+            remote_secrets_content(secrets, PROVISION_SECRET_KEYS),
             mode="600",
         )
-        run_steps(ssh, steps, out, secrets)
+        run_steps(target, steps, out, secrets)
     finally:
-        ssh.run("rm -f %s" % REMOTE_SECRETS, check=False)
+        target.run("rm -f %s" % REMOTE_SECRETS, check=False)
     out.write("PROVISION_OK\n")
     return 0
 
 
-def cmd_deploy(args, out=None) -> int:
-    """Build, push, migrate, restart and verify."""
+def cmd_deploy(args, out=None, target=None) -> int:
+    """Build, install, migrate, restart and verify."""
     if out is None:
         out = sys.stdout
     if args.dry_run:
@@ -4164,56 +4116,55 @@ def cmd_deploy(args, out=None) -> int:
     secrets = read_secrets(path)
     local_preflight(secrets)
 
-    ssh, host = target_ssh()
+    if target is None:
+        target = LocalTarget()
+    host = this_host()
     out.write("==> deploying to %s\n" % host)
-    push_self(ssh, out)
+    copy_self(target, out)
 
     # Fingerprints, before the payload rather than after: writing this .env
     # over a different key orphans every encrypted row in app_settings, and
-    # nothing recovers them. Both fingerprints come from key_fingerprint --
-    # the local one here, the remote one from the copy just pushed.
-    probe = ssh.run(REMOTE_FINGERPRINT_COMMAND, check=False)
-    refusal = fingerprint_probe_refusal(probe.returncode, probe.stderr, host)
-    if refusal:
-        raise Refusal(refusal)
+    # nothing recovers them. Both sides come from key_fingerprint, over a
+    # value parse_env_text extracted -- the same function, the same
+    # normalisation, so a match means a match.
     refusal = fingerprint_refusal(
         key_fingerprint(secrets.get("CRYPTO_MASTER_KEY", "")),
-        probe.stdout,
+        key_fingerprint_or_blank(read_existing_env().get("CRYPTO_MASTER_KEY", "")),
         str(path),
         host,
     )
     if refusal:
         raise Refusal(refusal)
 
-    check_remote_budget(ssh, deploy_needs(), deploy_breakdown())
+    check_disk_budget(target, deploy_needs(), deploy_breakdown())
 
     out.write("==> building\n")
     for directory, command in build_commands(root):
         result = subprocess.run(command, cwd=directory, shell=True)
         if result.returncode != 0:
             raise Refusal(
-                "FATAL: `%s` failed in %s (exit %d). Nothing was pushed."
+                "FATAL: `%s` failed in %s (exit %d). Nothing was installed."
                 % (command, directory, result.returncode)
             )
 
-    out.write("==> syncing\n")
+    out.write("==> installing\n")
     for item in deploy_payload(root):
         if item.kind == "dir":
-            ssh.push_dir(item.local, item.remote)
+            target.copy_dir(item.local, item.remote)
         else:
-            ssh.push_file(item.local, item.remote)
+            target.copy_file(item.local, item.remote)
 
-    # Inside the try: see cmd_provision for why a transfer that dies after
-    # the remote `cat >` created the file must still reach the removal.
+    # Inside the try: see cmd_provision for why a write that dies after the
+    # file was created must still reach the removal.
     try:
-        ssh.push_text(
-            remote_secrets_content(secrets, DEPLOY_SECRET_KEYS),
+        target.write(
             REMOTE_SECRETS,
+            remote_secrets_content(secrets, DEPLOY_SECRET_KEYS),
             mode="600",
         )
-        run_steps(ssh, deploy_steps(secrets), out, secrets)
+        run_steps(target, deploy_steps(secrets), out, secrets)
         out.write("==> health\n")
-        if not poll_health(ssh, out):
+        if not poll_health(target, out):
             sys.stderr.write(
                 "FATAL: the API did not come up within %ds. Last log lines:\n"
                 % (HEALTH_ATTEMPTS * HEALTH_INTERVAL_SECONDS)
@@ -4226,13 +4177,13 @@ def cmd_deploy(args, out=None) -> int:
             # at all. This half of the tool needs them, so it scrubs them.
             sys.stderr.write(
                 scrub(
-                    redact_url(ssh.run(JOURNAL_TAIL_COMMAND, check=False).stdout),
+                    redact_url(target.run(JOURNAL_TAIL_COMMAND, check=False).stdout),
                     secrets.values(),
                 )
             )
             return 1
     finally:
-        ssh.run("rm -f %s" % REMOTE_SECRETS, check=False)
+        target.run("rm -f %s" % REMOTE_SECRETS, check=False)
     out.write("DEPLOY_OK\n")
     return 0
 
@@ -4256,24 +4207,6 @@ def build_parser() -> argparse.ArgumentParser:
             help="print what would happen, touch nothing",
         )
         if name == "doctor":
-            # Listed rather than hidden. It was hidden as "internal: how the
-            # local half invokes the copy it pushed to the box" -- but the
-            # local half never invokes it. Nothing pushes the tool for
-            # doctor, and doctor never runs itself remotely. Its only real
-            # user is an operator already logged in to the box, which is
-            # exactly who target_ssh's "no ssh target" refusal sends here.
-            # A refusal that names a flag `--help` denies the existence of
-            # is worse than no advice.
-            #
-            # doctor only, because only doctor has a local runner. provision
-            # and deploy accepted it and then died on target_ssh's "No ssh
-            # target", which is the least useful way to say "not supported".
-            p.add_argument(
-                "--remote",
-                action="store_true",
-                help="read this machine instead of the ssh target; run it on "
-                "the box itself",
-            )
             p.add_argument(
                 "--no-state",
                 action="store_true",
@@ -4315,12 +4248,7 @@ def main(argv: list) -> int:
             render_plan([Step(name, command) for name, command in DOCTOR_COMMANDS])
         )
         return 0
-    try:
-        runner = doctor_runner(args)
-    except SecretsError as exc:
-        sys.stderr.write("%s\n" % exc)
-        return 2
-    return cmd_doctor(args, runner)
+    return cmd_doctor(args, LocalRunner())
 
 
 if __name__ == "__main__":
