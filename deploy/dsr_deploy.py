@@ -899,9 +899,17 @@ NODE_MAJOR_TEST = (
 # binary rather than rpm, because rpm answers about the package name and
 # `postgresql-server` is the same package name on every stream: RHEL 9's
 # default is PostgreSQL 13, and `rpm -q postgresql-server` is true of it.
+#
+# The floor is 13, not 16, and 16 is only what a bare host gets installed.
+# The schema needs exactly two things a 12 could not give it: gen_random_uuid()
+# built in rather than via pgcrypto (13), and `AS RESTRICTIVE` policies (10).
+# Nothing in server/drizzle uses MERGE, multiranges, NULLS NOT DISTINCT or any
+# other 14/15/16 feature -- checked. So a host already running 13 or 15 for
+# something else is a host DSR can share, and refusing it would mean demanding
+# a pg_upgrade of a cluster that works.
 PG_MAJOR_TEST = (
     '[ "$(/usr/bin/postgres --version 2>/dev/null | '
-    "awk '{print $NF}' | cut -d. -f1)\" -ge 16 ] 2>/dev/null"
+    "awk '{print $NF}' | cut -d. -f1)\" -ge 13 ] 2>/dev/null"
 )
 
 # What every later step and every deploy assumes is already there.
@@ -1075,7 +1083,7 @@ def provision_steps() -> list:
             % (NODE_MAJOR_TEST, NODE_MAJOR_TEST),
         ),
         Step(
-            "install PostgreSQL 16",
+            "install PostgreSQL (16 on a bare host, 13+ accepted)",
             # Deliberate `;` after `module reset`, for the same reason as
             # the Node step above.
             #

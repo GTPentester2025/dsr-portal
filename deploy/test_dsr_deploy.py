@@ -994,7 +994,10 @@ class TestPlans(unittest.TestCase):
         self.assertIn("-ge 22", dd.NODE_MAJOR_TEST)
         self.assertNotIn("cut -c2-3", dd.NODE_MAJOR_TEST)
         self.assertIn("cut -d. -f1", dd.PG_MAJOR_TEST)
-        self.assertIn("-ge 16", dd.PG_MAJOR_TEST)
+        # 13, not 16: the schema needs gen_random_uuid() built in (PG13)
+        # and AS RESTRICTIVE policies (PG10), and nothing beyond.
+        # 16 is what a bare host gets installed; 13 is what DSR runs on.
+        self.assertIn("-ge 13", dd.PG_MAJOR_TEST)
         # Asking the server binary, not rpm: the package name is the same on
         # every stream.
         self.assertIn("postgres --version", dd.PG_MAJOR_TEST)
