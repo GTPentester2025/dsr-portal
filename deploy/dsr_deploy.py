@@ -28,6 +28,7 @@ numbered steps, so a failure says how far it got:
 Three flags, and no subcommands:
 
     --diagnose     run the checks only; change nothing
+    --reset-admin  set a fresh administrator password and print it
     --dry-run      print the plan; touch nothing
     --skip-build   reuse whatever is already in dist/
 
@@ -68,6 +69,7 @@ import re
 import shutil
 import socket
 import stat
+import secrets as secrets_module
 import subprocess
 import sys
 import tempfile
@@ -2150,7 +2152,20 @@ def describe_url(value: str) -> str:
 # Folding stderr into stdout is what makes these visible; without it the
 # complaint is discarded and the empty result reads as a clean log, which is
 # a diagnostic asserting health on the strength of having read nothing.
-_UNREADABLE_MARKERS = ("command not found", "Permission denied", "Error opening")
+_UNREADABLE_MARKERS = (
+    "command not found",
+    "Permission denied",
+    "Error opening",
+    # A collector that blocked. Without this a single command waiting on
+    # something -- psql on a password prompt, a mount that stopped answering --
+    # hangs the whole verification step with no output and no way to tell
+    # which one, which is exactly what happened on the first real run.
+    "collector timed out",
+)
+
+# No collector is worth waiting on for longer than this. Every one of them is
+# a read that should answer immediately.
+COLLECTOR_TIMEOUT_SECONDS = 30
 
 
 def _unreadable(text: str) -> bool:
@@ -4108,7 +4123,18 @@ class LocalRunner:
 
     def run(self, command: str) -> str:
         try:
-            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=COLLECTOR_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            # Reported, not raised. One unresponsive command should cost its
+            # own finding, not the whole run -- and naming it beats a
+            # verification step that sits there saying nothing.
+            return "collector timed out after %ds" % COLLECTOR_TIMEOUT_SECONDS
         except OSError:
             return ""
         return result.stdout
@@ -4470,6 +4496,82 @@ def missing_graph_keys(env: dict) -> list:
     return [key for key in GRAPH_KEYS if not ((env or {}).get(key) or "").strip()]
 
 
+ADMIN_EMAIL = "admin@dsr.local"
+ADMIN_NAME = "Administrator"
+
+# Does an administrator already exist? Asked of the database rather than
+# tracked in a file, so a redeploy onto a box that already has one does not
+# mint a second and does not print a password that will not work.
+ADMIN_EXISTS_COMMAND = (
+    "sudo -u postgres psql -d dsr -tAc \"SELECT 1 FROM users WHERE role IN "
+    "('admin', 'super_admin') LIMIT 1\" 2>&1"
+)
+
+
+def admin_password() -> str:
+    """A first administrator password: strong, and typeable off a screen.
+
+    token_urlsafe rather than token_hex because somebody reads this one out
+    of a terminal and types it into a browser. Its alphabet is A-Za-z0-9-_,
+    which is safe inside the single quotes the create-user command wraps it
+    in and needs no shell escaping.
+    """
+    return secrets_module.token_urlsafe(12)
+
+
+def create_admin_command(password: str) -> str:
+    """Create the first administrator through the repo's own script.
+
+    scripts/create-user.mjs already hashes with argon2id and writes the row
+    the API expects; reimplementing that here would be a second definition of
+    what a user is, free to drift from the one the portal uses.
+    """
+    return (
+        "cd %s/server && set -a && . ./.env && set +a && "
+        "node scripts/create-user.mjs '%s' '%s' admin '' '%s'"
+        % (INSTALL_PREFIX, ADMIN_EMAIL, ADMIN_NAME, password)
+    )
+
+
+def portal_url() -> str:
+    """Where to point a browser. The hostname the box knows itself by, since
+    nothing here can know the name it is reached under from outside."""
+    try:
+        host = socket.gethostname() or "localhost"
+    except OSError:
+        host = "localhost"
+    return "http://%s/admin" % host
+
+
+def admin_credentials_banner(email: str, password: str, url: str) -> str:
+    """Printed once, because this is the only time the password is readable.
+
+    It is argon2-hashed on the way into the database, so nothing can recover
+    it afterwards -- if it scrolls past, the way back in is --reset-admin,
+    not a lookup.
+    """
+    nl = chr(10)
+    line = "=" * 66
+    return nl.join([
+        "",
+        line,
+        "  Sign in to the admin console",
+        line,
+        "",
+        "    Address   %s" % url,
+        "    Email     %s" % email,
+        "    Password  %s" % password,
+        "",
+        "  Written down nowhere else. The database holds only an argon2 hash,",
+        "  so this cannot be recovered -- if it scrolls away, run:",
+        "",
+        "      sudo python3 deploy/dsr_deploy.py --reset-admin",
+        "",
+        line,
+        "",
+    ]) + nl
+
+
 def graph_credentials_deferred(path, missing: list, written: bool) -> str:
     """What to print when deploying with the mailer switched off.
 
@@ -4791,6 +4893,7 @@ Deploy the DSR portal on this RHEL 9 host.
     sudo python3 deploy/dsr_deploy.py --diagnose   check only; change nothing
     sudo python3 deploy/dsr_deploy.py --dry-run    print the plan; touch nothing
     sudo python3 deploy/dsr_deploy.py --skip-build reuse the existing dist/
+    sudo python3 deploy/dsr_deploy.py --reset-admin  new admin password
 
 With --diagnose, a group flag narrows the report: %s.
 """
@@ -4803,7 +4906,9 @@ class Options(object):
     doing a real deployment is the failure mode this exists to prevent.
     """
 
-    NAMES = ("diagnose", "dry_run", "skip_build", "no_state", "help") + DOCTOR_GROUPS
+    NAMES = (
+        "diagnose", "dry_run", "skip_build", "no_state", "reset_admin", "help",
+    ) + DOCTOR_GROUPS
 
     def __init__(self, argv=()):
         for name in self.NAMES:
@@ -5172,12 +5277,38 @@ def run_deployment(options, out=None, err=None, target=None, log=None,
 
         # -- 9 --------------------------------------------------------------
         step(9, TOTAL_STEPS, "Deploy", out)
+        admin_banner = ""
         target.write(
             REMOTE_SECRETS,
             remote_secrets_content(secrets, DEPLOY_SECRET_KEYS),
             mode="600",
         )
         _run_phase(target, deploy_steps(secrets), secrets, out, err, log, runner)
+
+        # An administrator, if the box does not have one. Without this the
+        # deployment finishes with a portal nobody can sign in to, which is
+        # how the first real run ended.
+        existing = target.run(ADMIN_EXISTS_COMMAND, check=False).stdout.strip()
+        if existing == "1":
+            info("an administrator already exists -- use --reset-admin for a "
+                 "new password", out)
+        elif _unreadable(existing) or "psql" in existing.lower():
+            warn("could not tell whether an administrator exists: %s"
+                 % existing.splitlines()[0][:80], out)
+        else:
+            password = admin_password()
+            log.add_values([password])
+            result = target.run(create_admin_command(password), check=False)
+            log.step("create administrator", "node scripts/create-user.mjs "
+                     "(password withheld)", result.returncode,
+                     result.stdout, result.stderr)
+            if result.returncode == 0:
+                ok("created the first administrator", out)
+                admin_banner = admin_credentials_banner(
+                    ADMIN_EMAIL, password, portal_url())
+            else:
+                fail("could not create an administrator: %s"
+                     % sanitise_log_text(result.stderr, [password]).strip()[:200], err)
 
         # -- 10 -------------------------------------------------------------
         step(10, TOTAL_STEPS, "Health check and verification", out)
@@ -5209,8 +5340,14 @@ def run_deployment(options, out=None, err=None, target=None, log=None,
     log.close()
     if worst >= 2:
         fail("deployed, but the checks above found failures.", err)
+        if admin_banner:
+            out.write(admin_banner)
         return 1
     banner("DEPLOY_OK", out)
+    # Last thing on the screen on purpose. It is the only time this password
+    # is readable, and a deployment prints a lot of lines after it otherwise.
+    if admin_banner:
+        out.write(admin_banner)
     return 0
 
 
@@ -5240,6 +5377,32 @@ def _run_phase(target, steps, secrets, out, err, log, runner) -> None:
             )
 
 
+def cmd_reset_admin(out=None) -> int:
+    """A fresh administrator password, printed once.
+
+    The deployment prints one the first time it creates an administrator, and
+    argon2 means nothing can read it back afterwards. This is the way in once
+    that line has scrolled away -- create-user.mjs upserts, so running it
+    against the existing address resets rather than duplicating.
+    """
+    if out is None:
+        out = sys.stdout
+    if os.geteuid() != 0:
+        sys.stderr.write("FATAL: run this with sudo." + chr(10))
+        return 2
+    target = LocalTarget()
+    password = admin_password()
+    result = target.run(create_admin_command(password), check=False)
+    if result.returncode != 0:
+        sys.stderr.write(
+            "FATAL: could not reset the administrator: %s" + chr(10)
+            % sanitise_log_text(result.stderr, [password]).strip()[:300]
+        )
+        return 1
+    out.write(admin_credentials_banner(ADMIN_EMAIL, password, portal_url()))
+    return 0
+
+
 def cmd_diagnose(options, out=None) -> int:
     """The checks, and nothing else. Changes nothing on the box."""
     out = out or sys.stdout
@@ -5267,6 +5430,8 @@ def main(argv: list) -> int:
     try:
         if options.diagnose:
             return cmd_diagnose(options)
+        if options.reset_admin:
+            return cmd_reset_admin()
         return run_deployment(options)
     except Refusal as exc:
         # Refusals already read as the operator-facing message they are;
