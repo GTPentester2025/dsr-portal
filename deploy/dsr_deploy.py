@@ -1,21 +1,61 @@
 #!/usr/bin/env python3
-"""Provision, deploy and diagnose the DSR portal on a RHEL 9 host.
+"""Deploy the DSR portal on this RHEL 9 host, in one command.
 
-Runs on the operator's machine. For anything that has to read the state of
-the server -- pg_hba.conf, SELinux booleans, systemd restart counters -- it
-copies itself to the box and runs there, because reading a file in Python
-beats a sed expression nested inside three levels of shell quoting.
+Run it on the server, as root, from the repository you cloned there:
 
-    python3 deploy/dsr_deploy.py provision
-    python3 deploy/dsr_deploy.py deploy
-    python3 deploy/dsr_deploy.py doctor
+    sudo python3 deploy/dsr_deploy.py
 
-Targets the Python that RHEL 9 ships (3.9). Standard library only: there is
-no pip install step on either end.
+That is the whole invocation. It provisions the host, builds the bundles,
+installs them, runs the migrations, restarts the API, waits for it to
+answer, and then runs every diagnostic check as a final verification. Ten
+numbered steps, so a failure says how far it got:
+
+     1  Preflight -- root, RHEL 9, a complete checkout, a log to write to
+     2  What else is on this box -- every other TCP listener, and the exact
+        command to stop each one. Nothing is stopped for you.
+     3  Secrets -- read /opt/dsr/server/.env, keep every value in it, and
+        generate only what is genuinely missing
+     4  Disk space for the packages
+     5  Provision -- PostgreSQL 16, Node 22, nginx, firewalld, SELinux,
+        zram, the pg_hba rewrite, the service user and directories
+     6  Build -- npm run build in server, apps/admin, apps/public-form
+     7  Disk space for the deployment
+     8  Install the built bundles into /opt/dsr and /var/www/dsr
+     9  Deploy -- write .env, npm ci, migrate, import forms, install the
+        unit and the nginx site, restart, reload
+    10  Health check, then the checks
+
+Three flags, and no subcommands:
+
+    --diagnose     run the checks only; change nothing
+    --dry-run      print the plan; touch nothing
+    --skip-build   reuse whatever is already in dist/
+
+Secrets. The two database passwords and the settings encryption key are
+generated here and never typed: nobody uses them but the portal talking to
+itself. CRYPTO_MASTER_KEY is generated ONCE, on the deployment that finds no
+.env, and read back unchanged on every deployment after it -- a second one
+makes every encrypted row in app_settings permanently unreadable. The only
+thing an operator supplies is the four Microsoft Graph mail credentials, in
+deploy/.secrets.env, which this writes as a commented template if it is not
+there.
+
+Every run is logged to /var/log/dsr-deploy/deploy-<date>.log -- each step's
+command, exit code and output, with the secrets filtered out of every line,
+because that file exists to be sent to somebody for help. The last ten are
+kept.
+
+This box may be running something else. DSR's nginx site claims port 80, so
+any other site in /etc/nginx/conf.d is MOVED ASIDE into a timestamped
+directory, printed as it goes, with the one command that puts it all back.
+No service is ever stopped: step 2 prints what is running and leaves that
+decision with the person who knows the box.
+
+Targets the Python RHEL 9 ships (3.9). Standard library only -- there is no
+pip install step.
 """
 from __future__ import annotations
 
-import argparse
 import base64
 import binascii
 import calendar
@@ -32,6 +72,11 @@ import subprocess
 import sys
 import tempfile
 import time
+# The stdlib `secrets` module, imported by name because `secrets` is also
+# what every function here calls the parsed environment it is handed, and a
+# shadowed module is a NameError that only fires on the one path that
+# generates a password.
+from secrets import token_bytes, token_hex
 from urllib.parse import urlsplit
 
 INSTALL_PREFIX = "/opt/dsr"
@@ -1042,11 +1087,30 @@ def provision_steps() -> list:
             # thing to notice would have been a migration failing on syntax
             # that 13 does not have. The guard now asks the version, and the
             # trailing test asserts it afterwards either way.
-            "((rpm -q postgresql-server >/dev/null 2>&1 && %s) || "
-            "(dnf module reset -y postgresql >/dev/null 2>&1; "
-            "dnf module enable -y postgresql:16 && "
+            #
+            # A box that already has PostgreSQL and is not on 16 is a
+            # refusal, not an upgrade. `dnf module reset` followed by
+            # `enable postgresql:16` on a host with a live 13 cluster
+            # replaces the binaries under a data directory initdb'd by the
+            # older major, and PostgreSQL will not start on it -- which
+            # takes out whatever else on this box was using that cluster,
+            # not only DSR. Migrating a cluster across a major version is
+            # pg_upgrade's job and a decision for whoever owns the data.
+            "( if rpm -q postgresql-server >/dev/null 2>&1; then\n"
+            "    %s || { echo 'FATAL: PostgreSQL is already installed on this "
+            "host and it is not 16.' >&2;\n"
+            "            echo '       Upgrading in place would leave the "
+            "existing cluster unable to start,' >&2;\n"
+            "            echo '       and anything else using it down with "
+            "it. Migrate it with pg_upgrade' >&2;\n"
+            "            echo '       first, or deploy DSR to a host of its "
+            "own.' >&2; exit 1; };\n"
+            "  else\n"
+            "    dnf module reset -y postgresql >/dev/null 2>&1;\n"
+            "    dnf module enable -y postgresql:16 && "
             "dnf install -y postgresql-server postgresql-contrib && "
-            "dnf clean all)) && %s"
+            "dnf clean all;\n"
+            "  fi ) && %s"
             % (PG_MAJOR_TEST, PG_MAJOR_TEST),
         ),
         Step(
@@ -1500,13 +1564,15 @@ def deploy_steps(env: dict) -> list:
 # paths get pushed where, whether two fingerprints may differ, when the health
 # poll gives up -- is a pure function with a test. The functions further down
 # that shell out hold no logic beyond calling these in order, because a
-# decision buried inside a function that opens an SSH connection is a decision
-# nobody can test without a server.
+# decision buried inside a function that runs commands is a decision nobody
+# can test without a server.
 # ---------------------------------------------------------------------------
 
-# deploy.sh's default, and its reason: each droplet has its own secrets file
-# and writing the wrong one is not a recoverable mistake.
-DEFAULT_SECRETS_NAME = ".secrets.blr.env"
+# The one file the operator fills in. One host, one file: the ssh-era
+# convention of a file per droplet went with the ssh transport, and this
+# tool now only ever deploys to the box it is running on. SECRETS_FILE
+# still overrides it, for a box that keeps it somewhere else.
+DEFAULT_SECRETS_NAME = ".secrets.env"
 
 # What deploy actually spends under the install prefix. Numbers from the
 # spec's refusal example; the host has ~10 GB and is mostly full, so this
@@ -4174,23 +4240,17 @@ def secrets_path() -> pathlib.Path:
     return _DEPLOY_DIR / DEFAULT_SECRETS_NAME
 
 
-def read_secrets(path) -> dict:
-    """Parse a secrets file. Nothing in it is ever printed or logged."""
+def read_operator_secrets(path) -> dict:
+    """The operator's file, or {} when it is not there yet.
+
+    An absent file is not an error here: it is the case that writes the
+    template and tells them where it is. Nothing read out of it is ever
+    printed or logged.
+    """
     candidate = pathlib.Path(path)
     if not candidate.is_file():
-        raise SecretsError(
-            "No secrets file at %s. Point SECRETS_FILE at the one for this "
-            "host: SECRETS_FILE=deploy/.secrets.<host>.env" % candidate
-        )
+        return {}
     return parse_env_text(candidate.read_text())
-
-
-def local_preflight(secrets: dict, err=None) -> None:
-    """The guards that run on the operator's machine, before anything moves."""
-    if err is None:
-        err = sys.stderr
-    for warning in validate_secrets(secrets):
-        err.write("WARNING: %s\n" % warning)
 
 
 def copy_self(target, out) -> None:
@@ -4269,163 +4329,860 @@ def poll_health(target, out, sleep=None) -> bool:
     return False
 
 
-def cmd_provision(args, out=None, target=None) -> int:
-    """Take a bare RHEL 9 host to one ready to receive a deployment."""
-    if out is None:
-        out = sys.stdout
-    steps = provision_steps()
-    if args.dry_run:
-        out.write(render_plan(steps))
+# ---------------------------------------------------------------------------
+# The secrets the portal keeps to itself, and the one thing it must be told
+# ---------------------------------------------------------------------------
+
+# DB_PASS, APP_PASS and CRYPTO_MASTER_KEY are used by the portal to talk to
+# itself: nobody types them, nothing else consumes them, and asking an
+# operator to invent them buys nothing but a chance to invent a bad one.
+# They are generated here.
+GENERATED_KEYS = ("DB_PASS", "APP_PASS", "CRYPTO_MASTER_KEY")
+
+# What the operator supplies in deploy/.secrets.env. The mail credentials
+# belong to a tenant this tool cannot see; the last two have defaults and are
+# there for the rare box that needs them.
+OPERATOR_KEYS = GRAPH_KEYS + ("EMAIL_PROVIDER", "COOKIE_SECURE")
+
+
+def generate_role_password() -> str:
+    """A database password that survives being written into a URL.
+
+    token_hex, deliberately not token_urlsafe or base64: DATABASE_URL is
+    built by interpolation with no percent-encoding, and validate_role_passwords
+    refuses / @ : ? # % for reasons written out over URL_RESERVED_IN_PASSWORD.
+    Hex can produce none of them. 32 bytes of entropy either way.
+    """
+    return token_hex(32)
+
+
+def generate_master_key() -> str:
+    """32 random bytes, base64-encoded -- what validate_master_key demands.
+
+    The app decodes this and uses the 32 bytes as an AES key. A hex string
+    of the same length decodes to 48 bytes and is rejected; anything shorter
+    weakens every encrypted row in app_settings.
+    """
+    return base64.b64encode(token_bytes(32)).decode()
+
+
+DEFAULT_GENERATORS = {
+    "DB_PASS": generate_role_password,
+    "APP_PASS": generate_role_password,
+    "CRYPTO_MASTER_KEY": generate_master_key,
+}
+
+
+def assemble_env(installed: dict, operator: dict, generators: dict = None) -> tuple:
+    """The environment to deploy, and the list of keys generated just now.
+
+    Read this function as one rule: WHAT IS ALREADY ON THE BOX IS KEPT.
+    `installed` is /opt/dsr/server/.env as it stands, and every value in it
+    survives into the result untouched. Only a key that is genuinely absent
+    -- or present and empty, which the API cannot use either -- is generated.
+
+    CRYPTO_MASTER_KEY is the one that makes this the most dangerous function
+    in the file. Every secret row in app_settings is encrypted with it, and
+    it is the only copy: generate a second one on a redeploy and every one of
+    those rows is unreadable from that moment on, permanently, with no error
+    at the time and no way back. So it is generated exactly once, on the
+    deployment that finds no .env, and thereafter it is read and written
+    back unchanged. Nothing in here may become "regenerate if it looks
+    wrong" -- a key that fails validate_master_key is a refusal, not a
+    reason to replace it.
+
+    The operator's file supplies the mail credentials and nothing else. It
+    cannot introduce a CRYPTO_MASTER_KEY over an installed one; that is not
+    a decision a file should be able to make silently, and the fingerprint
+    guard exists for the case where someone tries.
+    """
+    if generators is None:
+        generators = DEFAULT_GENERATORS
+    env = dict(installed or {})
+    for key in OPERATOR_KEYS:
+        value = ((operator or {}).get(key) or "").strip()
+        if value:
+            env[key] = value
+    generated = []
+    for key in GENERATED_KEYS:
+        if (env.get(key) or "").strip():
+            continue
+        env[key] = generators[key]()
+        generated.append(key)
+    return env, generated
+
+
+SECRETS_TEMPLATE = """\
+# DSR portal -- the credentials this deployment cannot generate for itself.
+#
+# Fill in the four values below, save the file, and run the deployer again:
+#
+#     sudo python3 deploy/dsr_deploy.py
+#
+# Everything else the portal needs -- the two database passwords and the
+# encryption key for saved settings -- is generated on the first deployment
+# and reused on every one after it. You never see them and never type them.
+#
+# These four come from the Microsoft Entra app registration that lets the
+# portal send mail as the privacy mailbox. Get them from whoever owns that
+# registration:
+#
+#   PRIVACY_MAILBOX      the mailbox the portal sends from, e.g.
+#                        privacy@example.com
+#   GRAPH_TENANT_ID      the directory (tenant) ID, a UUID
+#   GRAPH_CLIENT_ID      the application (client) ID, a UUID
+#   GRAPH_CLIENT_SECRET  the client secret VALUE (not its ID), which Entra
+#                        shows once, when it is created
+#
+# Values may be quoted or bare. Do not commit this file: it is ignored by
+# git and should stay mode 600.
+
+PRIVACY_MAILBOX=
+GRAPH_TENANT_ID=
+GRAPH_CLIENT_ID=
+GRAPH_CLIENT_SECRET=
+
+# Optional, and safe to leave alone.
+# EMAIL_PROVIDER=graph      # `console` prints mail instead of sending it
+# COOKIE_SECURE=true        # false only on a box with no TLS at all
+"""
+
+
+def missing_graph_keys(env: dict) -> list:
+    """Which of the four mail credentials are absent or empty."""
+    return [key for key in GRAPH_KEYS if not ((env or {}).get(key) or "").strip()]
+
+
+def graph_credentials_refusal(path, missing: list, written: bool) -> str:
+    """What to print when the mail credentials are not there yet.
+
+    Not a prompt. A client secret typed at a terminal is echoed, lands in
+    the scrollback and, for anyone who pastes rather than types, in the
+    shell history -- and this runs under sudo, where that history is root's.
+    A file the operator fills in with an editor has none of those problems
+    and can be reviewed before it is used.
+    """
+    lines = []
+    if written:
+        lines.append("Created %s" % path)
+    else:
+        lines.append("%s is missing the mail credentials." % path)
+    lines.append("")
+    lines.append("Fill in these four values, then run this command again:")
+    for key in missing:
+        lines.append("    %s" % key)
+    lines.append("")
+    lines.append("They come from the Entra app registration that lets the portal")
+    lines.append("send mail as the privacy mailbox. The file explains each one.")
+    lines.append("")
+    lines.append("    sudo nano %s" % path)
+    lines.append("    sudo python3 deploy/dsr_deploy.py")
+    return "\n".join(lines) + "\n"
+
+
+def write_secrets_template(path) -> bool:
+    """Write the template, unless something is already there.
+
+    False when the file exists -- never overwrite it. The one file on the
+    box holding a credential an operator typed is not a file this tool gets
+    to replace with a blank form.
+    """
+    candidate = pathlib.Path(path)
+    if candidate.exists():
+        return False
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    handle = os.open(str(candidate), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(handle, "w") as stream:
+        stream.write(SECRETS_TEMPLATE)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# The log of a run
+# ---------------------------------------------------------------------------
+
+LOG_DIR = "/var/log/dsr-deploy"
+LOG_PREFIX = "deploy-"
+LOG_SUFFIX = ".log"
+# Ten runs. The box has ~10 GB and is mostly full; a log directory that grows
+# without limit is one more thing competing with the uploads that cannot be
+# deleted.
+LOG_KEEP = 10
+
+
+def log_filename(now=None) -> str:
+    """deploy-YYYYmmdd-HHMMSS.log -- named so that sorting is chronological."""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+    return "%s%s%s" % (LOG_PREFIX, stamp, LOG_SUFFIX)
+
+
+def logs_to_delete(names, keep: int = LOG_KEEP) -> list:
+    """Which log files to remove so that `keep` remain. Oldest first.
+
+    Sorted by name, which the timestamp format makes the same as sorted by
+    age -- and unlike mtime it cannot be reordered by something touching a
+    file. Anything not named like one of our logs is never returned: this
+    list is fed to unlink.
+    """
+    ours = sorted(
+        n for n in names if n.startswith(LOG_PREFIX) and n.endswith(LOG_SUFFIX)
+    )
+    if keep <= 0:
+        return ours
+    return ours[:-keep] if len(ours) > keep else []
+
+
+def sanitise_log_text(text: str, values) -> str:
+    """Everything written to the log goes through here first.
+
+    The log exists to be sent to someone for help, which makes it the single
+    most likely place for a generated password to escape. Both filters run:
+    redact_url catches a connection string nobody staged locally (one already
+    in a .env, echoed back by node), and scrub catches the exact values this
+    run generated wherever they appear -- in a psql `LINE 3:` echo, in a
+    shell trace, in a heredoc this file wrote.
+    """
+    return scrub(redact_url(text or ""), values)
+
+
+class RunLog:
+    """The full detail of one run, on disk, with the secrets taken out.
+
+    The terminal gets a summary; this gets each step's command, exit code,
+    stdout and stderr. Every write goes through sanitise_log_text -- there is
+    deliberately no method that writes anything raw, because the one that
+    exists is the one that eventually gets called by mistake.
+    """
+
+    def __init__(self, path, values=()):
+        self.path = str(path)
+        self.values = list(values)
+        self.handle = None
+
+    def open(self):
+        directory = pathlib.Path(self.path).parent
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self.handle = os.fdopen(handle, "a")
+        return self
+
+    def add_values(self, values) -> None:
+        """Register secrets generated after the log was opened.
+
+        Called the moment they exist and before any step can print one.
+        """
+        for value in values:
+            if value and value not in self.values:
+                self.values.append(value)
+
+    def write(self, text: str) -> None:
+        if self.handle is None:
+            return
+        self.handle.write(sanitise_log_text(text, self.values))
+        self.handle.flush()
+
+    def line(self, text: str = "") -> None:
+        self.write(text + "\n")
+
+    def step(self, name: str, command: str, returncode, stdout: str, stderr: str) -> None:
+        self.line("")
+        self.line("--- %s" % name)
+        self.line("$ %s" % command)
+        self.line("exit %s" % returncode)
+        if (stdout or "").strip():
+            self.line("stdout:")
+            self.line(stdout.rstrip("\n"))
+        if (stderr or "").strip():
+            self.line("stderr:")
+            self.line(stderr.rstrip("\n"))
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+    def prune(self, keep: int = LOG_KEEP) -> list:
+        directory = pathlib.Path(self.path).parent
+        try:
+            names = [p.name for p in directory.iterdir() if p.is_file()]
+        except OSError:
+            return []
+        removed = []
+        for name in logs_to_delete(names, keep):
+            try:
+                (directory / name).unlink()
+                removed.append(name)
+            except OSError:
+                pass
+        return removed
+
+
+class NullLog:
+    """A log that goes nowhere -- for --dry-run and for the tests."""
+
+    path = ""
+
+    def add_values(self, values):
+        pass
+
+    def write(self, text):
+        pass
+
+    def line(self, text=""):
+        pass
+
+    def step(self, name, command, returncode, stdout, stderr):
+        pass
+
+    def close(self):
+        pass
+
+    def prune(self, keep=LOG_KEEP):
+        return []
+
+
+# ---------------------------------------------------------------------------
+# What the operator sees
+# ---------------------------------------------------------------------------
+
+def _use_colour(stream) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _supports(text: str, stream) -> bool:
+    """Whether `stream` can encode `text` -- a tick is not universal."""
+    encoding = getattr(stream, "encoding", None) or "ascii"
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+TICK = "\u2713"
+CROSS = "\u2717"
+WARN_SIGN = "\u26a0"
+ARROW = "\u2192"
+
+
+def _symbol(preferred: str, fallback: str, stream) -> str:
+    return preferred if _supports(preferred, stream) else fallback
+
+
+def _colour(code: str, text: str, stream) -> str:
+    return "\033[%sm%s\033[0m" % (code, text) if _use_colour(stream) else text
+
+
+def banner(message: str, out=None) -> None:
+    out = out or sys.stdout
+    line = "-" * 66
+    out.write("\n%s\n" % _colour("1;36", line, out))
+    out.write("%s\n" % _colour("1;36", "  " + message, out))
+    out.write("%s\n" % _colour("1;36", line, out))
+    out.flush()
+
+
+def step(number: int, total: int, message: str, out=None) -> None:
+    """The numbered heading a failure is read against.
+
+    Numbered because the first question after a failed deployment is "how
+    far did it get", and an operator who can answer "it stopped at 6 of 10,
+    building the bundles" has already narrowed it to one thing.
+    """
+    out = out or sys.stdout
+    out.write("\n%s\n" % _colour("1", "[%d/%d] %s" % (number, total, message), out))
+    out.flush()
+
+
+def ok(message: str, out=None) -> None:
+    out = out or sys.stdout
+    out.write("  %s  %s\n" % (_colour("0;32", _symbol(TICK, "OK", out), out), message))
+    out.flush()
+
+
+def warn(message: str, out=None) -> None:
+    out = out or sys.stdout
+    out.write("  %s  %s\n" % (_colour("1;33", _symbol(WARN_SIGN, "!", out), out), message))
+    out.flush()
+
+
+def info(message: str, out=None) -> None:
+    out = out or sys.stdout
+    out.write("  %s  %s\n" % (_colour("0;36", _symbol(ARROW, "-", out), out), message))
+    out.flush()
+
+
+def fail(message: str, err=None) -> None:
+    err = err or sys.stderr
+    err.write("  %s  %s\n" % (_colour("0;31", _symbol(CROSS, "x", err), err), message))
+    err.flush()
+
+
+def die(message: str, code: int = 1) -> None:
+    fail(message)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# The command line: three flags, no subcommands
+# ---------------------------------------------------------------------------
+
+USAGE = """\
+Deploy the DSR portal on this RHEL 9 host.
+
+    sudo python3 deploy/dsr_deploy.py              provision, deploy, verify
+    sudo python3 deploy/dsr_deploy.py --diagnose   check only; change nothing
+    sudo python3 deploy/dsr_deploy.py --dry-run    print the plan; touch nothing
+    sudo python3 deploy/dsr_deploy.py --skip-build reuse the existing dist/
+
+With --diagnose, a group flag narrows the report: %s.
+"""
+
+
+class Options(object):
+    """The flags, as attributes. Membership tests over sys.argv, no argparse.
+
+    Unknown flags are collected rather than ignored: `--dryrun` silently
+    doing a real deployment is the failure mode this exists to prevent.
+    """
+
+    NAMES = ("diagnose", "dry_run", "skip_build", "no_state", "help") + DOCTOR_GROUPS
+
+    def __init__(self, argv=()):
+        for name in self.NAMES:
+            setattr(self, name, False)
+        self.unknown = []
+        for argument in argv:
+            name = argument.lstrip("-").replace("-", "_")
+            if argument in ("-h", "--help"):
+                self.help = True
+            elif argument.startswith("--") and name in self.NAMES:
+                setattr(self, name, True)
+            else:
+                self.unknown.append(argument)
+
+
+def parse_flags(argv) -> Options:
+    return Options(argv)
+
+
+def unknown_flag_refusal(unknown: list) -> str:
+    """"" when every argument was understood; the refusal otherwise."""
+    if not unknown:
+        return ""
+    return (
+        "FATAL: not a flag this tool has: %s\n\n%s"
+        % (" ".join(unknown), USAGE % ", ".join("--" + g for g in DOCTOR_GROUPS))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+def check_root() -> None:
+    """Refuse anywhere this cannot possibly work, before it half works."""
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or geteuid() != 0:
+        raise Refusal(
+            "FATAL: this has to run as root on the server itself.\n"
+            "\n"
+            "    sudo python3 deploy/dsr_deploy.py\n"
+        )
+
+
+def rhel_warning(os_release: str) -> str:
+    """"" when this looks like RHEL 9; a warning otherwise. Never a refusal.
+
+    CentOS Stream 9, Alma and Rocky are all fine targets and none of them
+    says "Red Hat" -- `platform:el9` is what the packages actually care
+    about, so that is what is checked and everything else is a warning an
+    operator can read and overrule by carrying on.
+    """
+    text = os_release or ""
+    if "platform:el9" in text:
+        return ""
+    if not text.strip():
+        return "could not read /etc/os-release; assuming this is RHEL 9"
+    return (
+        "this does not look like RHEL 9 (no platform:el9 in /etc/os-release). "
+        "The package names, /var/lib/pgsql and the SELinux settings below are "
+        "RHEL 9's; continuing anyway"
+    )
+
+
+def missing_repo_paths(root: str) -> list:
+    """The files a deployment reads out of the checkout. [] when complete."""
+    needed = [
+        os.path.join(root, "server", "package.json"),
+        os.path.join(root, "apps", "admin", "package.json"),
+        os.path.join(root, "apps", "public-form", "package.json"),
+        os.path.join(root, "form-schema"),
+        str(NGINX_CONF_LOCAL),
+        str(UNIT_FILE_LOCAL),
+    ]
+    return [p for p in needed if not os.path.exists(p)]
+
+
+def repo_refusal(root: str, missing: list) -> str:
+    if not missing:
+        return ""
+    lines = [
+        "FATAL: this does not look like a complete DSR checkout.",
+        "       Run it from the repository you cloned onto this box:",
+        "",
+        "           cd /path/to/dsr-portal",
+        "           sudo python3 deploy/dsr_deploy.py",
+        "",
+        "       Looked under %s and did not find:" % root,
+    ]
+    for path in missing:
+        lines.append("           %s" % path)
+    return "\n".join(lines)
+
+
+def built_bundles_missing(root: str) -> list:
+    """Which built directories --skip-build would have nothing to install."""
+    return [
+        item.local
+        for item in deploy_payload(root)
+        if item.kind == "dir"
+        and item.local.endswith("dist")
+        and not os.path.isdir(item.local)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The run
+# ---------------------------------------------------------------------------
+
+TOTAL_STEPS = 10
+
+
+class NullOut(object):
+    """Swallows the running commentary that has its own line already.
+
+    copy_self and poll_health both narrate; here their narration is
+    replaced by one ok() line each, and the detail is in the log.
+    """
+
+    def __init__(self, out=None):
+        self.out = out
+
+    def write(self, text):
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+
+def print_diagnosis(runner, out, log, now_epoch=None) -> list:
+    """Run every check and print what it found. Never raises.
+
+    Called after a failed step and after a health-poll timeout as well as at
+    the end of a good run: an exit code tells an operator that something is
+    wrong, and this tells them what. It changes nothing, so running it on
+    the way out of a failure costs only the seconds it takes.
+    """
+    if now_epoch is None:
+        now_epoch = int(time.time())
+    try:
+        capture = collect(runner)
+        findings = assemble_findings(capture, {}, now_epoch)
+    except Exception as exc:  # pragma: no cover - a broken collector is not fatal
+        out.write("could not run the checks: %s\n" % exc)
+        return []
+    report = render_findings(findings)
+    out.write(report)
+    log.write(report)
+    return findings
+
+
+def survey_host(target, out, log) -> str:
+    """Print what else is on this box, and how to turn each of it off."""
+    listeners = parse_listeners(target.run(LISTENERS_COMMAND, check=False).stdout)
+    units = parse_pid_units(target.run(PID_UNITS_COMMAND, check=False).stdout)
+    report = takeover_report(listeners, units)
+    if not report:
+        ok("nothing else is listening on a TCP port", out)
+        log.line("no other TCP listeners")
+        return ""
+    warn("this box is running something else:", out)
+    out.write("\n" + report + "\n")
+    log.line(report)
+    return report
+
+
+def run_deployment(options, out=None, err=None, target=None, log=None,
+                   runner=None) -> int:
+    """The whole thing, in ten numbered steps.
+
+    The order is the argument: provision before build (the build needs the
+    Node this installs), guards before anything is mirrored (mirroring
+    removes its destination), migrate before restart, and the checks last,
+    where they verify rather than predict.
+    """
+    out = out or sys.stdout
+    err = err or sys.stderr
+    target = target or LocalTarget()
+    runner = runner or LocalRunner()
+    root = str(_DEPLOY_DIR.parent)
+
+    banner("DSR portal deployment", out)
+
+    if options.dry_run:
+        out.write(
+            "Nothing below is run. This is what a deployment would do.\n"
+        )
+        out.write("\nProvisioning:\n")
+        out.write(render_plan(provision_steps()))
+        out.write("\nDeployment:\n")
+        out.write(render_plan(deploy_steps({})))
+        out.write("\nThen: health check, then the checks --diagnose runs.\n")
         return 0
 
-    # The secrets are read before anything is installed, so a secrets file
-    # that cannot deploy never gets as far as creating roles from it.
-    path = secrets_path()
-    secrets = read_secrets(path)
-    local_preflight(secrets)
+    # -- 1 ------------------------------------------------------------------
+    step(1, TOTAL_STEPS, "Preflight", out)
+    check_root()
+    ok("running as root", out)
 
-    if target is None:
-        target = LocalTarget()
-    out.write("==> provisioning %s\n" % this_host())
-    copy_self(target, out)
+    if log is None:
+        try:
+            log = RunLog(os.path.join(LOG_DIR, log_filename())).open()
+        except OSError as exc:
+            # A read-only or full /var/log is a reason to lose the log, not
+            # a reason to refuse the deployment the operator asked for.
+            log = NullLog()
+            warn("could not open a log under %s (%s); continuing without one"
+                 % (LOG_DIR, exc.strerror or exc), out)
+    log.line("dsr_deploy.py starting on %s" % this_host())
+    if log.path:
+        ok("logging this run to %s" % log.path, out)
+    removed = log.prune()
+    if removed:
+        info("removed %d older log%s" % (len(removed), "" if len(removed) == 1 else "s"), out)
+
+    warning = rhel_warning(target.run("cat /etc/os-release", check=False).stdout)
+    if warning:
+        warn(warning, out)
+        log.line("WARNING: %s" % warning)
+    else:
+        ok("RHEL 9 (platform:el9)", out)
+
+    missing = missing_repo_paths(root)
+    refusal = repo_refusal(root, missing)
+    if refusal:
+        raise Refusal(refusal)
+    ok("checkout looks complete: %s" % root, out)
+
+    copy_self(target, NullOut(out))
+    ok("this tool copied to %s (the config rewrites run it)" % REMOTE_SELF, out)
+
+    # -- 2 ------------------------------------------------------------------
+    step(2, TOTAL_STEPS, "What else is on this box", out)
+    survey_host(target, out, log)
+
+    # -- 3 ------------------------------------------------------------------
+    step(3, TOTAL_STEPS, "Secrets", out)
+    installed = read_existing_env()
+    if installed:
+        ok("read the existing %s (%d values kept)" % (ENV_PATH, len(installed)), out)
+    else:
+        info("no %s yet -- this is a first deployment" % ENV_PATH, out)
+
+    path = secrets_path()
+    operator = read_operator_secrets(path)
+    absent = missing_graph_keys(operator)
+    if absent:
+        written = write_secrets_template(path)
+        out.write("\n")
+        out.write(graph_credentials_refusal(path, absent, written))
+        log.line("stopped: %s needs %s" % (path, " ".join(absent)))
+        log.close()
+        return 2
+    ok("mail credentials read from %s" % path, out)
+
+    secrets, generated = assemble_env(installed, operator)
+    log.add_values([secrets.get(key, "") for key in GENERATED_KEYS])
+    for key in GENERATED_KEYS:
+        if key in generated:
+            ok("generated %s" % key, out)
+        else:
+            ok("kept the existing %s" % key, out)
+    if "CRYPTO_MASTER_KEY" not in generated:
+        info(
+            "the encryption key is the one already installed (%s) -- a new one "
+            "would orphan every saved setting"
+            % key_fingerprint(secrets.get("CRYPTO_MASTER_KEY", "")),
+            out,
+        )
+
+    # The belt to the braces above: whatever route the value took through
+    # assemble_env, the key about to be written must be the key that is
+    # already there. If those two ever disagree, stop before the .env is
+    # written rather than after.
+    refusal = fingerprint_refusal(
+        key_fingerprint_or_blank(secrets.get("CRYPTO_MASTER_KEY", "")),
+        key_fingerprint_or_blank(installed.get("CRYPTO_MASTER_KEY", "")),
+        str(path),
+        this_host(),
+    )
+    if refusal:
+        raise Refusal(refusal)
+
+    for warning in validate_secrets(secrets):
+        warn(warning, out)
+        log.line("WARNING: %s" % warning)
+
+    # -- 4 ------------------------------------------------------------------
+    step(4, TOTAL_STEPS, "Disk space for provisioning", out)
     check_disk_budget(
         target,
         provision_needs(),
         "nginx, Node 22, PostgreSQL 16, SELinux tooling and the dnf cache",
     )
+    ok("enough room for the packages", out)
 
-    # Inside the try, not before it: the write can create the file and then
-    # fail, and the removal below would never run -- leaving a secrets file
-    # behind. The `rm -f` is already harmless when it was never created.
+    # -- 5 ------------------------------------------------------------------
+    # From here to the end, the staged secrets file and its removal bracket
+    # everything: the role step reads DB_PASS out of it and the .env step
+    # reads all nine, and a run that dies in between must not leave a file
+    # holding both database passwords behind on disk.
+    #
+    # Two writes rather than one. Provisioning needs the two role passwords
+    # and nothing else, so that is all it gets: the encryption key is not
+    # exposed for the length of an npm build it has no part in.
     try:
+        step(5, TOTAL_STEPS, "Provision the host", out)
         target.write(
             REMOTE_SECRETS,
             remote_secrets_content(secrets, PROVISION_SECRET_KEYS),
             mode="600",
         )
-        run_steps(target, steps, out, secrets)
-    finally:
-        target.run("rm -f %s" % REMOTE_SECRETS, check=False)
-    out.write("PROVISION_OK\n")
-    return 0
+        _run_phase(target, provision_steps(), secrets, out, err, log, runner)
 
-
-def cmd_deploy(args, out=None, target=None) -> int:
-    """Build, install, migrate, restart and verify."""
-    if out is None:
-        out = sys.stdout
-    if args.dry_run:
-        out.write(render_plan(deploy_steps({})))
-        return 0
-
-    root = str(_DEPLOY_DIR.parent)
-    path = secrets_path()
-    secrets = read_secrets(path)
-    local_preflight(secrets)
-
-    if target is None:
-        target = LocalTarget()
-    host = this_host()
-    out.write("==> deploying to %s\n" % host)
-    copy_self(target, out)
-
-    # Fingerprints, before the payload rather than after: writing this .env
-    # over a different key orphans every encrypted row in app_settings, and
-    # nothing recovers them. Both sides come from key_fingerprint, over a
-    # value parse_env_text extracted -- the same function, the same
-    # normalisation, so a match means a match.
-    refusal = fingerprint_refusal(
-        key_fingerprint(secrets.get("CRYPTO_MASTER_KEY", "")),
-        key_fingerprint_or_blank(read_existing_env().get("CRYPTO_MASTER_KEY", "")),
-        str(path),
-        host,
-    )
-    if refusal:
-        raise Refusal(refusal)
-
-    check_disk_budget(target, deploy_needs(), deploy_breakdown())
-
-    out.write("==> building\n")
-    for directory, command in build_commands(root):
-        result = subprocess.run(command, cwd=directory, shell=True)
-        if result.returncode != 0:
-            raise Refusal(
-                "FATAL: `%s` failed in %s (exit %d). Nothing was installed."
-                % (command, directory, result.returncode)
-            )
-
-    out.write("==> installing\n")
-    for item in deploy_payload(root):
-        if item.kind == "dir":
-            target.copy_dir(item.local, item.remote)
+        # -- 6 --------------------------------------------------------------
+        step(6, TOTAL_STEPS, "Build the bundles", out)
+        if options.skip_build:
+            unbuilt = built_bundles_missing(root)
+            if unbuilt:
+                raise Refusal(
+                    "FATAL: --skip-build, but there is nothing built to install:\n"
+                    "       %s\n"
+                    "       Run again without --skip-build." % "\n       ".join(unbuilt)
+                )
+            info("--skip-build: reusing what is already in dist/", out)
         else:
-            target.copy_file(item.local, item.remote)
+            for directory, command in build_commands(root):
+                info("%s: %s" % (directory, command), out)
+                result = subprocess.run(
+                    command, cwd=directory, shell=True, capture_output=True, text=True
+                )
+                log.step("build %s" % directory, command, result.returncode,
+                         result.stdout, result.stderr)
+                if result.returncode != 0:
+                    err.write(sanitise_log_text(result.stderr or result.stdout or "",
+                                                secrets.values()))
+                    raise Refusal(
+                        "FATAL: `%s` failed in %s (exit %d). Nothing was installed."
+                        % (command, directory, result.returncode)
+                    )
+            ok("all three bundles built", out)
 
-    # Inside the try: see cmd_provision for why a write that dies after the
-    # file was created must still reach the removal.
-    try:
+        # -- 7 --------------------------------------------------------------
+        step(7, TOTAL_STEPS, "Disk space for the deployment", out)
+        check_disk_budget(target, deploy_needs(), deploy_breakdown())
+        ok("enough room for %s" % deploy_breakdown(), out)
+
+        # -- 8 --------------------------------------------------------------
+        step(8, TOTAL_STEPS, "Install the bundles", out)
+        for item in deploy_payload(root):
+            if item.kind == "dir":
+                target.copy_dir(item.local, item.remote)
+            else:
+                target.copy_file(item.local, item.remote)
+            log.line("installed %s -> %s" % (item.local, item.remote))
+        ok("%d paths installed" % len(deploy_payload(root)), out)
+
+        # -- 9 --------------------------------------------------------------
+        step(9, TOTAL_STEPS, "Deploy", out)
         target.write(
             REMOTE_SECRETS,
             remote_secrets_content(secrets, DEPLOY_SECRET_KEYS),
             mode="600",
         )
-        run_steps(target, deploy_steps(secrets), out, secrets)
-        out.write("==> health\n")
-        if not poll_health(target, out):
-            sys.stderr.write(
-                "FATAL: the API did not come up within %ds. Last log lines:\n"
-                % (HEALTH_ATTEMPTS * HEALTH_INTERVAL_SECONDS)
+        _run_phase(target, deploy_steps(secrets), secrets, out, err, log, runner)
+
+        # -- 10 -------------------------------------------------------------
+        step(10, TOTAL_STEPS, "Health check and verification", out)
+        if not poll_health(target, NullOut(out)):
+            fail(
+                "the API did not answer within %ds."
+                % (HEALTH_ATTEMPTS * HEALTH_INTERVAL_SECONDS),
+                err,
             )
-            # Twenty-five raw journal lines, at the single most likely
-            # moment for an operator to paste this into a ticket. Node
-            # prints the whole DATABASE_URL in `ERR_INVALID_URL`, and a
-            # stack trace can carry a connection string anywhere in it --
-            # which is why evaluate_service refuses to quote journal lines
-            # at all. This half of the tool needs them, so it scrubs them.
-            sys.stderr.write(
-                scrub(
-                    redact_url(target.run(JOURNAL_TAIL_COMMAND, check=False).stdout),
-                    secrets.values(),
-                )
+            journal = sanitise_log_text(
+                target.run(JOURNAL_TAIL_COMMAND, check=False).stdout,
+                secrets.values(),
             )
+            err.write(journal)
+            log.line("health poll timed out; journal follows")
+            log.write(journal)
+            out.write("\nWhat the checks say about this box:\n")
+            print_diagnosis(runner, out, log)
             return 1
+        ok("the API is up and answering on 127.0.0.1:%d" % APP_PORT, out)
+
     finally:
         target.run("rm -f %s" % REMOTE_SECRETS, check=False)
-    out.write("DEPLOY_OK\n")
+
+    out.write("\nVerifying:\n")
+    findings = print_diagnosis(runner, out, log)
+    worst = exit_code_for(findings)
+    log.line("finished with worst finding severity %d" % worst)
+    log.close()
+    if worst >= 2:
+        fail("deployed, but the checks above found failures.", err)
+        return 1
+    banner("DEPLOY_OK", out)
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="dsr_deploy.py",
-        description="Provision, deploy and diagnose the DSR portal on RHEL 9.",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    for name, help_text in (
-        ("provision", "take a bare RHEL 9 host to one ready for a deployment"),
-        ("deploy", "build, push, migrate, restart and verify"),
-        ("doctor", "read the box and explain what is wrong; changes nothing"),
-    ):
-        p = sub.add_parser(name, help=help_text)
-        p.add_argument(
-            "--dry-run",
-            action="store_true",
-            help="print what would happen, touch nothing",
-        )
-        if name == "doctor":
-            p.add_argument(
-                "--no-state",
-                action="store_true",
-                help="do not record this run's measurements (no growth projection)",
+def _run_phase(target, steps, secrets, out, err, log, runner) -> None:
+    """Run one list of steps, naming each, diagnosing the one that fails."""
+    total = len(steps)
+    for index, entry in enumerate(steps, 1):
+        info("[%d/%d] %s" % (index, total, entry.name), out)
+        result = target.run(entry.command, check=False)
+        log.step(entry.name, entry.command, result.returncode,
+                 result.stdout, result.stderr)
+        if result.returncode != 0:
+            message = sanitise_log_text(
+                step_failure_message(
+                    entry.name, result.returncode, result.stderr, result.stdout
+                ),
+                secrets.values(),
             )
-            for group in DOCTOR_GROUPS:
-                p.add_argument(
-                    "--" + group,
-                    action="store_true",
-                    help="report only the %s checks" % group,
-                )
-    return parser
+            fail("step %d of %d failed." % (index, total), err)
+            err.write(message + "\n")
+            out.write("\nWhat the checks say about this box:\n")
+            print_diagnosis(runner, out, log)
+            log.line("FAILED at step %d of %d" % (index, total))
+            log.close()
+            raise Refusal(
+                "%s\n\nThe full log of this run is at %s" % (message, log.path)
+            )
+
+
+def cmd_diagnose(options, out=None) -> int:
+    """The checks, and nothing else. Changes nothing on the box."""
+    out = out or sys.stdout
+    banner("DSR portal checks", out)
+    return cmd_doctor(options, LocalRunner())
 
 
 def main(argv: list) -> int:
@@ -4435,27 +5192,28 @@ def main(argv: list) -> int:
             % (MIN_PYTHON[0], MIN_PYTHON[1], sys.version.split()[0])
         )
         return 2
-    args = build_parser().parse_args(argv)
 
-    if args.command in ("provision", "deploy"):
-        command = cmd_provision if args.command == "provision" else cmd_deploy
-        try:
-            return command(args)
-        except Refusal as exc:
-            # Refusals already read as the operator-facing message they are;
-            # anything else is a bug and should keep its traceback.
-            sys.stderr.write("%s\n" % exc)
-            return 1
-        except RuntimeError as exc:
-            sys.stderr.write("FATAL: %s\n" % exc)
-            return 1
-
-    if args.dry_run:
-        sys.stdout.write(
-            render_plan([Step(name, command) for name, command in DOCTOR_COMMANDS])
-        )
+    options = parse_flags(argv)
+    refusal = unknown_flag_refusal(options.unknown)
+    if refusal:
+        sys.stderr.write(refusal + "\n")
+        return 2
+    if options.help:
+        sys.stdout.write(USAGE % ", ".join("--" + g for g in DOCTOR_GROUPS))
         return 0
-    return cmd_doctor(args, LocalRunner())
+
+    try:
+        if options.diagnose:
+            return cmd_diagnose(options)
+        return run_deployment(options)
+    except Refusal as exc:
+        # Refusals already read as the operator-facing message they are;
+        # anything else is a bug and should keep its traceback.
+        sys.stderr.write("%s\n" % exc)
+        return 1
+    except RuntimeError as exc:
+        sys.stderr.write("FATAL: %s\n" % exc)
+        return 1
 
 
 if __name__ == "__main__":

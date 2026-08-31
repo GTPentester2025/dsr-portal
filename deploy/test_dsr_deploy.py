@@ -209,24 +209,77 @@ class TestPython39Target(unittest.TestCase):
         self.assertTrue(dd.__file__.endswith("dsr_deploy.py"))
 
 
-class TestCli(unittest.TestCase):
-    def test_commands_are_the_three_the_spec_names(self):
-        for command in ("provision", "deploy", "doctor"):
-            args = dd.build_parser().parse_args([command])
-            self.assertEqual(args.command, command)
+class TestFlags(unittest.TestCase):
+    """Membership tests over sys.argv, and what happens to a typo.
 
-    def test_dry_run_defaults_off_and_is_settable(self):
-        self.assertFalse(dd.build_parser().parse_args(["deploy"]).dry_run)
-        self.assertTrue(dd.build_parser().parse_args(["deploy", "--dry-run"]).dry_run)
+    The whole invocation is `sudo python3 deploy/dsr_deploy.py`, so the
+    flags are few and the one that matters is the one nobody typed
+    correctly: `--dryrun` silently doing a real deployment is the failure
+    this refuses.
+    """
 
-    def test_doctor_takes_no_state_and_group_filters(self):
-        args = dd.build_parser().parse_args(["doctor", "--no-state", "--disk"])
-        self.assertTrue(args.no_state)
-        self.assertTrue(args.disk)
+    def test_no_flags_is_a_full_deployment(self):
+        options = dd.parse_flags([])
+        self.assertFalse(options.dry_run)
+        self.assertFalse(options.diagnose)
+        self.assertFalse(options.skip_build)
+        self.assertEqual(options.unknown, [])
 
-    def test_no_command_is_an_error_not_a_crash(self):
-        with self.assertRaises(SystemExit):
-            dd.build_parser().parse_args([])
+    def test_the_three_flags_the_docstring_promises(self):
+        for flag, name in (
+            ("--diagnose", "diagnose"),
+            ("--dry-run", "dry_run"),
+            ("--skip-build", "skip_build"),
+        ):
+            self.assertTrue(getattr(dd.parse_flags([flag]), name), flag)
+            self.assertIn(flag, dd.__doc__)
+
+    def test_a_group_filter_narrows_diagnose(self):
+        options = dd.parse_flags(["--diagnose", "--disk"])
+        self.assertTrue(options.diagnose)
+        self.assertTrue(options.disk)
+        self.assertFalse(options.selinux)
+
+    def test_every_doctor_group_is_a_flag(self):
+        for group in dd.DOCTOR_GROUPS:
+            self.assertTrue(getattr(dd.parse_flags(["--" + group]), group), group)
+
+    def test_a_misspelt_flag_is_refused_rather_than_ignored(self):
+        # `--dryrun` ignored is a real deployment on a box the operator
+        # thought they were only asking about.
+        options = dd.parse_flags(["--dryrun"])
+        self.assertEqual(options.unknown, ["--dryrun"])
+        self.assertFalse(options.dry_run)
+        refusal = dd.unknown_flag_refusal(options.unknown)
+        self.assertIn("--dryrun", refusal)
+        self.assertIn("FATAL", refusal)
+
+    def test_a_bare_word_is_not_a_subcommand_any_more(self):
+        # `deploy` used to be one. Accepting it silently would run a full
+        # deployment for someone following an old note.
+        self.assertEqual(dd.parse_flags(["deploy"]).unknown, ["deploy"])
+
+    def test_understood_flags_are_no_refusal(self):
+        self.assertEqual(dd.unknown_flag_refusal([]), "")
+
+    def test_main_refuses_an_unknown_flag_with_exit_two(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = dd.main(["--dryrun"])
+        self.assertEqual(code, 2)
+        self.assertIn("--dryrun", err.getvalue())
+
+    def test_help_prints_the_usage_and_exits_zero(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = dd.main(["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("sudo python3 deploy/dsr_deploy.py", out.getvalue())
+
+    def test_the_usage_lists_every_flag_that_exists(self):
+        text = dd.USAGE % ", ".join("--" + g for g in dd.DOCTOR_GROUPS)
+        for flag in ("--diagnose", "--dry-run", "--skip-build"):
+            self.assertIn(flag, text)
 
 
 class TestEnvParsing(unittest.TestCase):
@@ -1150,7 +1203,7 @@ class TestPlans(unittest.TestCase):
         with unittest.mock.patch.object(dd, "UNIT_FILE_LOCAL", missing):
             with contextlib.redirect_stderr(err):
                 with contextlib.redirect_stdout(io.StringIO()):
-                    code = dd.main(["deploy", "--dry-run"])
+                    code = dd.main(["--dry-run"])
         self.assertEqual(code, 1)
         self.assertIn("dsr-no-such-unit.service", err.getvalue())
 
@@ -1200,6 +1253,48 @@ DF_SINGLE_ROOT_NEARLY_FULL = """Filesystem     1B-blocks       Used  Available C
 DF_PLENTY = """Filesystem     1B-blocks       Used  Available Capacity Mounted on
 /dev/vda1     42949672960 4294967296 38654705664      10% /
 """
+
+
+class FakeLog:
+    """A run log that keeps its lines in memory.
+
+    Same shape as RunLog, including the sanitising: a test that asserts a
+    secret never reaches the log has to be running the filter the real one
+    runs, or it is asserting about this class instead.
+    """
+
+    def __init__(self, path="/var/log/dsr-deploy/deploy-20260831-000000.log"):
+        self.path = path
+        self.values = []
+        self.lines = []
+        self.closed = False
+
+    def add_values(self, values):
+        for value in values:
+            if value and value not in self.values:
+                self.values.append(value)
+
+    def write(self, text):
+        self.lines.append(dd.sanitise_log_text(text, self.values))
+
+    def line(self, text=""):
+        self.write(text + "\n")
+
+    def step(self, name, command, returncode, stdout, stderr):
+        self.line("--- %s" % name)
+        self.line("$ %s" % command)
+        self.line("exit %s" % returncode)
+        self.line(stdout or "")
+        self.line(stderr or "")
+
+    def close(self):
+        self.closed = True
+
+    def prune(self, keep=dd.LOG_KEEP):
+        return []
+
+    def text(self):
+        return "".join(self.lines)
 
 
 class FakeTarget:
@@ -2144,40 +2239,36 @@ class TestScrub(unittest.TestCase):
         self.assertTrue(message.strip())
 
 
-class CommandTestCase(unittest.TestCase):
-    """Base for the cmd_provision / cmd_deploy tests. Nothing runs, nothing
-    is read.
+class RunTestCase(unittest.TestCase):
+    """Base for the run_deployment tests. Nothing runs, nothing is read.
 
     Everything that would reach the machine is replaced: the target (so no
-    command executes and no file is written), read_secrets and
-    read_existing_env (so no secrets file and no /opt/dsr/server/.env is
-    opened), subprocess.run (so no npm build runs) and time.sleep (so a
-    health-poll timeout costs no wall clock). What is left is the *order* of
-    the decisions these two functions make, which is the region the
-    fail-open fingerprint guard lived in.
+    command executes and no file is written), the runner (so no collector
+    shells out), read_existing_env and read_operator_secrets (so neither
+    /opt/dsr/server/.env nor an operator's real secrets file is opened),
+    subprocess.run (so no npm build runs), the log (so nothing is written
+    to /var/log) and time.sleep (so a health-poll timeout costs no wall
+    clock). What is left is the order of the decisions the run makes.
     """
 
-    SECRETS = {
-        "DB_PASS": "db-pass",
-        "APP_PASS": "app-pass",
-        "CRYPTO_MASTER_KEY": base64.b64encode(b"\x03" * 32).decode(),
-        "EMAIL_PROVIDER": "graph",
+    OPERATOR = {
         "PRIVACY_MAILBOX": "privacy@example.com",
         "GRAPH_TENANT_ID": "t",
         "GRAPH_CLIENT_ID": "c",
         "GRAPH_CLIENT_SECRET": "s",
     }
-    HOST = "root@198.51.100.7"
+    INSTALLED = {
+        "DB_PASS": "db-pass",
+        "APP_PASS": "app-pass",
+        "CRYPTO_MASTER_KEY": base64.b64encode(b"\x03" * 32).decode(),
+    }
 
     def setUp(self):
         self.out = io.StringIO()
         self.err = io.StringIO()
         self.builds = []
         self.slept = []
-        self.secrets_read = []
-        # Points SECRETS_FILE somewhere that does not exist, so a test that
-        # accidentally reaches the real read_secrets fails loudly instead of
-        # opening an operator's actual secrets file.
+        self.log = FakeLog()
         patcher = unittest.mock.patch.dict(
             os.environ, {"SECRETS_FILE": "/nonexistent/.secrets.test.env"}
         )
@@ -2188,28 +2279,41 @@ class CommandTestCase(unittest.TestCase):
         answers = dict(responses or {})
         answers.setdefault("df -PB1", (0, DF_PLENTY, ""))
         answers.setdefault(dd.health_command(), (0, "", ""))
+        answers.setdefault("cat /etc/os-release", (0, OS_RELEASE_EL9, ""))
+        answers.setdefault(dd.LISTENERS_COMMAND, (0, SS_ONLY_OURS, ""))
+        answers.setdefault(dd.PID_UNITS_COMMAND, (0, PID_UNITS, ""))
         return FakeTarget(responses=answers, **kwargs)
 
-    def run_command(self, func, argv, target=None, secrets=None, installed=None):
+    def run_deploy(self, argv=(), target=None, installed=None, operator=None,
+                   build_returncode=0):
         target = target if target is not None else self.target()
+        options = dd.parse_flags(list(argv))
 
         def fake_subprocess_run(command, **kwargs):
             self.builds.append((command, kwargs.get("cwd")))
-            return dd.subprocess.CompletedProcess(command, 0)
+            return dd.subprocess.CompletedProcess(
+                command, build_returncode, "built", "" if not build_returncode
+                else "vite: command not found"
+            )
 
-        def fake_read_secrets(path):
-            self.secrets_read.append(str(path))
-            return dict(self.SECRETS if secrets is None else secrets)
-
-        args = dd.build_parser().parse_args(argv)
         with contextlib.ExitStack() as stack:
             stack.enter_context(
                 unittest.mock.patch.object(
-                    dd, "read_existing_env", lambda *a, **k: dict(installed or {})
+                    dd, "read_existing_env",
+                    lambda *a, **k: dict(self.INSTALLED if installed is None else installed),
                 )
             )
             stack.enter_context(
-                unittest.mock.patch.object(dd, "read_secrets", fake_read_secrets)
+                unittest.mock.patch.object(
+                    dd, "read_operator_secrets",
+                    lambda *a, **k: dict(self.OPERATOR if operator is None else operator),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(dd, "check_root", lambda: None)
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(dd, "missing_repo_paths", lambda root: [])
             )
             stack.enter_context(
                 unittest.mock.patch.object(dd.subprocess, "run", fake_subprocess_run)
@@ -2217,39 +2321,60 @@ class CommandTestCase(unittest.TestCase):
             stack.enter_context(
                 unittest.mock.patch.object(dd.time, "sleep", self.slept.append)
             )
-            stack.enter_context(unittest.mock.patch.object(sys, "stderr", self.err))
-            code = func(args, out=self.out, target=target)
+            code = dd.run_deployment(
+                options, out=self.out, err=self.err, target=target,
+                log=self.log, runner=FakeRunner(HEALTHY_REPLIES),
+            )
         return code, target
 
 
-class TestCmdProvision(CommandTestCase):
-    """The function this task existed to create, which had no test at all."""
+class TestRunDeployment(RunTestCase):
+    """The one command, and the order it does things in."""
 
-    def test_dry_run_reads_no_secrets_and_never_touches_the_box(self):
-        code, target = self.run_command(dd.cmd_provision, ["provision", "--dry-run"])
+    def test_a_good_run_provisions_deploys_and_reports_ok(self):
+        code, target = self.run_deploy()
         self.assertEqual(code, 0)
-        self.assertEqual(self.secrets_read, [])
+        ran = [c for kind, c in target.events if kind == "run"]
+        for entry in dd.provision_steps():
+            self.assertIn(entry.command, ran)
+        for entry in dd.deploy_steps(dict(self.INSTALLED)):
+            self.assertIn(entry.command, ran)
+        self.assertIn("DEPLOY_OK", self.out.getvalue())
+
+    def test_every_step_is_numbered_so_a_failure_says_where_it_stopped(self):
+        self.run_deploy()
+        text = self.out.getvalue()
+        for number in range(1, dd.TOTAL_STEPS + 1):
+            self.assertIn("[%d/%d]" % (number, dd.TOTAL_STEPS), text)
+
+    def test_dry_run_touches_nothing_at_all(self):
+        code, target = self.run_deploy(["--dry-run"])
+        self.assertEqual(code, 0)
         self.assertEqual(target.events, [])
+        self.assertEqual(self.builds, [])
         self.assertIn("install base packages", self.out.getvalue())
+        self.assertIn("restart dsr-api", self.out.getvalue())
 
-    def test_it_runs_every_provisioning_step_in_order(self):
-        code, target = self.run_command(dd.cmd_provision, ["provision"])
-        self.assertEqual(code, 0)
-        expected = [s.command for s in dd.provision_steps()]
-        ran = [c for _kind, c in [e for e in target.events if e[0] == "run"]]
-        for command in expected:
-            self.assertIn(command, ran)
-        self.assertIn("PROVISION_OK", self.out.getvalue())
+    def test_it_provisions_before_it_builds(self):
+        # The build needs the Node 22 provisioning installs. Building first
+        # fails on a bare box with an error about npm, not about Node.
+        _code, target = self.run_deploy()
+        last_provision = target.index_of_run(dd.provision_steps()[-1].command)
+        self.assertTrue(self.builds)
+        self.assertLess(last_provision, target.first_index_of("copy_dir"))
 
-    def test_the_budget_is_checked_before_a_single_step_runs(self):
-        _code, target = self.run_command(dd.cmd_provision, ["provision"])
-        first_step = dd.provision_steps()[0].command
-        self.assertLess(target.index_of_run("df -PB1"), target.index_of_run(first_step))
+    def test_the_disk_budget_runs_before_the_first_directory_is_mirrored(self):
+        # copy_dir removes its destination before it copies, so a guard that
+        # fires afterwards has already cost the box a working install.
+        _code, target = self.run_deploy()
+        self.assertLess(
+            target.index_of_run("df -PB1"), target.first_index_of("copy_dir")
+        )
 
     def test_a_full_box_is_refused_before_anything_is_staged(self):
         target = self.target(responses={"df -PB1": (0, DF_SINGLE_ROOT_NEARLY_FULL, "")})
         with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_provision, ["provision"], target=target)
+            self.run_deploy(target=target)
         self.assertIn("FATAL:", str(caught.exception))
         self.assertEqual(target.written, [])
 
@@ -2257,61 +2382,86 @@ class TestCmdProvision(CommandTestCase):
         failing = dd.provision_steps()[1].command
         target = self.target(responses={failing: (1, "", "No package nginx available")})
         with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_provision, ["provision"], target=target)
+            self.run_deploy(target=target)
         self.assertIn("No package nginx available", str(caught.exception))
         # The whole reason the removal is in a `finally`: a 0600 file with
         # both role passwords must not outlive a failed run.
         self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
 
-    def test_a_failing_deploy_step_does_not_quote_the_staged_password(self):
-        secrets = dict(self.SECRETS)
-        secrets["DB_PASS"] = "7xK9pQzSecretValue"
-        failing = dd.deploy_steps(secrets)[3].command
-        target = self.target(
-            responses={
-                failing: (
-                    1,
-                    "",
-                    "LINE 3:   ALTER ROLE dsr PASSWORD '7xK9pQzSecretValue';",
-                )
-            }
-        )
-        with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_deploy, ["deploy"], target=target, secrets=secrets)
-        self.assertNotIn("7xK9pQzSecretValue", str(caught.exception))
+    def test_provisioning_is_staged_only_the_two_role_passwords(self):
+        _code, target = self.run_deploy()
+        first = target.written[0]
+        text, remote, mode = first
+        self.assertEqual(remote, dd.REMOTE_SECRETS)
+        self.assertEqual(mode, "600")
+        self.assertEqual(sorted(dd.parse_env_text(text)), ["APP_PASS", "DB_PASS"])
+        self.assertNotIn("CRYPTO_MASTER_KEY", text)
 
-    def test_a_failing_provision_step_does_not_quote_the_staged_password(self):
-        # The role step is the one that sends psql the expanded password.
-        secrets = dict(self.SECRETS)
-        secrets["APP_PASS"] = "appQzSecretValue42"
+    def test_the_deploy_phase_is_staged_everything_the_env_needs(self):
+        _code, target = self.run_deploy()
+        text, remote, mode = target.written[-1]
+        self.assertEqual(remote, dd.REMOTE_SECRETS)
+        self.assertEqual(mode, "600")
+        self.assertEqual(
+            sorted(dd.parse_env_text(text)), sorted(dd.DEPLOY_SECRET_KEYS)
+        )
+
+    def test_a_failing_step_does_not_quote_the_password_it_echoed(self):
+        installed = dict(self.INSTALLED)
+        installed["DB_PASS"] = "7xK9pQzSecretValue"
         failing = [s for s in dd.provision_steps() if "role" in s.name][0].command
         target = self.target(
             responses={
                 failing: (
-                    1,
-                    "",
-                    "LINE 3:   CREATE ROLE dsr_app LOGIN PASSWORD "
-                    "'appQzSecretValue42';",
+                    1, "",
+                    "LINE 3:   CREATE ROLE dsr LOGIN PASSWORD "
+                    "'7xK9pQzSecretValue';",
                 )
             }
         )
         with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(dd.cmd_provision, ["provision"], target=target, secrets=secrets)
-        self.assertNotIn("appQzSecretValue42", str(caught.exception))
+            self.run_deploy(target=target, installed=installed)
+        self.assertNotIn("7xK9pQzSecretValue", str(caught.exception))
+        self.assertNotIn("7xK9pQzSecretValue", self.err.getvalue())
         self.assertIn("role", str(caught.exception))
 
-    def test_the_journal_dump_does_not_print_the_staged_passwords(self):
-        # This is the moment output gets pasted into a ticket, and it chains
-        # straight off the slash-in-the-password bug: a `/` in DB_PASS makes
-        # Node raise `ERR_INVALID_URL` with the whole URL in the message,
-        # the service crash-loops, the poll times out, and this runs.
-        secrets = dict(self.SECRETS)
-        secrets["DB_PASS"] = "7xK9pQzSecret"
-        secrets["APP_PASS"] = "appQzSecret42"
+    def test_a_failed_step_prints_the_diagnosis_with_the_failure(self):
+        # An exit code says something is wrong; the checks say what.
+        failing = dd.provision_steps()[1].command
+        target = self.target(responses={failing: (1, "", "No package nginx")})
+        with self.assertRaises(dd.Refusal):
+            self.run_deploy(target=target)
+        self.assertIn("[selinux]", self.out.getvalue())
+        self.assertIn("What the checks say", self.out.getvalue())
+
+    def test_a_failed_step_names_the_log_to_send_on(self):
+        failing = dd.provision_steps()[1].command
+        target = self.target(responses={failing: (1, "", "No package nginx")})
+        with self.assertRaises(dd.Refusal) as caught:
+            self.run_deploy(target=target)
+        self.assertIn(self.log.path, str(caught.exception))
+
+    def test_an_api_that_never_comes_up_fails_and_diagnoses_itself(self):
+        target = self.target(responses={dd.health_command(): (1, "", "")})
+        code, target = self.run_deploy(target=target)
+        self.assertEqual(code, 1)
+        self.assertIn(dd.JOURNAL_TAIL_COMMAND, target.commands)
+        self.assertNotIn("DEPLOY_OK", self.out.getvalue())
+        self.assertIn("did not answer", self.err.getvalue())
+        self.assertIn("[selinux]", self.out.getvalue())
+        # It waited the full window rather than giving up on one probe, and
+        # it still cleaned the secrets file up on the way out.
+        self.assertEqual(len(self.slept), dd.HEALTH_ATTEMPTS - 1)
+        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
+
+    def test_the_journal_dump_does_not_print_the_generated_passwords(self):
+        # This is the moment output gets pasted into a ticket.
+        installed = dict(self.INSTALLED)
+        installed["DB_PASS"] = "7xK9pQzSecret"
+        installed["APP_PASS"] = "appQzSecret42"
         journal = (
             "dsr-api[981]: TypeError [ERR_INVALID_URL]: Invalid URL: "
             "postgres://dsr:7xK9pQzSecret@127.0.0.1:5432/dsr\n"
-            "dsr-api[981]:     at new NodeError (node:internal/errors:399:5)\n"
             "dsr-api[981]: DATABASE_URL_APP=postgres://dsr_app:appQzSecret42@h/dsr\n"
         )
         target = self.target(
@@ -2320,155 +2470,578 @@ class TestCmdProvision(CommandTestCase):
                 dd.JOURNAL_TAIL_COMMAND: (0, journal, ""),
             }
         )
-        code, target = self.run_command(
-            dd.cmd_deploy, ["deploy"], target=target, secrets=secrets
-        )
+        code, _target = self.run_deploy(target=target, installed=installed)
         self.assertEqual(code, 1)
         printed = self.err.getvalue()
-        self.assertIn(dd.JOURNAL_TAIL_COMMAND, target.commands)
         self.assertNotIn("7xK9pQzSecret", printed)
         self.assertNotIn("appQzSecret42", printed)
-        self.assertNotIn(secrets["CRYPTO_MASTER_KEY"], printed)
+        self.assertNotIn(installed["CRYPTO_MASTER_KEY"], printed)
         # It is still a log: the operator needs the error, just not the key.
         self.assertIn("ERR_INVALID_URL", printed)
-        self.assertIn("did not come up", printed)
 
-    def test_a_transfer_that_dies_mid_push_still_removes_the_secrets_file(self):
-        # The write can create the file and then fail. With it outside the
-        # try, the finally never ran and a partial 0600 secrets file stayed
-        # on the box.
-        target = self.target()
-
-        def exploding_write(path, text, mode=""):
-            target.events.append(("write", path))
-            raise RuntimeError("write failed for " + path + ": no space left")
-
-        target.write = exploding_write
-        with self.assertRaises(RuntimeError):
-            self.run_command(dd.cmd_provision, ["provision"], target=target)
-        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
-
-    def test_it_stages_only_the_two_role_passwords(self):
-        _code, target = self.run_command(dd.cmd_provision, ["provision"])
-        self.assertEqual(len(target.written), 1)
-        text, remote, mode = target.written[0]
-        self.assertEqual(remote, dd.REMOTE_SECRETS)
-        self.assertEqual(mode, "600")
-        self.assertEqual(sorted(dd.parse_env_text(text)), ["APP_PASS", "DB_PASS"])
-        self.assertNotIn("CRYPTO_MASTER_KEY", text)
-
-
-class TestCmdDeploy(CommandTestCase):
-    """The other untested half, and the one the Critical lived in."""
-
-    def test_dry_run_reads_no_secrets_and_never_touches_the_box(self):
-        code, target = self.run_command(dd.cmd_deploy, ["deploy", "--dry-run"])
-        self.assertEqual(code, 0)
-        self.assertEqual(self.secrets_read, [])
-        self.assertEqual(target.events, [])
-        self.assertEqual(self.builds, [])
-        self.assertIn("restart dsr-api", self.out.getvalue())
-
-    def test_a_successful_deployment_runs_every_step_and_reports_ok(self):
-        code, target = self.run_command(dd.cmd_deploy, ["deploy"])
-        self.assertEqual(code, 0)
-        ran = [c for _k, c in [e for e in target.events if e[0] == "run"]]
-        for step in dd.deploy_steps(dict(self.SECRETS)):
-            self.assertIn(step.command, ran)
-        self.assertIn("DEPLOY_OK", self.out.getvalue())
-
-    def test_the_disk_budget_runs_before_the_first_directory_is_mirrored(self):
-        # copy_dir removes its destination before it copies, so a guard
-        # that fires after the first copy has already cost the box a
-        # working install.
-        _code, target = self.run_command(dd.cmd_deploy, ["deploy"])
-        disk = target.index_of_run("df -PB1")
-        first_copy = target.first_index_of("copy_dir")
-        self.assertIsNotNone(first_copy)
-        self.assertLess(disk, first_copy)
-
-    def test_a_mismatched_key_refuses_before_anything_is_pushed(self):
-        # The .env already on the box was written with a different key. Its
-        # encrypted rows cannot be read with any other one, so this refuses
-        # rather than overwriting it.
-        installed = {"CRYPTO_MASTER_KEY": base64.b64encode(b"\x09" * 32).decode()}
-        target = self.target()
+    def test_a_failed_build_installs_nothing(self):
         with self.assertRaises(dd.Refusal) as caught:
-            self.run_command(
-                dd.cmd_deploy, ["deploy"], target=target, installed=installed
-            )
-        self.assertIn("app_settings", str(caught.exception))
+            self.run_deploy(build_returncode=1)
+        code_target = None
+        self.assertIn("Nothing was installed", str(caught.exception))
+
+    def test_a_failed_build_does_not_mirror_a_directory(self):
+        target = self.target()
+        with self.assertRaises(dd.Refusal):
+            self.run_deploy(target=target, build_returncode=1)
         self.assertEqual(target.copied_dirs, [])
+
+    def test_skip_build_reuses_what_is_there(self):
+        with unittest.mock.patch.object(dd, "built_bundles_missing", lambda root: []):
+            code, _target = self.run_deploy(["--skip-build"])
+        self.assertEqual(code, 0)
         self.assertEqual(self.builds, [])
 
-    def test_a_failed_build_pushes_nothing(self):
-        def failing_build(command, **kwargs):
-            self.builds.append((command, kwargs.get("cwd")))
-            return dd.subprocess.CompletedProcess(command, 1)
-
-        target = self.target()
-        args = dd.build_parser().parse_args(["deploy"])
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                unittest.mock.patch.object(dd, "read_existing_env", lambda *a, **k: {})
-            )
-            stack.enter_context(
-                unittest.mock.patch.object(
-                    dd, "read_secrets", lambda path: dict(self.SECRETS)
-                )
-            )
-            stack.enter_context(
-                unittest.mock.patch.object(dd.subprocess, "run", failing_build)
-            )
+    def test_skip_build_with_nothing_built_is_a_refusal_that_says_so(self):
+        with unittest.mock.patch.object(
+            dd, "built_bundles_missing", lambda root: ["/repo/server/dist"]
+        ):
             with self.assertRaises(dd.Refusal) as caught:
-                dd.cmd_deploy(args, out=self.out, target=target)
-        self.assertIn("Nothing was installed", str(caught.exception))
-        self.assertEqual(target.copied_dirs, [])
-
-    def test_the_staged_secrets_are_removed_even_when_a_step_fails(self):
-        failing = dd.deploy_steps(dict(self.SECRETS))[3].command
-        target = self.target(responses={failing: (1, "", "relation does not exist")})
-        with self.assertRaises(dd.Refusal):
-            self.run_command(dd.cmd_deploy, ["deploy"], target=target)
-        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
-
-    def test_an_api_that_never_comes_up_fails_and_shows_the_journal(self):
-        target = self.target(responses={dd.health_command(): (1, "", "")})
-        code, target = self.run_command(dd.cmd_deploy, ["deploy"], target=target)
-        self.assertEqual(code, 1)
-        self.assertIn(dd.JOURNAL_TAIL_COMMAND, target.commands)
-        self.assertNotIn("DEPLOY_OK", self.out.getvalue())
-        self.assertIn("did not come up", self.err.getvalue())
-        # It waited the full window rather than giving up on one probe, and
-        # it still cleaned the secrets file up on the way out.
-        self.assertEqual(len(self.slept), dd.HEALTH_ATTEMPTS - 1)
-        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
-
-    def test_a_transfer_that_dies_mid_push_still_removes_the_secrets_file(self):
-        # The write can create the file and then fail. With it outside the
-        # try, the finally never ran and a partial 0600 secrets file stayed
-        # on the box.
-        target = self.target()
-
-        def exploding_write(path, text, mode=""):
-            target.events.append(("write", path))
-            raise RuntimeError("write failed for " + path + ": no space left")
-
-        target.write = exploding_write
-        with self.assertRaises(RuntimeError):
-            self.run_command(dd.cmd_deploy, ["deploy"], target=target)
-        self.assertIn("rm -f %s" % dd.REMOTE_SECRETS, target.commands)
+                self.run_deploy(["--skip-build"])
+        self.assertIn("--skip-build", str(caught.exception))
+        self.assertIn("/repo/server/dist", str(caught.exception))
 
     def test_the_deployer_copies_itself_before_any_step_can_invoke_it(self):
-        # Two provisioning steps run `python3 /root/dsr_deploy.py`; deploy
-        # copies it too, so the copy on the box is never the previous
-        # release's while this release's steps are running.
-        _code, target = self.run_command(dd.cmd_deploy, ["deploy"])
+        # Two provisioning steps run `python3 /root/dsr_deploy.py`.
+        _code, target = self.run_deploy()
         self.assertIn(("copy_file", dd.REMOTE_SELF), target.events)
         self.assertLess(
             target.events.index(("copy_file", dd.REMOTE_SELF)),
-            target.first_index_of("copy_dir"),
+            target.index_of_run(dd.provision_steps()[0].command),
         )
+
+    def test_it_prints_what_else_is_listening_before_it_changes_anything(self):
+        target = self.target(responses={dd.LISTENERS_COMMAND: (0, SS_SHARED_BOX, "")})
+        _code, target = self.run_deploy(target=target)
+        text = self.out.getvalue()
+        self.assertIn("5567", text)
+        self.assertIn("systemctl stop data-formulator.service", text)
+        self.assertLess(
+            text.index("systemctl stop data-formulator.service"),
+            text.index("[5/%d]" % dd.TOTAL_STEPS),
+        )
+
+    def test_it_stops_nothing_itself(self):
+        target = self.target(responses={dd.LISTENERS_COMMAND: (0, SS_SHARED_BOX, "")})
+        _code, target = self.run_deploy(target=target)
+        for command in target.commands:
+            self.assertNotIn("systemctl stop", command)
+            self.assertNotIn("systemctl disable", command)
+
+    def test_a_run_that_finds_failures_reports_them_and_exits_one(self):
+        # Deployed, health-checked, and the checks still found something.
+        # Saying DEPLOY_OK over that would be the tool lying about the box.
+        options = dd.parse_flags([])
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    dd, "read_existing_env", lambda *a, **k: dict(self.INSTALLED)
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    dd, "read_operator_secrets", lambda *a, **k: dict(self.OPERATOR)
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(dd, "check_root", lambda: None)
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(dd, "missing_repo_paths", lambda root: [])
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    dd.subprocess, "run",
+                    lambda command, **kw: dd.subprocess.CompletedProcess(command, 0),
+                )
+            )
+            code = dd.run_deployment(
+                options, out=self.out, err=self.err, target=self.target(),
+                log=self.log, runner=FakeRunner(BROKEN_REPLIES),
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("setsebool -P httpd_can_network_connect on", self.out.getvalue())
+        self.assertNotIn("DEPLOY_OK", self.out.getvalue())
+
+
+class TestGeneratedSecrets(unittest.TestCase):
+    """The three values nobody types, and the one that must never change.
+
+    CRYPTO_MASTER_KEY is the whole reason this class is long. Every secret
+    row in app_settings is encrypted with it and there is no second copy: a
+    redeploy that generates a new one makes all of them permanently
+    unreadable, silently, with the deployment reporting success.
+    """
+
+    KEY = base64.b64encode(b"\x11" * 32).decode()
+
+    def test_a_first_deployment_generates_all_three(self):
+        env, generated = dd.assemble_env({}, {})
+        self.assertEqual(sorted(generated), ["APP_PASS", "CRYPTO_MASTER_KEY", "DB_PASS"])
+        for key in dd.GENERATED_KEYS:
+            self.assertTrue(env[key])
+
+    def test_a_redeploy_keeps_every_value_already_installed(self):
+        installed = {
+            "DB_PASS": "already-here-db",
+            "APP_PASS": "already-here-app",
+            "CRYPTO_MASTER_KEY": self.KEY,
+            "COOKIE_SECURE": "false",
+            "SOMETHING_ELSE": "set by hand",
+        }
+        env, generated = dd.assemble_env(installed, {})
+        self.assertEqual(generated, [])
+        for key, value in installed.items():
+            self.assertEqual(env[key], value, key)
+
+    def test_the_master_key_is_never_regenerated_over_an_existing_one(self):
+        # The one that cannot be undone. Run it a hundred times against an
+        # installed key and it must come back the same every time.
+        for _ in range(100):
+            env, generated = dd.assemble_env({"CRYPTO_MASTER_KEY": self.KEY}, {})
+            self.assertEqual(env["CRYPTO_MASTER_KEY"], self.KEY)
+            self.assertNotIn("CRYPTO_MASTER_KEY", generated)
+
+    def test_the_operator_file_cannot_replace_an_installed_master_key(self):
+        # Not even if someone puts one there. A file should not be able to
+        # orphan every encrypted row without anyone deciding to.
+        env, _generated = dd.assemble_env(
+            {"CRYPTO_MASTER_KEY": self.KEY},
+            {"CRYPTO_MASTER_KEY": base64.b64encode(b"\x22" * 32).decode()},
+        )
+        self.assertEqual(env["CRYPTO_MASTER_KEY"], self.KEY)
+
+    def test_an_installed_key_that_is_invalid_is_a_refusal_not_a_replacement(self):
+        # A key that fails validate_master_key is broken; generating a new
+        # one "to fix it" destroys the data it was protecting. The pair
+        # asserted together: kept by assemble_env, refused by validation.
+        env, generated = dd.assemble_env({"CRYPTO_MASTER_KEY": "a" * 64}, {})
+        self.assertEqual(env["CRYPTO_MASTER_KEY"], "a" * 64)
+        self.assertNotIn("CRYPTO_MASTER_KEY", generated)
+        with self.assertRaises(dd.SecretsError):
+            dd.validate_master_key(env["CRYPTO_MASTER_KEY"])
+
+    def test_an_empty_value_counts_as_absent(self):
+        # `DB_PASS=` in the .env deploys an empty password, the API cannot
+        # authenticate and systemd crash-loops it. There is nothing to
+        # preserve in an empty string.
+        env, generated = dd.assemble_env(
+            {"DB_PASS": "", "APP_PASS": "   ", "CRYPTO_MASTER_KEY": self.KEY}, {}
+        )
+        self.assertEqual(sorted(generated), ["APP_PASS", "DB_PASS"])
+        self.assertTrue(env["DB_PASS"].strip())
+
+    def test_the_operator_file_supplies_the_mail_credentials(self):
+        env, _generated = dd.assemble_env(
+            {"CRYPTO_MASTER_KEY": self.KEY},
+            {"GRAPH_CLIENT_SECRET": "from-the-file", "PRIVACY_MAILBOX": "p@e.com"},
+        )
+        self.assertEqual(env["GRAPH_CLIENT_SECRET"], "from-the-file")
+        self.assertEqual(env["PRIVACY_MAILBOX"], "p@e.com")
+
+    def test_a_rotated_client_secret_wins_over_the_installed_one(self):
+        # Entra secrets expire. The file is where the operator changes it,
+        # so the file has to be what a redeploy reads.
+        env, _generated = dd.assemble_env(
+            {"GRAPH_CLIENT_SECRET": "expired"}, {"GRAPH_CLIENT_SECRET": "rotated"}
+        )
+        self.assertEqual(env["GRAPH_CLIENT_SECRET"], "rotated")
+
+    def test_an_empty_line_in_the_operator_file_does_not_blank_a_value(self):
+        # The template ships with `GRAPH_TENANT_ID=` on it. If that
+        # overwrote an installed value, editing one line of the file would
+        # silently clear the other three.
+        env, _generated = dd.assemble_env(
+            {"GRAPH_TENANT_ID": "installed"}, {"GRAPH_TENANT_ID": ""}
+        )
+        self.assertEqual(env["GRAPH_TENANT_ID"], "installed")
+
+    def test_the_generated_passwords_survive_a_connection_string(self):
+        # token_hex, not token_urlsafe or base64: the .env interpolates
+        # these into postgres://user:PASS@host with no percent-encoding, and
+        # validate_role_passwords refuses / @ : ? # % for that reason.
+        for _ in range(200):
+            env, _generated = dd.assemble_env({}, {})
+            dd.validate_role_passwords(env)
+            for key in ("DB_PASS", "APP_PASS"):
+                for character in dd.URL_RESERVED_IN_PASSWORD:
+                    self.assertNotIn(character, env[key])
+
+    def test_the_generated_passwords_carry_thirty_two_bytes_of_entropy(self):
+        password = dd.generate_role_password()
+        self.assertEqual(len(password), 64)
+        int(password, 16)  # raises if it is not hex
+
+    def test_two_generated_passwords_are_not_the_same_password(self):
+        # DB_PASS and APP_PASS are generated by the same function; sharing
+        # one value would give dsr_app the owner role's password.
+        env, _generated = dd.assemble_env({}, {})
+        self.assertNotEqual(env["DB_PASS"], env["APP_PASS"])
+
+    def test_the_generated_master_key_is_exactly_thirty_two_bytes(self):
+        # What validate_master_key demands, and what the app's AES key is.
+        for _ in range(50):
+            key = dd.generate_master_key()
+            dd.validate_master_key(key)
+            self.assertEqual(len(base64.b64decode(key)), 32)
+
+    def test_generation_is_the_only_thing_that_differs_between_two_runs(self):
+        first, _ = dd.assemble_env({}, {})
+        second, _ = dd.assemble_env({}, {})
+        for key in dd.GENERATED_KEYS:
+            self.assertNotEqual(first[key], second[key], key)
+
+    def test_the_generators_are_injectable_so_this_can_be_pinned(self):
+        env, generated = dd.assemble_env(
+            {}, {}, generators={
+                "DB_PASS": lambda: "db", "APP_PASS": lambda: "app",
+                "CRYPTO_MASTER_KEY": lambda: "key",
+            }
+        )
+        self.assertEqual(env["DB_PASS"], "db")
+        self.assertEqual(env["CRYPTO_MASTER_KEY"], "key")
+        self.assertEqual(len(generated), 3)
+
+
+class TestSecretsTemplate(unittest.TestCase):
+    """The four values an operator has to supply, and how they are asked for."""
+
+    def setUp(self):
+        self.directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.directory), True)
+        self.path = self.directory / ".secrets.env"
+
+    def test_a_missing_file_is_written_as_a_template(self):
+        self.assertTrue(dd.write_secrets_template(self.path))
+        text = self.path.read_text()
+        for key in dd.GRAPH_KEYS:
+            self.assertIn(key + "=", text)
+
+    def test_the_template_explains_each_value(self):
+        dd.write_secrets_template(self.path)
+        text = self.path.read_text()
+        self.assertIn("Entra", text)
+        self.assertIn("sudo python3 deploy/dsr_deploy.py", text)
+        # And says what it does NOT ask for, so nobody goes looking.
+        self.assertIn("generated on the first deployment", text)
+
+    def test_an_existing_file_is_never_overwritten(self):
+        self.path.write_text("GRAPH_CLIENT_SECRET=typed-by-hand\n")
+        self.assertFalse(dd.write_secrets_template(self.path))
+        self.assertEqual(self.path.read_text(), "GRAPH_CLIENT_SECRET=typed-by-hand\n")
+
+    def test_the_template_is_created_unreadable_to_anyone_else(self):
+        # The mode os.open is CALLED with, not the mode the file ends up
+        # with: this suite runs on a platform with no POSIX modes at all,
+        # where reading it back asserts nothing.
+        opened = []
+        real_open = os.open
+
+        def recording_open(path, flags, mode=0o777, **kwargs):
+            opened.append((str(path), mode))
+            return real_open(path, flags, mode, **kwargs)
+
+        with unittest.mock.patch.object(os, "open", recording_open):
+            dd.write_secrets_template(self.path)
+        self.assertEqual(opened, [(str(self.path), 0o600)])
+
+    def test_a_file_with_every_value_is_not_missing_anything(self):
+        self.assertEqual(
+            dd.missing_graph_keys(
+                dict((k, "v") for k in dd.GRAPH_KEYS)
+            ),
+            [],
+        )
+
+    def test_a_blank_value_counts_as_missing(self):
+        env = dict((k, "v") for k in dd.GRAPH_KEYS)
+        env["GRAPH_CLIENT_SECRET"] = "   "
+        self.assertEqual(dd.missing_graph_keys(env), ["GRAPH_CLIENT_SECRET"])
+
+    def test_an_untouched_template_counts_as_missing_all_four(self):
+        dd.write_secrets_template(self.path)
+        env = dd.parse_env_text(self.path.read_text())
+        self.assertEqual(dd.missing_graph_keys(env), list(dd.GRAPH_KEYS))
+
+    def test_the_refusal_names_the_file_and_every_missing_key(self):
+        message = dd.graph_credentials_refusal(
+            self.path, ["GRAPH_CLIENT_SECRET"], True
+        )
+        self.assertIn(str(self.path), message)
+        self.assertIn("GRAPH_CLIENT_SECRET", message)
+        self.assertIn("run this command again", message)
+
+    def test_nothing_is_ever_prompted_for(self):
+        # A client secret typed at a terminal is echoed into the scrollback
+        # and, when pasted, into root's shell history -- this runs under
+        # sudo. The source is the assertion: no input() anywhere.
+        source = pathlib.Path(dd.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("input(", source)
+        self.assertNotIn("getpass", source)
+
+
+class TestRunLog(unittest.TestCase):
+    """The log exists to be sent to somebody for help.
+
+    Which makes it the single most likely place for a generated password to
+    escape, and the reason every line goes through scrub and redact_url
+    before it is written.
+    """
+
+    def setUp(self):
+        self.directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.directory), True)
+
+    def log(self, values=()):
+        log = dd.RunLog(self.directory / dd.log_filename(), values).open()
+        self.addCleanup(log.close)
+        return log
+
+    def test_a_staged_secret_cannot_appear_in_the_log(self):
+        # The test this file exists for. A real generated password, put
+        # through every route that reaches the log.
+        password = dd.generate_role_password()
+        key = dd.generate_master_key()
+        log = self.log([password, key])
+        log.line("writing .env")
+        log.step(
+            "create the dsr and dsr_app roles",
+            "sudo -u postgres psql <<SQL ... PASSWORD '%s' ... SQL" % password,
+            1,
+            "CREATE ROLE dsr LOGIN PASSWORD '%s';" % password,
+            "psql: ERROR: syntax error\nLINE 3: ... PASSWORD '%s';" % password,
+        )
+        log.write("CRYPTO_MASTER_KEY=%s\n" % key)
+        log.close()
+        text = pathlib.Path(log.path).read_text()
+        self.assertNotIn(password, text)
+        self.assertNotIn(key, text)
+        # Still a log: the diagnosis has to survive the redaction.
+        self.assertIn("syntax error", text)
+        self.assertIn("create the dsr and dsr_app roles", text)
+        self.assertIn("exit 1", text)
+
+    def test_a_connection_string_in_the_output_is_redacted_too(self):
+        # scrub only knows the values it was handed. A password already in
+        # a .env on the box, echoed back by node, was never staged here.
+        log = self.log([])
+        log.line("Invalid URL: postgres://dsr:onTheBox9@127.0.0.1:5432/dsr")
+        log.close()
+        self.assertNotIn("onTheBox9", pathlib.Path(log.path).read_text())
+
+    def test_a_value_generated_after_the_log_opened_is_still_filtered(self):
+        # The log is opened in step 1 and the secrets are generated in step
+        # 3. Anything printed in between cannot contain them; everything
+        # after must be filtered, which is what add_values is for.
+        log = self.log([])
+        password = dd.generate_role_password()
+        log.add_values([password])
+        log.line("DB_PASS=%s" % password)
+        log.close()
+        self.assertNotIn(password, pathlib.Path(log.path).read_text())
+
+    def test_every_step_is_recorded_with_its_command_and_exit_code(self):
+        log = self.log()
+        log.step("install base packages", "dnf install -y nginx", 0, "Complete!", "")
+        log.close()
+        text = pathlib.Path(log.path).read_text()
+        self.assertIn("install base packages", text)
+        self.assertIn("dnf install -y nginx", text)
+        self.assertIn("exit 0", text)
+        self.assertIn("Complete!", text)
+
+    def test_the_log_is_created_unreadable_to_anyone_else(self):
+        # It holds every command of the run. Even scrubbed, that is not a
+        # file for every user on the box. Asserted on the mode os.open is
+        # called with, because this suite runs where st_mode means nothing.
+        opened = []
+        real_open = os.open
+
+        def recording_open(path, flags, mode=0o777, **kwargs):
+            opened.append((str(path), mode))
+            return real_open(path, flags, mode, **kwargs)
+
+        path = self.directory / dd.log_filename()
+        with unittest.mock.patch.object(os, "open", recording_open):
+            log = dd.RunLog(path).open()
+            log.close()
+        self.assertEqual(opened, [(str(path), 0o600)])
+
+    def test_the_name_sorts_chronologically(self):
+        early = dd.log_filename(1756512242)
+        late = dd.log_filename(1756598642)
+        self.assertLess(early, late)
+        self.assertTrue(early.startswith("deploy-"))
+        self.assertTrue(early.endswith(".log"))
+
+    def test_ten_are_kept_and_the_oldest_go(self):
+        names = ["deploy-2026083%d-000000.log" % n for n in range(0, 10)]
+        names += ["deploy-20260901-000000.log", "deploy-20260902-000000.log"]
+        doomed = dd.logs_to_delete(names, keep=10)
+        self.assertEqual(doomed, ["deploy-20260830-000000.log",
+                                  "deploy-20260831-000000.log"])
+        self.assertEqual(len(names) - len(doomed), 10)
+
+    def test_nothing_is_deleted_until_there_are_more_than_ten(self):
+        names = ["deploy-2026083%d-000000.log" % n for n in range(0, 10)]
+        self.assertEqual(dd.logs_to_delete(names, keep=10), [])
+
+    def test_the_default_is_the_ten_the_docstring_promises(self):
+        self.assertEqual(dd.LOG_KEEP, 10)
+
+    def test_it_never_offers_to_delete_a_file_that_is_not_one_of_ours(self):
+        # This list is fed to unlink, in a directory under /var/log.
+        names = ["messages", "secure", "dsr-deploy.conf", "deploy-x.txt"]
+        names += ["deploy-2026083%d-000000.log" % n for n in range(0, 10)]
+        names += ["deploy-20260901-000000.log"]
+        doomed = dd.logs_to_delete(names, keep=10)
+        self.assertEqual(doomed, ["deploy-20260830-000000.log"])
+
+    def test_pruning_removes_the_oldest_from_disk(self):
+        for n in range(0, 12):
+            (self.directory / ("deploy-202608%02d-000000.log" % (n + 1))).write_text("x")
+        (self.directory / "messages").write_text("not ours")
+        log = dd.RunLog(self.directory / "deploy-20260930-000000.log")
+        removed = log.prune(keep=10)
+        self.assertEqual(len(removed), 2)
+        self.assertTrue((self.directory / "messages").exists())
+        remaining = sorted(
+            p.name for p in self.directory.iterdir() if p.name.startswith("deploy-")
+        )
+        self.assertEqual(len(remaining), 10)
+
+    def test_the_sanitiser_runs_both_filters(self):
+        text = dd.sanitise_log_text(
+            "postgres://dsr:inTheUrl9@h/dsr and staged sw0rdfish99", ["sw0rdfish99"]
+        )
+        self.assertNotIn("inTheUrl9", text)
+        self.assertNotIn("sw0rdfish99", text)
+
+    def test_the_null_log_swallows_everything_without_a_file(self):
+        log = dd.NullLog()
+        log.add_values(["x"])
+        log.line("y")
+        log.step("a", "b", 1, "c", "d")
+        log.close()
+        self.assertEqual(log.prune(), [])
+        self.assertEqual(log.path, "")
+
+    def test_a_log_that_cannot_be_opened_does_not_stop_the_deployment(self):
+        # A read-only or full /var/log loses the log; it does not lose the
+        # deployment the operator asked for.
+        opener = dd.RunLog.open
+
+        def exploding_open(self):
+            raise OSError(30, "Read-only file system")
+
+        with unittest.mock.patch.object(dd.RunLog, "open", exploding_open):
+            case = RunTestCase("run")
+            case.setUp()
+            options = dd.parse_flags([])
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(unittest.mock.patch.object(
+                    dd, "read_existing_env", lambda *a, **k: dict(case.INSTALLED)))
+                stack.enter_context(unittest.mock.patch.object(
+                    dd, "read_operator_secrets", lambda *a, **k: dict(case.OPERATOR)))
+                stack.enter_context(unittest.mock.patch.object(
+                    dd, "check_root", lambda: None))
+                stack.enter_context(unittest.mock.patch.object(
+                    dd, "missing_repo_paths", lambda root: []))
+                stack.enter_context(unittest.mock.patch.object(
+                    dd.subprocess, "run",
+                    lambda command, **kw: dd.subprocess.CompletedProcess(command, 0)))
+                code = dd.run_deployment(
+                    options, out=case.out, err=case.err, target=case.target(),
+                    runner=FakeRunner(HEALTHY_REPLIES),
+                )
+            case.doCleanups()
+        self.assertEqual(code, 0)
+        self.assertIn("continuing without one", case.out.getvalue())
+        self.assertIs(opener, dd.RunLog.open)
+
+
+class TestDiagnoseOnly(unittest.TestCase):
+    def test_diagnose_runs_the_checks_and_changes_nothing(self):
+        out = io.StringIO()
+        runner = FakeRunner(HEALTHY_REPLIES)
+        with unittest.mock.patch.object(dd, "LocalRunner", lambda: runner):
+            with contextlib.redirect_stdout(out):
+                code = dd.main(["--diagnose", "--no-state"])
+        self.assertEqual(code, 0)
+        self.assertIn("All checks passed.", out.getvalue())
+        self.assertEqual(runner.writes, [])
+        for command in runner.commands:
+            for verb in ("systemctl restart", "systemctl stop", "dnf install",
+                         "rm ", "mv ", "cat >"):
+                self.assertNotIn(verb, command)
+
+    def test_a_broken_box_exits_two(self):
+        out = io.StringIO()
+        with unittest.mock.patch.object(
+            dd, "LocalRunner", lambda: FakeRunner(BROKEN_REPLIES)
+        ):
+            with contextlib.redirect_stdout(out):
+                code = dd.main(["--diagnose", "--no-state"])
+        self.assertEqual(code, 2)
+        self.assertIn("setsebool", out.getvalue())
+
+
+class TestPreflight(unittest.TestCase):
+    def test_running_as_a_normal_user_is_a_refusal_naming_sudo(self):
+        with unittest.mock.patch.object(os, "geteuid", lambda: 1000, create=True):
+            with self.assertRaises(dd.Refusal) as caught:
+                dd.check_root()
+        self.assertIn("sudo python3 deploy/dsr_deploy.py", str(caught.exception))
+
+    def test_root_passes(self):
+        with unittest.mock.patch.object(os, "geteuid", lambda: 0, create=True):
+            dd.check_root()
+
+    def test_a_platform_without_geteuid_is_refused_rather_than_assumed(self):
+        # Windows has no geteuid. Reading its absence as "must be root" is
+        # how a deployer runs half of itself on a developer's laptop.
+        with unittest.mock.patch.object(dd.os, "geteuid", None, create=True):
+            with self.assertRaises(dd.Refusal):
+                dd.check_root()
+
+    def test_el9_is_no_warning(self):
+        self.assertEqual(dd.rhel_warning(OS_RELEASE_EL9), "")
+
+    def test_something_else_warns_but_does_not_refuse(self):
+        warning = dd.rhel_warning('NAME="Ubuntu"\nVERSION_ID="24.04"\n')
+        self.assertIn("RHEL 9", warning)
+
+    def test_an_unreadable_os_release_says_so(self):
+        self.assertIn("could not read", dd.rhel_warning(""))
+
+    def test_a_missing_checkout_names_every_path_it_looked_for(self):
+        missing = dd.missing_repo_paths(str(pathlib.Path(tempfile.gettempdir()) / "nope"))
+        self.assertTrue(missing)
+        refusal = dd.repo_refusal("/nope", missing)
+        self.assertIn("FATAL", refusal)
+        for path in missing:
+            self.assertIn(path, refusal)
+
+    def test_the_real_checkout_is_complete(self):
+        # The other half: the list has to be satisfiable by this repository,
+        # or every run refuses.
+        root = str(pathlib.Path(dd.__file__).resolve().parent.parent)
+        self.assertEqual(dd.missing_repo_paths(root), [])
+
+    def test_a_complete_checkout_is_no_refusal(self):
+        self.assertEqual(dd.repo_refusal("/repo", []), "")
+
+    def test_skip_build_notices_a_bundle_that_was_never_built(self):
+        root = str(pathlib.Path(tempfile.gettempdir()) / "dsr-not-built")
+        missing = dd.built_bundles_missing(root)
+        self.assertTrue(missing)
+        for path in missing:
+            self.assertTrue(path.endswith("dist"), path)
 
 
 class TestAtomicWrite(unittest.TestCase):
@@ -4615,7 +5188,7 @@ class TestEveryEvaluatorReachesTheAssembledReport(unittest.TestCase):
 
 class TestCmdDoctor(unittest.TestCase):
     def run_doctor(self, argv, replies=HEALTHY_REPLIES):
-        args = dd.build_parser().parse_args(argv)
+        args = dd.parse_flags(argv)
         runner = FakeRunner(replies)
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
@@ -4623,18 +5196,18 @@ class TestCmdDoctor(unittest.TestCase):
         return code, buffer.getvalue(), runner
 
     def test_a_healthy_box_prints_a_report_and_exits_zero(self):
-        code, text, _runner = self.run_doctor(["doctor", "--no-state"])
+        code, text, _runner = self.run_doctor(["--diagnose", "--no-state"])
         self.assertEqual(code, 0)
         self.assertIn("selinux", text)
         self.assertIn("All checks passed.", text)
 
     def test_a_broken_box_exits_two_and_prints_the_setsebool_line(self):
-        code, text, _runner = self.run_doctor(["doctor", "--no-state"], BROKEN_REPLIES)
+        code, text, _runner = self.run_doctor(["--diagnose", "--no-state"], BROKEN_REPLIES)
         self.assertEqual(code, 2)
         self.assertIn("setsebool -P httpd_can_network_connect on", text)
 
     def test_a_group_filter_narrows_the_report(self):
-        code, text, _runner = self.run_doctor(["doctor", "--no-state", "--selinux"])
+        code, text, _runner = self.run_doctor(["--diagnose", "--no-state", "--selinux"])
         self.assertIn("[selinux]", text)
         self.assertNotIn("[disk]", text)
         self.assertEqual(code, 0)
@@ -4646,7 +5219,7 @@ class TestCmdDoctor(unittest.TestCase):
         # cron check; the word "All" is not -- it asserts something about the
         # whole box that this run never established.
         code, text, _runner = self.run_doctor(
-            ["doctor", "--no-state", "--disk"], BROKEN_REPLIES
+            ["--diagnose", "--no-state", "--disk"], BROKEN_REPLIES
         )
         self.assertEqual(code, 0)
         self.assertIn("[disk]", text)
@@ -4656,21 +5229,21 @@ class TestCmdDoctor(unittest.TestCase):
 
     def test_two_filters_name_both_groups(self):
         _code, text, _runner = self.run_doctor(
-            ["doctor", "--no-state", "--disk", "--web"]
+            ["--diagnose", "--no-state", "--disk", "--web"]
         )
         self.assertIn("All disk and web checks passed.", text)
 
     def test_an_unfiltered_clean_run_still_says_all_checks_passed(self):
-        _code, text, _runner = self.run_doctor(["doctor", "--no-state"])
+        _code, text, _runner = self.run_doctor(["--diagnose", "--no-state"])
         self.assertIn("All checks passed.", text)
 
     def test_it_records_a_sample_by_default(self):
-        _code, _text, runner = self.run_doctor(["doctor"])
+        _code, _text, runner = self.run_doctor(["--diagnose"])
         self.assertEqual([path for path, _text in runner.writes], [dd.STATE_PATH])
         self.assertIn("/", dd.parse_state(runner.writes[0][1]))
 
     def test_no_state_writes_nothing_at_all(self):
-        _code, _text, runner = self.run_doctor(["doctor", "--no-state"])
+        _code, _text, runner = self.run_doctor(["--diagnose", "--no-state"])
         self.assertEqual(runner.writes, [])
 
 
