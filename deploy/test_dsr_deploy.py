@@ -2046,7 +2046,16 @@ class TestDeployPayload(unittest.TestCase):
 
     def test_the_three_bundles_are_built_before_anything_is_pushed(self):
         commands = dd.build_commands("/repo")
-        self.assertEqual([c for _d, c in commands], ["npm run build"] * 3)
+        # Each installs before it builds: nest, vite and tsc are all
+        # devDependencies, so on a server that has never built the portal
+        # `npm run build` alone dies with `nest: command not found`.
+        for _d, command in commands:
+            self.assertIn("npm ci", command)
+            self.assertTrue(
+                command.index("npm ci") < command.index("npm run build"),
+                "install must precede build: %s" % command,
+            )
+            self.assertIn("&&", command)
         self.assertEqual(
             [pathlib.PurePath(d).as_posix() for d, _c in commands],
             ["/repo/server", "/repo/apps/admin", "/repo/apps/public-form"],

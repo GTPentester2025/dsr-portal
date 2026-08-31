@@ -1850,7 +1850,16 @@ def build_commands(root: str) -> list:
     is run from Git Bash today -- `npm` is a `.cmd` shim that only a shell
     resolves. Nothing operator-supplied is interpolated into it.
     """
-    return [(os.path.join(root, name), "npm run build") for name in BUILD_DIRS]
+    # `npm ci` first, and not conditionally. `nest`, `vite` and `tsc` are all
+    # devDependencies: on a server that has only ever run the portal there is
+    # no node_modules at all, and `npm run build` fails with
+    # `nest: command not found` before anything is installed. Chained with &&
+    # so a failed install fails the step rather than being masked by the build
+    # that follows it.
+    return [
+        (os.path.join(root, name), "npm ci --no-audit --no-fund && npm run build")
+        for name in BUILD_DIRS
+    ]
 
 
 def deploy_payload(root: str) -> list:
