@@ -778,7 +778,7 @@ def atomic_write(path: str, text: str) -> None:
 
     `pathlib.Path.write_text` opens with O_TRUNC: from that instant until the
     write completes the file is empty on disk. If the process dies in that
-    window -- a dropped SSH connection, an OOM kill on a 1-vCPU box -- the
+    window -- a power cut, an OOM kill on a 1-vCPU box -- the
     file stays empty. For `pg_hba.conf` that means a host whose only
     authentication file has been destroyed, and every database connection
     the portal makes fails from then on.
@@ -1322,7 +1322,7 @@ _ENSURE_URLS_JS = """const pg = require('pg');
 """
 
 # Every reference to `$1`/argv here is inside a *single* argv element handed
-# straight to ssh -- never spliced into a local shell string first. That
+# straight to bash -c -- never spliced into another shell string first. That
 # nested-quoting bug is exactly how this broke once in deploy.sh.
 #
 # The heredoc body and its closing delimiter are left flush against the left
@@ -1923,7 +1923,7 @@ def step_failure_message(name: str, returncode: int, stderr: str, stdout: str = 
     if not detail:
         detail = "\n".join((stdout or "").strip().splitlines()[-5:])
     if not detail:
-        detail = "the command printed nothing; try it by hand over ssh"
+        detail = "the command printed nothing; try it by hand in a shell"
     for line in detail.splitlines():
         lines.append("       " + line)
     return "\n".join(lines)
