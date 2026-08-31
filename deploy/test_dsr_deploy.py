@@ -4826,8 +4826,19 @@ class TestHostEvaluator(unittest.TestCase):
         self.assertIn("22", _blob(findings))
 
     def test_an_old_postgres_is_a_failure(self):
-        findings = dd.evaluate_host(OS_RELEASE_EL9, "v22.11.0", "psql (PostgreSQL) 13.7")
+        # 12 is genuinely too old: gen_random_uuid() is not built in before 13
+        # and the schema calls it in 0000_init.sql.
+        findings = dd.evaluate_host(OS_RELEASE_EL9, "v22.11.0", "psql (PostgreSQL) 12.19")
         self.assertTrue(any(f.severity == dd.FAIL for f in findings))
+
+    def test_postgres_13_is_accepted(self):
+        # The boundary, and the reason this file has two constants that must
+        # agree: PG_MAJOR_TEST gates provisioning and POSTGRES_MINIMUM gates
+        # the verification afterwards. When they disagreed, a real deployment
+        # provisioned onto RHEL 9's default 13 and then failed its own checks.
+        findings = dd.evaluate_host(OS_RELEASE_EL9, "v22.11.0", "psql (PostgreSQL) 13.23")
+        self.assertFalse(any(f.severity == dd.FAIL for f in findings))
+        self.assertIn("-ge 13", dd.PG_MAJOR_TEST)
 
     def test_a_host_that_is_not_el9_warns(self):
         findings = dd.evaluate_host(

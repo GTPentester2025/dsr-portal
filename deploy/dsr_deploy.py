@@ -1165,7 +1165,7 @@ def provision_steps() -> list:
             "DB_PASS_SQL=${DB_PASS_SQL//\\'/\\'\\'}\n"
             "APP_PASS_SQL=${APP_PASS:?APP_PASS required}\n"
             "APP_PASS_SQL=${APP_PASS_SQL//\\'/\\'\\'}\n"
-            + "sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL\n"
+            + "cd / && sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL\n"
             "DO \\$\\$\n"
             "BEGIN\n"
             "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'dsr') THEN\n"
@@ -1181,9 +1181,9 @@ def provision_steps() -> list:
             "END\n"
             "\\$\\$;\n"
             "SQL\n"
-            "sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname = 'dsr'\" "
+            "cd / && sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname = 'dsr'\" "
             "| grep -q 1 || sudo -u postgres createdb -O dsr -E UTF8 -T template0 dsr\n"
-            "sudo -u postgres psql -d dsr -v ON_ERROR_STOP=1 "
+            "cd / && sudo -u postgres psql -d dsr -v ON_ERROR_STOP=1 "
             "-c \"GRANT ALL ON SCHEMA public TO dsr; ALTER SCHEMA public OWNER TO dsr;\"",
         ),
         Step(
@@ -3507,11 +3507,11 @@ def evaluate_web(nginx_t: str, listeners: str) -> list:
 # -tA already separates columns with a pipe, so the query asks for two columns
 # rather than concatenating them.
 DB_SIZE_COMMAND = (
-    "sudo -u postgres psql -tAc \"SELECT pg_database_size('dsr')\" 2>&1"
+    "cd / && sudo -u postgres psql -tAc \"SELECT pg_database_size('dsr')\" 2>&1"
 )
 
 TABLE_SIZES_COMMAND = (
-    "sudo -u postgres psql -d dsr -tAc \"SELECT c.relname, "
+    "cd / && sudo -u postgres psql -d dsr -tAc \"SELECT c.relname, "
     "pg_total_relation_size(c.oid) FROM pg_class c JOIN pg_namespace n ON "
     "n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' "
     "ORDER BY 2 DESC LIMIT 5\" 2>&1"
@@ -3827,7 +3827,12 @@ def _version_number(text: str) -> str:
 
 
 NODE_MINIMUM = "22"
-POSTGRES_MINIMUM = "16"
+# 13, matching PG_MAJOR_TEST. The schema needs gen_random_uuid() built in
+# (PG13) and AS RESTRICTIVE policies (PG10) and nothing newer, so a host
+# already running 13 is a host DSR runs on. This constant and PG_MAJOR_TEST
+# must not drift: one refusing what the other accepts is how the first real
+# deployment provisioned successfully and then failed its own verification.
+POSTGRES_MINIMUM = "13"
 
 
 def evaluate_host(os_release: str, node_version: str, psql_version: str) -> list:
@@ -4074,12 +4079,12 @@ DOCTOR_COMMANDS = (
     ("env_text", "cat %s 2>/dev/null" % ENV_PATH),
     (
         "psql_roles",
-        "sudo -u postgres psql -tAc \"SELECT rolname FROM pg_roles WHERE "
+        "cd / && sudo -u postgres psql -tAc \"SELECT rolname FROM pg_roles WHERE "
         "rolname IN ('dsr', 'dsr_app') ORDER BY rolname\" 2>&1",
     ),
     (
         "migrations",
-        "sudo -u postgres psql -d dsr -tAc 'SELECT name FROM "
+        "cd / && sudo -u postgres psql -d dsr -tAc 'SELECT name FROM "
         "schema_migrations ORDER BY name' 2>&1",
     ),
     ("migration_files", "ls %s/server/drizzle 2>/dev/null" % INSTALL_PREFIX),
@@ -4503,7 +4508,7 @@ ADMIN_NAME = "Administrator"
 # tracked in a file, so a redeploy onto a box that already has one does not
 # mint a second and does not print a password that will not work.
 ADMIN_EXISTS_COMMAND = (
-    "sudo -u postgres psql -d dsr -tAc \"SELECT 1 FROM users WHERE role IN "
+    "cd / && sudo -u postgres psql -d dsr -tAc \"SELECT 1 FROM users WHERE role IN "
     "('admin', 'super_admin') LIMIT 1\" 2>&1"
 )
 
