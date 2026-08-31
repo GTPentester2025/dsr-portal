@@ -50,6 +50,10 @@ REMOTE_SELF = "/root/dsr_deploy.py"
 # anyone with `ps` to read.
 REMOTE_SECRETS = "/root/.dsr-secrets.env"
 STATE_PATH = "/var/lib/dsr-deploy/state.json"
+# Where the last run put the nginx sites it displaced. Written by the
+# displacement step and read by the rollback inside the install step, so a
+# config this tool could not validate never leaves the box serving nothing.
+DISPLACED_MARKER = "/var/lib/dsr-deploy/displaced-nginx-conf"
 SERVICE = "dsr-api"
 APP_PORT = 3000
 
@@ -874,6 +878,110 @@ BASE_PACKAGES = (
 )
 
 
+Listener = collections.namedtuple("Listener", "port process pid")
+
+# `ss -lntp` prints, per socket:
+#   LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=1234,fd=6))
+# The local address column is the fourth field and the port is whatever
+# follows the last colon, which is the only form that survives IPv6
+# (`[::]:80`) and a bound address (`127.0.0.1:3000`) alike.
+_SS_PROCESS = re.compile(r'users:\(\("([^"]+)",pid=(\d+)')
+
+# Everything DSR itself puts on a port, plus 22. A report that told an
+# operator to stop sshd would be a report that bricks the box.
+DSR_OWNED_PORTS = (22, 80, 443, APP_PORT, 5432)
+
+LISTENERS_COMMAND = "ss -lntp 2>&1"
+
+# pid -> unit, asked of systemd rather than guessed from the process name.
+# `ss` says "python3"; systemd says "data-formulator.service", and only the
+# second one can be handed back to the operator as a command to run.
+PID_UNITS_COMMAND = (
+    "for pid in $(ss -lntpH 2>/dev/null | grep -o 'pid=[0-9]*' | "
+    "cut -d= -f2 | sort -u); do "
+    "unit=$(systemctl status \"$pid\" 2>/dev/null | head -1 | awk '{print $2}'); "
+    "echo \"$pid ${unit:-unknown}\"; done"
+)
+
+
+def parse_listeners(text: str) -> list:
+    """Every TCP listener `ss -lntp` reported. [] for anything unreadable."""
+    found = []
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) < 5 or not line.strip().startswith("LISTEN"):
+            continue
+        local = fields[3]
+        _host, _sep, port = local.rpartition(":")
+        if not port.isdigit():
+            continue
+        match = _SS_PROCESS.search(line)
+        process = match.group(1) if match else "unknown"
+        pid = match.group(2) if match else ""
+        found.append(Listener(int(port), process, pid))
+    return found
+
+
+def parse_pid_units(text: str) -> dict:
+    """`<pid> <unit>` lines into a mapping. Unreadable lines are skipped."""
+    units = {}
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        if fields[1] in ("unknown", "-"):
+            continue
+        units[fields[0]] = fields[1]
+    return units
+
+
+def takeover_report(listeners: list, pid_units: dict, owned=DSR_OWNED_PORTS) -> str:
+    """What else is listening, and the exact command that turns each one off.
+
+    "" when nothing else is. This tool does not stop them itself, and that
+    is a deliberate line rather than an omission: moving a config file aside
+    is reversible in one command, but stopping a daemon on a box nobody has
+    inventoried can take down someone else's production with nothing left on
+    screen to say what it was. Printing the command costs the operator one
+    paste and leaves the decision with the person who knows the box.
+    """
+    others = sorted(
+        set(l for l in listeners if l.port not in owned), key=lambda l: l.port
+    )
+    if not others:
+        return ""
+    lines = [
+        "Other services are listening on this box. This tool does not stop",
+        "them: moving a config file aside is reversible in one command,",
+        "stopping an unidentified daemon is not. Each one, and the command",
+        "that turns it off for good:",
+        "",
+    ]
+    for listener in others:
+        unit = pid_units.get(listener.pid, "")
+        lines.append(
+            "  port %-6d %s (pid %s)"
+            % (listener.port, listener.process, listener.pid or "?")
+        )
+        if unit:
+            lines.append(
+                "      systemctl stop %s && systemctl disable %s" % (unit, unit)
+            )
+        elif listener.pid:
+            lines.append(
+                "      identify it first:  systemctl status %s" % listener.pid
+            )
+        else:
+            lines.append(
+                "      identify it first:  ss -lntp | grep ':%d '" % listener.port
+            )
+    lines.append("")
+    lines.append(
+        "Port 22 is left alone deliberately: it is how you get back in."
+    )
+    return "\n".join(lines) + "\n"
+
+
 def provision_steps() -> list:
     """The RHEL 9 provisioning sequence, in order.
 
@@ -1173,6 +1281,108 @@ _ENSURE_URLS_COMMAND = (
 ) % INSTALL_PREFIX
 
 
+# Move every other site in conf.d aside, into a timestamped directory, and
+# say where they went.
+#
+# DSR's conf declares `listen 80 default_server`, and nginx refuses to start
+# with two of those -- so on a box already serving something else, one of the
+# two sites is going to lose port 80 whatever happens. Moving the other one
+# aside is the version of that with a way back: `mv` is reversible in one
+# command, printed at the end of the step and again in the log, and the
+# directory is stamped so two runs cannot overwrite each other's rescue copy.
+#
+# `if`, not `[ ... ] && continue`: under `set -e` a false test as the last
+# command of a loop body ends the whole step, which would leave half the
+# sites moved and no message saying so.
+_DISPLACE_NGINX_SITES_COMMAND = (
+    "set -e\n"
+    "mkdir -p %s\n"
+    "DISABLED=/etc/nginx/conf.d.disabled-$(date +%%Y%%m%%d-%%H%%M%%S)\n"
+    "MOVED=0\n"
+    "for CONF in /etc/nginx/conf.d/*.conf; do\n"
+    "  test -e \"$CONF\" || continue\n"
+    "  if [ \"$CONF\" != %s ]; then\n"
+    "    mkdir -p \"$DISABLED\"\n"
+    "    mv \"$CONF\" \"$DISABLED\"/\n"
+    "    echo \"displaced $CONF -> $DISABLED/\"\n"
+    "    MOVED=$((MOVED + 1))\n"
+    "  fi\n"
+    "done\n"
+    "if [ \"$MOVED\" -gt 0 ]; then\n"
+    "  echo \"$DISABLED\" > %s\n"
+    "  echo \"to put them back, in one command:\"\n"
+    "  echo \"  mv $DISABLED/*.conf /etc/nginx/conf.d/ && nginx -t && "
+    "systemctl reload nginx\"\n"
+    "else\n"
+    "  rm -f %s\n"
+    "  echo 'no other nginx sites were in /etc/nginx/conf.d'\n"
+    "fi"
+) % (
+    STATE_PATH.rsplit("/", 1)[0],
+    NGINX_SITE_CONF_REMOTE,
+    DISPLACED_MARKER,
+    DISPLACED_MARKER,
+)
+
+
+def _nginx_rollback_command() -> str:
+    """Put back what was here, then reload, then fail the step.
+
+    Reached only when `nginx -t` rejects the config this step just wrote. The
+    box was serving something a moment ago -- possibly someone else's site --
+    and the worst outcome is not a failed deployment but a box left serving
+    nothing because a file this tool wrote will not parse. So the previous
+    dsr.conf goes back, the displaced sites come back, and nginx is reloaded
+    onto the configuration it had before this step ran.
+    """
+    return (
+        "  echo 'FATAL: nginx rejected the DSR site; putting back what was "
+        "here' >&2\n"
+        "  if [ -f %s.prev ]; then\n"
+        "    cp -p %s.prev %s\n"
+        "  else\n"
+        "    rm -f %s\n"
+        "  fi\n"
+        "  DISABLED=$(cat %s 2>/dev/null || true)\n"
+        "  if [ -n \"$DISABLED\" ] && [ -d \"$DISABLED\" ]; then\n"
+        "    mv \"$DISABLED\"/*.conf /etc/nginx/conf.d/ || true\n"
+        "    echo \"restored the displaced sites from $DISABLED\" >&2\n"
+        "  fi\n"
+        "  nginx -t && systemctl reload nginx || true\n"
+        "  exit 1\n"
+    ) % (
+        NGINX_SITE_CONF_REMOTE,
+        NGINX_SITE_CONF_REMOTE,
+        NGINX_SITE_CONF_REMOTE,
+        NGINX_SITE_CONF_REMOTE,
+        DISPLACED_MARKER,
+    )
+
+
+def _install_site_command() -> str:
+    """Write the unit and the site config, then prove nginx will take it.
+
+    `.orig` is the copy an operator diffs against, taken once and never
+    overwritten. `.prev` is this run's undo, taken every time -- they are
+    different jobs and one file cannot do both.
+    """
+    conf = NGINX_SITE_CONF_REMOTE
+    return (
+        "set -e\n"
+        # `.orig` only on the first run, and only if there is anything to copy.
+        "if [ ! -f %s.orig ] && [ -f %s ]; then cp -p %s %s.orig; fi\n"
+        "if [ -f %s ]; then cp -p %s %s.prev; else rm -f %s.prev; fi\n"
+        % (conf, conf, conf, conf, conf, conf, conf, conf)
+        + _cat_heredoc_command(UNIT_REMOTE, shipped_text(UNIT_FILE_LOCAL), "DSR_UNIT_EOF")
+        + "\n"
+        + _cat_heredoc_command(conf, shipped_text(NGINX_CONF_LOCAL), "DSR_NGINX_EOF")
+        + "\n"
+        "if ! nginx -t; then\n"
+        + _nginx_rollback_command()
+        + "fi"
+    )
+
+
 def deploy_steps(env: dict) -> list:
     """The deployment sequence, in order.
 
@@ -1242,18 +1452,15 @@ def deploy_steps(env: dict) -> list:
             ),
         ),
         Step(
+            "move any other nginx site aside (reversibly)",
+            _DISPLACE_NGINX_SITES_COMMAND,
+        ),
+        Step(
             "install the dsr-api unit and nginx conf.d/dsr.conf",
             # `set -e`: two heredocs joined by a newline means the second
             # one's exit code is the step's, and a unit file that never
             # landed would be reported as installed.
-            "set -e\n"
-            + _cat_heredoc_command(
-                UNIT_REMOTE, shipped_text(UNIT_FILE_LOCAL), "DSR_UNIT_EOF"
-            )
-            + "\n"
-            + _cat_heredoc_command(
-                NGINX_SITE_CONF_REMOTE, shipped_text(NGINX_CONF_LOCAL), "DSR_NGINX_EOF"
-            ),
+            _install_site_command(),
         ),
         Step(
             "re-apply TLS certificate if one is already installed",

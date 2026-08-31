@@ -1568,6 +1568,251 @@ class TestFingerprintGuard(unittest.TestCase):
         )
 
 
+# What `ss -lntp` prints on the box this is aimed at: nginx on 80, sshd, and
+# two things nobody on the DSR side put there.
+SS_SHARED_BOX = """State  Recv-Q Send-Q  Local Address:Port  Peer Address:Port Process
+LISTEN 0      511           0.0.0.0:80         0.0.0.0:*     users:(("nginx",pid=1234,fd=6))
+LISTEN 0      128           0.0.0.0:22         0.0.0.0:*     users:(("sshd",pid=900,fd=3))
+LISTEN 0      511           0.0.0.0:5567       0.0.0.0:*     users:(("python3",pid=4242,fd=9))
+LISTEN 0      128         127.0.0.1:5050       0.0.0.0:*     users:(("gunicorn",pid=987,fd=5))
+LISTEN 0      128              [::]:22            [::]:*     users:(("sshd",pid=900,fd=4))
+LISTEN 0      244         127.0.0.1:5432       0.0.0.0:*     users:(("postgres",pid=770,fd=7))
+"""
+
+SS_ONLY_OURS = """State  Recv-Q Send-Q  Local Address:Port  Peer Address:Port Process
+LISTEN 0      511           0.0.0.0:80         0.0.0.0:*     users:(("nginx",pid=1234,fd=6))
+LISTEN 0      128           0.0.0.0:22         0.0.0.0:*     users:(("sshd",pid=900,fd=3))
+LISTEN 0      511         127.0.0.1:3000       0.0.0.0:*     users:(("node",pid=555,fd=18))
+"""
+
+PID_UNITS = "4242 data-formulator.service\n987 unknown\n1234 nginx.service\n"
+
+
+class TestTakeoverReport(unittest.TestCase):
+    """What else is on the box, and the command that turns each one off.
+
+    This tool moves nginx config aside and stops nothing, on purpose: `mv`
+    is reversible in one command and `systemctl stop` on an uninventoried
+    box is not. The report is what makes that defensible rather than a
+    silent half-measure.
+    """
+
+    def listeners(self, text=SS_SHARED_BOX):
+        return dd.parse_listeners(text)
+
+    def test_it_reads_the_port_the_process_and_the_pid(self):
+        found = self.listeners()
+        self.assertIn(dd.Listener(5567, "python3", "4242"), found)
+        self.assertIn(dd.Listener(5050, "gunicorn", "987"), found)
+        self.assertIn(dd.Listener(80, "nginx", "1234"), found)
+
+    def test_an_ipv6_listener_is_read_the_same_way(self):
+        # `[::]:8443` -- the port is what follows the LAST colon, which is
+        # the only rule that survives both address families. Read from the
+        # first colon instead, this row parses as ":]:8443" and is dropped,
+        # and a service holding a port is missing from the report entirely.
+        text = (
+            "State  Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+            'LISTEN 0      511             [::]:8443          [::]:*     '
+            'users:(("caddy",pid=77,fd=8))\n'
+        )
+        self.assertEqual(dd.parse_listeners(text), [dd.Listener(8443, "caddy", "77")])
+
+    def test_the_header_line_is_not_a_listener(self):
+        for listener in self.listeners():
+            self.assertNotEqual(listener.process, "Process")
+
+    def test_unreadable_output_is_no_listeners_rather_than_a_crash(self):
+        self.assertEqual(dd.parse_listeners(""), [])
+        self.assertEqual(dd.parse_listeners("ss: command not found"), [])
+
+    def test_a_listener_with_no_process_column_still_reports_its_port(self):
+        # `ss -lntp` without root prints no users:(()) at all, and a port
+        # nobody can name is still a port in the way.
+        text = (
+            "State  Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+            "LISTEN 0      511          0.0.0.0:9000       0.0.0.0:*\n"
+        )
+        self.assertEqual(dd.parse_listeners(text), [dd.Listener(9000, "unknown", "")])
+
+    def test_the_report_names_the_unit_and_the_command_to_stop_it(self):
+        report = dd.takeover_report(self.listeners(), dd.parse_pid_units(PID_UNITS))
+        self.assertIn("5567", report)
+        self.assertIn(
+            "systemctl stop data-formulator.service && "
+            "systemctl disable data-formulator.service",
+            report,
+        )
+
+    def test_a_pid_systemd_could_not_name_asks_the_operator_to_look(self):
+        # Guessing a unit from `ss`'s process name ("gunicorn") produces a
+        # command that does nothing and reads as if it did.
+        report = dd.takeover_report(self.listeners(), dd.parse_pid_units(PID_UNITS))
+        self.assertIn("systemctl status 987", report)
+        self.assertNotIn("systemctl stop gunicorn ", report)
+
+    def test_it_never_offers_to_stop_ssh_or_anything_dsr_owns(self):
+        # A report that told an operator to stop sshd would be a report that
+        # locks them out of the box it is running on.
+        report = dd.takeover_report(self.listeners(), dd.parse_pid_units(PID_UNITS))
+        self.assertNotIn("sshd", report)
+        self.assertNotIn("port 22 ", report)
+        self.assertNotIn("nginx", report)
+        self.assertNotIn("postgres", report)
+        self.assertIn("Port 22 is left alone", report)
+
+    def test_a_box_with_nothing_else_on_it_says_nothing(self):
+        # An empty report is the signal that there is nothing to decide; a
+        # report that always prints is one nobody reads.
+        self.assertEqual(
+            dd.takeover_report(
+                dd.parse_listeners(SS_ONLY_OURS), dd.parse_pid_units(PID_UNITS)
+            ),
+            "",
+        )
+
+    def test_unknown_is_not_mistaken_for_a_unit_name(self):
+        units = dd.parse_pid_units(PID_UNITS)
+        self.assertNotIn("987", units)
+        self.assertEqual(units["4242"], "data-formulator.service")
+
+    def test_the_ports_it_leaves_alone_are_the_ones_this_tool_owns(self):
+        self.assertEqual(set(dd.DSR_OWNED_PORTS), {22, 80, 443, dd.APP_PORT, 5432})
+
+    def test_the_collectors_ask_systemd_rather_than_guessing(self):
+        self.assertIn("ss -lntp", dd.LISTENERS_COMMAND)
+        self.assertIn("systemctl status", dd.PID_UNITS_COMMAND)
+
+
+class TestNginxDisplacement(unittest.TestCase):
+    """Moving other sites aside, and the way back.
+
+    The box may be serving someone else's site. DSR's conf claims
+    `listen 80 default_server` and nginx refuses to start with two of those,
+    so one of them loses port 80 whatever happens -- but it loses it to a
+    `mv` that is printed, logged and reversible, not to an `rm`.
+    """
+
+    def step(self, needle="move any other nginx site"):
+        return [s for s in dd.deploy_steps({}) if needle in s.name][0]
+
+    def test_it_moves_rather_than_deletes(self):
+        command = self.step().command
+        self.assertIn('mv "$CONF" "$DISABLED"/', command)
+        for verb in ("rm -rf", "rm -f /etc/nginx/conf.d/", "unlink", "shred"):
+            self.assertNotIn(verb, command)
+
+    def test_the_directory_it_moves_them_to_is_stamped(self):
+        # Two runs must not overwrite each other's rescue copy.
+        self.assertIn(
+            "/etc/nginx/conf.d.disabled-$(date +%Y%m%d-%H%M%S)", self.step().command
+        )
+
+    def test_it_never_moves_our_own_site_aside(self):
+        self.assertIn('[ "$CONF" != %s ]' % dd.NGINX_SITE_CONF_REMOTE, self.step().command)
+
+    def test_it_prints_every_file_it_moves(self):
+        self.assertIn('echo "displaced $CONF -> $DISABLED/"', self.step().command)
+
+    def test_it_prints_the_exact_command_that_puts_them_back(self):
+        command = self.step().command
+        self.assertIn("mv $DISABLED/*.conf /etc/nginx/conf.d/", command)
+        self.assertIn("nginx -t && systemctl reload nginx", command)
+
+    def test_it_records_where_they_went_for_the_rollback_to_find(self):
+        self.assertIn('echo "$DISABLED" > %s' % dd.DISPLACED_MARKER, self.step().command)
+
+    def test_a_box_with_no_other_sites_clears_the_marker(self):
+        # A stale marker would make a later failure "restore" files from a
+        # directory a previous run already emptied.
+        self.assertIn("rm -f %s" % dd.DISPLACED_MARKER, self.step().command)
+
+    def test_the_loop_body_cannot_end_the_step_halfway_through(self):
+        # `[ ... ] && continue` returns 1 when the test is false, and under
+        # `set -e` that ends the step -- with some sites moved, some not,
+        # and no message saying which.
+        command = self.step().command
+        self.assertIn("set -e", command)
+        self.assertNotIn("&& continue", command)
+
+    def test_it_happens_before_our_config_is_written(self):
+        names = [s.name for s in dd.deploy_steps({})]
+        self.assertLess(
+            names.index("move any other nginx site aside (reversibly)"),
+            names.index("install the dsr-api unit and nginx conf.d/dsr.conf"),
+        )
+
+
+class TestNginxInstallRollback(unittest.TestCase):
+    """A config this tool cannot validate must not leave the box dark."""
+
+    def step(self):
+        return [
+            s
+            for s in dd.deploy_steps({})
+            if s.name == "install the dsr-api unit and nginx conf.d/dsr.conf"
+        ][0]
+
+    def test_it_validates_before_anything_is_reloaded(self):
+        command = self.step().command
+        self.assertIn("if ! nginx -t; then", command)
+        self.assertLess(command.index("nginx -t"), command.index("systemctl reload"))
+
+    def test_a_rejected_config_puts_the_previous_one_back(self):
+        command = self.step().command
+        self.assertIn(
+            "cp -p %s.prev %s" % (dd.NGINX_SITE_CONF_REMOTE, dd.NGINX_SITE_CONF_REMOTE),
+            command,
+        )
+
+    def test_a_rejected_config_on_a_first_deploy_removes_the_file_it_wrote(self):
+        # There is no .prev on a first deployment, and leaving the rejected
+        # file in conf.d means the next reload anybody runs takes nginx down.
+        self.assertIn(
+            "rm -f %s\n" % dd.NGINX_SITE_CONF_REMOTE, self.step().command
+        )
+
+    def test_a_rejected_config_brings_the_displaced_sites_back(self):
+        command = self.step().command
+        self.assertIn("cat %s" % dd.DISPLACED_MARKER, command)
+        self.assertIn('mv "$DISABLED"/*.conf /etc/nginx/conf.d/', command)
+
+    def test_it_reloads_after_restoring_so_the_box_serves_what_it_did(self):
+        command = self.step().command
+        rollback = command[command.index("if ! nginx -t; then"):]
+        self.assertIn("nginx -t && systemctl reload nginx", rollback)
+        self.assertIn("exit 1", rollback)
+
+    def test_the_rollback_is_what_the_step_exits_with(self):
+        # Restoring and then reporting success would be worse than not
+        # restoring: the operator would believe the deployment landed.
+        command = self.step().command
+        self.assertLess(command.index("systemctl reload nginx"), command.index("exit 1"))
+
+    def test_the_original_is_backed_up_once_and_this_run_undo_every_time(self):
+        # Two files, two jobs: .orig is what an operator diffs against
+        # forever, .prev is this run's undo. One file cannot be both.
+        command = self.step().command
+        self.assertIn(
+            "cp -p %s %s.orig"
+            % (dd.NGINX_SITE_CONF_REMOTE, dd.NGINX_SITE_CONF_REMOTE),
+            command,
+        )
+        self.assertIn("if [ ! -f %s.orig ]" % dd.NGINX_SITE_CONF_REMOTE, command)
+        self.assertIn(
+            "cp -p %s %s.prev" % (dd.NGINX_SITE_CONF_REMOTE, dd.NGINX_SITE_CONF_REMOTE),
+            command,
+        )
+
+    def test_the_stock_default_server_is_still_cleared_out(self):
+        # DSR's conf declares `listen 80 default_server` and nginx refuses
+        # to start with two of them, so RHEL's stock block in nginx.conf has
+        # to go whatever else is on the box.
+        blob = " ".join(s.command for s in dd.provision_steps())
+        self.assertIn("neutralise_default_server", blob)
+        self.assertIn("%s.orig" % dd.NGINX_MAIN_CONF_REMOTE, blob)
+
+
 class TestDiskBudgetRefusal(unittest.TestCase):
     def test_deploy_budgets_the_documented_total(self):
         self.assertEqual(dd.deploy_needs(), {dd.INSTALL_PREFIX: 420 * 1024 * 1024})
