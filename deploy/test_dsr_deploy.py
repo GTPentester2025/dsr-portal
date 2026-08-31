@@ -5272,3 +5272,41 @@ class TestCmdDoctor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIncrementalBuild(unittest.TestCase):
+    """The build skips work that is already done.
+
+    `npm ci` deletes and reinstalls three dependency trees -- minutes on one
+    core -- and after a `git pull` that touched one component it is usually
+    wasted. These pin the two guards that make a redeploy cheap.
+    """
+
+    def _commands(self):
+        return [c for _d, c in dd.build_commands("/repo")]
+
+    def test_every_bundle_guards_both_the_install_and_the_build(self):
+        for command in self._commands():
+            self.assertIn("[ -d node_modules ]", command)
+            self.assertIn("package-lock.json -nt node_modules", command)
+            self.assertIn("-newer", command)
+            self.assertIn("npm ci", command)
+            self.assertIn("npm run build", command)
+
+    def test_a_changed_lockfile_forces_a_rebuild_not_just_a_reinstall(self):
+        # Reinstalling without rebuilding would leave dist built against the
+        # previous dependency tree, which is the one combination that looks
+        # like it worked and did not.
+        for command in self._commands():
+            inputs = command.split("find ", 1)[1].split(" -newer", 1)[0]
+            self.assertIn("package-lock.json", inputs)
+
+    def test_the_marker_is_a_real_artefact_not_a_stamp_file(self):
+        # An interrupted build leaves no main.js/index.html, so the next run
+        # rebuilds. A stamp file written by the script would claim success.
+        markers = [m for _n, m, _i in dd.BUILD_TARGETS]
+        self.assertEqual(markers, ["dist/main.js", "dist/index.html", "dist/index.html"])
+
+    def test_install_precedes_build_in_every_command(self):
+        for command in self._commands():
+            self.assertLess(command.index("npm ci"), command.index("npm run build"))

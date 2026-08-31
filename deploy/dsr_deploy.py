@@ -1845,22 +1845,54 @@ def deploy_breakdown() -> str:
     )
 
 
+# (directory, the file a finished build leaves behind, the inputs that make it
+# stale). The marker is a real artefact rather than a stamp file: a half-built
+# dist that was interrupted has no main.js, so the next run rebuilds it.
+BUILD_TARGETS = (
+    ("server", "dist/main.js", "src tsconfig.json tsconfig.build.json package.json package-lock.json nest-cli.json"),
+    ("apps/admin", "dist/index.html", "src public index.html package.json package-lock.json vite.config.ts"),
+    ("apps/public-form", "dist/index.html", "src public index.html package.json package-lock.json vite.config.ts"),
+)
+
+
+def build_command(marker: str, inputs: str) -> str:
+    """Install if the lockfile moved, build if any input is newer than the build.
+
+    Both halves are shell tests rather than Python, because the answer has to
+    be taken on the box at the moment the step runs -- `--dry-run` prints this
+    command, and it must be the same command that later decides.
+
+    `npm ci` is the slow part of a redeploy: it deletes node_modules and
+    reinstalls all three trees, minutes on one core, and after a `git pull`
+    that changed one component it is usually wasted. It is skipped when
+    node_modules exists and package-lock.json is no newer than it -- which is
+    exactly the condition under which `npm ci` would reinstall the same tree.
+
+    `find <inputs> -newer <marker>` answers the build half. No match means
+    nothing has changed since the artefact was written, so there is nothing
+    to do. A missing marker makes `find` fail, which falls through to a
+    build -- the safe direction.
+    """
+    return (
+        "{ [ -d node_modules ] && [ ! package-lock.json -nt node_modules ] "
+        "&& echo 'dependencies unchanged' "
+        "|| npm ci --no-audit --no-fund; } && "
+        "{ [ -f %s ] && [ -z \"$(find %s -newer %s 2>/dev/null | head -1)\" ] "
+        "&& echo 'build is up to date' "
+        "|| npm run build; }" % (marker, inputs, marker)
+    )
+
+
 def build_commands(root: str) -> list:
-    """(directory, command) for each bundle built before anything is pushed.
+    """(directory, command) for each bundle, skipping what is already current.
 
     A string rather than an argv list because on Windows -- where this tool
-    is run from Git Bash today -- `npm` is a `.cmd` shim that only a shell
-    resolves. Nothing operator-supplied is interpolated into it.
+    was run from Git Bash before it moved onto the box -- `npm` is a `.cmd`
+    shim that only a shell resolves. Nothing operator-supplied reaches it.
     """
-    # `npm ci` first, and not conditionally. `nest`, `vite` and `tsc` are all
-    # devDependencies: on a server that has only ever run the portal there is
-    # no node_modules at all, and `npm run build` fails with
-    # `nest: command not found` before anything is installed. Chained with &&
-    # so a failed install fails the step rather than being masked by the build
-    # that follows it.
     return [
-        (os.path.join(root, name), "npm ci --no-audit --no-fund && npm run build")
-        for name in BUILD_DIRS
+        (os.path.join(root, name), build_command(marker, inputs))
+        for name, marker, inputs in BUILD_TARGETS
     ]
 
 
