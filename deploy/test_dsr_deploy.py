@@ -5310,3 +5310,40 @@ class TestIncrementalBuild(unittest.TestCase):
     def test_install_precedes_build_in_every_command(self):
         for command in self._commands():
             self.assertLess(command.index("npm ci"), command.index("npm run build"))
+
+
+class TestMailProviderSwitchesBack(unittest.TestCase):
+    """Filling in the Graph values must actually turn mail on.
+
+    The deployment sets EMAIL_PROVIDER=console itself when the four Graph
+    values are missing, and writes it to /opt/dsr/server/.env. assemble_env
+    keeps every installed value, and .secrets.env ships with EMAIL_PROVIDER
+    commented out -- so without an explicit switch back, an operator who
+    fills in their credentials and redeploys still gets no mail, and the only
+    sign is a warning they have already learned to ignore.
+    """
+
+    INSTALLED = {"EMAIL_PROVIDER": "console"}
+    FILLED = {
+        "PRIVACY_MAILBOX": "privacy@example.com",
+        "GRAPH_TENANT_ID": "t",
+        "GRAPH_CLIENT_ID": "c",
+        "GRAPH_CLIENT_SECRET": "s",
+    }
+
+    def test_console_survives_when_it_is_the_only_opinion(self):
+        # The mechanism the bug rode in on: nothing else asks for graph.
+        env, _ = dd.assemble_env(self.INSTALLED, dict(self.FILLED))
+        self.assertEqual(env["EMAIL_PROVIDER"], "console")
+
+    def test_graph_wins_once_the_deployment_asks_for_it(self):
+        operator = dict(self.FILLED)
+        operator["EMAIL_PROVIDER"] = "graph"
+        env, _ = dd.assemble_env(self.INSTALLED, operator)
+        self.assertEqual(env["EMAIL_PROVIDER"], "graph")
+
+    def test_an_operator_who_asks_for_console_keeps_it(self):
+        operator = dict(self.FILLED)
+        operator["EMAIL_PROVIDER"] = "console"
+        env, _ = dd.assemble_env(self.INSTALLED, operator)
+        self.assertEqual(env["EMAIL_PROVIDER"], "console")

@@ -5208,6 +5208,14 @@ def run_deployment(options, out=None, err=None, target=None, log=None,
         log.line("continuing without mail: %s still needs %s"
                  % (path, " ".join(absent)))
     else:
+        # The script set console itself on an earlier run, so it has to unset
+        # it here. assemble_env keeps whatever is already installed, and
+        # .secrets.env ships with EMAIL_PROVIDER commented out -- so without
+        # this, filling in all four Graph values and redeploying leaves mail
+        # off, with only the warning the operator has already learned to
+        # ignore. An EMAIL_PROVIDER the operator set explicitly still wins.
+        if not (operator.get("EMAIL_PROVIDER") or "").strip():
+            operator["EMAIL_PROVIDER"] = "graph"
         ok("mail credentials read from %s" % path, out)
 
     secrets, generated = assemble_env(installed, operator)
