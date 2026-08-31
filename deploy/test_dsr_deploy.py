@@ -961,7 +961,7 @@ class TestPlans(unittest.TestCase):
         # exit code carries it.
         for name, test in (
             ("install Node.js 22", dd.NODE_MAJOR_TEST),
-            ("install PostgreSQL 16", dd.PG_MAJOR_TEST),
+            ("install PostgreSQL (16 on a bare host, 13+ accepted)", dd.PG_MAJOR_TEST),
         ):
             step = [s for s in dd.provision_steps() if s.name == name][0]
             # `&& ` and endswith asserted together, not separately: the
@@ -979,8 +979,8 @@ class TestPlans(unittest.TestCase):
         # `rpm -q postgresql-server` is true of PostgreSQL 13, which is
         # RHEL 9's default stream. A host where someone had already run
         # `dnf install postgresql-server` short-circuited a step named
-        # "install PostgreSQL 16", reported success, and ran 13.
-        step = [s for s in dd.provision_steps() if s.name == "install PostgreSQL 16"][0]
+        # "install PostgreSQL (16 on a bare host, 13+ accepted)", reported success, and ran 13.
+        step = [s for s in dd.provision_steps() if s.name == "install PostgreSQL (16 on a bare host, 13+ accepted)"][0]
         guard = step.command.split(" || ", 1)[0]
         self.assertIn("rpm -q postgresql-server", guard)
         self.assertIn(dd.PG_MAJOR_TEST, guard)
