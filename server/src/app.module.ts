@@ -12,6 +12,7 @@ import { AuthModule } from './auth/auth.module';
 import { CasesModule } from './cases/cases.module';
 import { FormsModule } from './forms/forms.module';
 import { MigrationModule } from './migration/migration.module';
+import { DelegationModule } from './delegation/delegation.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { MigrationModule } from './migration/migration.module';
     CasesModule,
     FormsModule,
     MigrationModule,
+    DelegationModule,
   ],
   controllers: [AppController],
   providers: [AppService],
