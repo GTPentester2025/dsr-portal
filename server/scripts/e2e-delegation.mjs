@@ -193,7 +193,16 @@ const inviteLines = emailLines().filter(
 check('console provider actually sent 3 delegation-invite emails', inviteLines.length === 3,
   `found ${inviteLines.length}`);
 
-const logRows = (await db.query('SELECT * FROM email_log WHERE case_id = $1', [caseId])).rows;
+// Scoped to the invite template, not just the case: the case already has one
+// email_log row from the intake acknowledgement sent at submission (step 6 of
+// IntakeService#submit), so `WHERE case_id = $1` alone also counts that
+// unrelated row and can never equal exactly 3 once delegation logs its own.
+const logRows = (
+  await db.query(
+    "SELECT * FROM email_log WHERE case_id = $1 AND template_id = 'delegation-invite'",
+    [caseId],
+  )
+).rows;
 check('3 emails recorded in email_log for the send', logRows.length === 3,
   `found ${logRows.length} -- delegation.service.ts#send() never writes to email_log on a successful ` +
   `sendTransactional, unlike every other call site (public/intake.service.ts, cases/assignment.service.ts, ` +

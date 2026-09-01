@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { randomBytes } from 'node:crypto';
 import { DbService, ZoneContext } from '../db/db.module';
+import { emailLog } from '../db/schema';
 import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { StorageService } from '../cases/storage.service';
@@ -109,8 +110,9 @@ export class DelegationService {
     const link = `${this.settings.get<string>('PUBLIC_BASE_URL', 'http://127.0.0.1:5180')}/#/delegation/${token}`;
 
     for (const m of members) {
+      let result;
       try {
-        await this.email.sendTransactional(m.email, 'delegation-invite', {
+        result = await this.email.sendTransactional(m.email, 'delegation-invite', {
           case_ref: context.caseRef,
           zone: context.zoneId,
           request_type: context.requestType,
@@ -121,8 +123,40 @@ export class DelegationService {
         }, { caseId: args.caseId, zoneId: row.zoneId });
       } catch (err) {
         // One unreachable address must not stop the other two being asked.
-        // The send guard has already recorded what did not go out.
+        // The send guard has already recorded what did not go out, so nothing
+        // is written to email_log here -- a second row would make the case's
+        // mail history read as two attempts at the same invitation.
         this.log.warn(`delegation invite to ${m.email} failed: ${(err as Error).message}`);
+        continue;
+      }
+
+      // One row per recipient: a case delegated to a group of three must be
+      // able to show it asked all three, not just that the group's link was
+      // used once. The rendered body is deliberately not stored -- unlike
+      // the acknowledgement or assignment emails, this one carries a bearer
+      // token in its link, and email_log.body_html is readable by anyone who
+      // can see the case. Recording the subject and template id is enough to
+      // evidence that the invite went out without also handing out the
+      // capability it invited them with.
+      try {
+        await this.db.withContext(ctx, (db) =>
+          db.insert(emailLog).values({
+            caseId: args.caseId,
+            provider: this.email.activeName(),
+            fromAddr: 'transactional',
+            toAddrs: [m.email],
+            subject: result.subject ?? `Help needed on privacy request ${context.caseRef}`,
+            templateId: 'delegation-invite',
+            status: 'sent',
+            providerMessageId: result.providerMessageId,
+          }),
+        );
+      } catch (err) {
+        // A bookkeeping failure must not undo a delegation that has already
+        // been created and sent -- the invite went out either way.
+        this.log.error(
+          `failed to record email_log for delegation invite to ${m.email}: ${(err as Error).message}`,
+        );
       }
     }
 
