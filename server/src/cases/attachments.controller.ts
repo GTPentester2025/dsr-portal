@@ -51,7 +51,7 @@ export class AttachmentsController {
     return this.db.withContext(req.zoneCtx, async (_db, client) => {
       const res = await client.query(
         `SELECT a.id, a.filename, a.mime_type, a.size_bytes, a.source, a.note,
-                a.created_at, a.in_reply_to, u.name AS uploaded_by_name
+                a.created_at, a.in_reply_to, COALESCE(a.uploaded_by_name, u.name) AS uploaded_by_name
            FROM case_attachments a
       LEFT JOIN users u ON u.id = a.uploaded_by
           WHERE a.case_id = $1

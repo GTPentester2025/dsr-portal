@@ -47,6 +47,8 @@ interface PolicyBody {
   holidays?: string[];
   pauseAllowed?: boolean;
   extensionAllowedDays?: number;
+  /** Days after closure in which the requester may appeal. 0 => no appeals. */
+  appealWindowDays?: number;
   reminderThresholds?: number[];
   escalationThreshold?: number;
 }
@@ -74,7 +76,7 @@ export class SlaPolicyController {
     const rows = await this.db.system(async (_db, client) => {
       const res = await client.query(
         `SELECT id, zone_id, request_type, target_minutes, business_days, timezone,
-                holidays, pause_allowed, extension_allowed_days,
+                holidays, pause_allowed, extension_allowed_days, appeal_window_days,
                 reminder_thresholds, escalation_threshold
            FROM sla_policies
           ORDER BY zone_id, (request_type = '*') DESC, request_type`,
@@ -105,6 +107,10 @@ export class SlaPolicyController {
     if (!Number.isInteger(extension) || extension < 0 || extension > 365) {
       throw new BadRequestException('Extension allowance must be between 0 and 365 days');
     }
+    const appealWindow = Number(body.appealWindowDays ?? 0);
+    if (!Number.isInteger(appealWindow) || appealWindow < 0 || appealWindow > 365) {
+      throw new BadRequestException('Appeal window must be between 0 and 365 days');
+    }
     const thresholds = body.reminderThresholds ?? [0.75, 0.9, 1];
     if (
       !Array.isArray(thresholds) ||
@@ -133,8 +139,9 @@ export class SlaPolicyController {
       await client.query(
         `INSERT INTO sla_policies
            (zone_id, request_type, target_minutes, business_days, timezone, holidays,
-            pause_allowed, extension_allowed_days, reminder_thresholds, escalation_threshold)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            pause_allowed, extension_allowed_days, appeal_window_days,
+            reminder_thresholds, escalation_threshold)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
          ON CONFLICT (zone_id, request_type) DO UPDATE SET
            target_minutes = EXCLUDED.target_minutes,
            business_days = EXCLUDED.business_days,
@@ -142,6 +149,7 @@ export class SlaPolicyController {
            holidays = EXCLUDED.holidays,
            pause_allowed = EXCLUDED.pause_allowed,
            extension_allowed_days = EXCLUDED.extension_allowed_days,
+           appeal_window_days = EXCLUDED.appeal_window_days,
            reminder_thresholds = EXCLUDED.reminder_thresholds,
            escalation_threshold = EXCLUDED.escalation_threshold`,
         [
@@ -153,6 +161,7 @@ export class SlaPolicyController {
           JSON.stringify(holidays),
           Boolean(body.pauseAllowed),
           extension,
+          appealWindow,
           JSON.stringify(thresholds),
           JSON.stringify(escalation),
         ],
@@ -169,7 +178,7 @@ export class SlaPolicyController {
       before: before
         ? { targetMinutes: before.target_minutes, businessDays: before.business_days }
         : undefined,
-      after: { targetMinutes, businessDays: Boolean(body.businessDays), extension },
+      after: { targetMinutes, businessDays: Boolean(body.businessDays), extension, appealWindow },
       sourceIp: ip,
     });
 

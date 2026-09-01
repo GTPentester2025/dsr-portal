@@ -55,6 +55,12 @@ panel → "Test connection" exercises the active provider, or run
 | `npx jest src/email` | template rendering, HTML escaping, missing-variable failure |
 | `apps/public-form`: `node --experimental-strip-types scripts/smoke.mjs` | renderer validation/conditional logic against all 12 real schemas |
 
+## Migrating from another DSR tool
+
+The **Migration** page uploads a CSV export from an existing privacy tool and
+creates the cases here — column mapping and date order are proposed, shown, and
+confirmed before anything is written. See [docs/MIGRATION.md](docs/MIGRATION.md).
+
 ## Architecture decisions (deviations from the spec's suggestions)
 
 - **12 forms, not 3.** The source estate is 2 EUR + 6 SAZ + 4 MAZ country

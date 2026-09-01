@@ -315,6 +315,8 @@ export class OutboundService {
         bcc: args.bcc,
         subject: args.subject,
         body: args.body,
+        caseId: args.caseId,
+        zoneId: c.zoneId,
       });
       providerMessageId = result.providerMessageId;
     } catch (err) {
@@ -322,22 +324,27 @@ export class OutboundService {
       error = (err as Error).message;
     }
 
-    await this.db.withContext(ctx, (db) =>
-      db.insert(emailLog).values({
-        caseId: args.caseId,
-        provider: this.email.activeName(),
-        fromAddr: fromMailbox,
-        toAddrs: args.to,
-        ccAddrs: args.cc ?? null,
-        bccAddrs: args.bcc ?? null,
-        subject: args.subject,
-        bodyHtml: args.body,
-        templateId: args.templateId ?? null,
-        status,
-        providerMessageId,
-        error,
-      }),
-    );
+    // A failure has already been logged in full by the send guard — recipients,
+    // subject, rendered body and the reason — so writing a second, thinner row
+    // here would only make the case's mail history read as two attempts.
+    if (status === 'sent') {
+      await this.db.withContext(ctx, (db) =>
+        db.insert(emailLog).values({
+          caseId: args.caseId,
+          provider: this.email.activeName(),
+          fromAddr: fromMailbox,
+          toAddrs: args.to,
+          ccAddrs: args.cc ?? null,
+          bccAddrs: args.bcc ?? null,
+          subject: args.subject,
+          bodyHtml: args.body,
+          templateId: args.templateId ?? null,
+          status,
+          providerMessageId,
+          error,
+        }),
+      );
+    }
     await this.audit.record({
       actorId: args.actorId,
       actorType: 'user',

@@ -97,6 +97,8 @@ export const slaPolicies = pgTable(
     holidays: jsonb('holidays').notNull().default([]),
     pauseAllowed: boolean('pause_allowed').notNull().default(false),
     extensionAllowedDays: integer('extension_allowed_days').notNull().default(0),
+    /** Days after closure in which the requester may appeal. 0 => no appeal. */
+    appealWindowDays: integer('appeal_window_days').notNull().default(0),
     /** Fractions of SLA at which to remind, e.g. [0.75, 0.9, 1.0]. */
     reminderThresholds: jsonb('reminder_thresholds').notNull().default([0.75, 0.9, 1.0]),
     escalationThreshold: jsonb('escalation_threshold').notNull().default(0.9),
@@ -210,12 +212,37 @@ export const cases = pgTable(
     closedAt: timestamp('closed_at', { withTimezone: true }),
     outcomeCode: text('outcome_code'),
     closureNote: text('closure_note'),
+    /** Where the requester says they live, as opposed to which form they used. */
+    residency: text('residency'),
+    /** Suppresses the closure notification for requesters handled out of band. */
+    skipCompletionNotification: boolean('skip_completion_notification').notNull().default(false),
+    /** Stamped at closure, so a later SLA edit cannot rewrite history. */
+    completedAfterDeadline: boolean('completed_after_deadline'),
+    /** True when the deadline moved without a person granting it. */
+    autoExtended: boolean('auto_extended').notNull().default(false),
+    /** Outcome report delivery — a separate event from closing the case. */
+    reportPublishedAt: timestamp('report_published_at', { withTimezone: true }),
+    reportAccessedAt: timestamp('report_accessed_at', { withTimezone: true }),
+    canBeAppealed: boolean('can_be_appealed').notNull().default(false),
+    canAppealUntil: timestamp('can_appeal_until', { withTimezone: true }),
+    isAppeal: boolean('is_appeal').notNull().default(false),
+    appealOfCaseId: uuid('appeal_of_case_id'),
+    /** 'requested' | 'under_review' | 'upheld' | 'rejected'; null => no appeal. */
+    appealStatus: text('appeal_status'),
+    /** 'portal' | 'import'. Imported cases never trigger requester email. */
+    source: text('source').notNull().default('portal'),
+    /** Identifiers the case carried in the tool it was migrated from. */
+    externalId: text('external_id'),
+    externalRequestId: text('external_request_id'),
+    importedAt: timestamp('imported_at', { withTimezone: true }),
   },
   (t) => [
     uniqueIndex('cases_ref_ux').on(t.caseRef),
     index('cases_zone_ix').on(t.zoneId),
     index('cases_status_ix').on(t.status),
     index('cases_email_hmac_ix').on(t.requesterEmailHmac),
+    uniqueIndex('cases_external_id_ux').on(t.externalId),
+    index('cases_source_ix').on(t.source),
   ],
 );
 
@@ -234,12 +261,58 @@ export const caseFields = pgTable(
   (t) => [index('case_fields_case_ix').on(t.caseId)],
 );
 
+/**
+ * One row per file uploaded on the Migration page.
+ *
+ * The parsed rows live on the record between the analyse step and the commit
+ * step, so the operator can review and correct the column mapping without
+ * uploading the file again, and so a committed import can afterwards be
+ * explained from what was actually read rather than from what was intended.
+ */
+export const caseImports = pgTable(
+  'case_imports',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    filename: text('filename').notNull(),
+    sourceTool: text('source_tool').notNull().default('securiti'),
+    zoneId: text('zone_id').notNull().references(() => zones.id),
+    formKey: text('form_key').notNull(),
+    formVersion: integer('form_version').notNull(),
+    // 'analysed' | 'committed' | 'failed' | 'discarded'
+    status: text('status').notNull().default('analysed'),
+    totalRows: integer('total_rows').notNull().default(0),
+    imported: integer('imported').notNull().default(0),
+    skipped: integer('skipped').notNull().default(0),
+    failed: integer('failed').notNull().default(0),
+    /** Header -> target, as confirmed by the operator. */
+    mapping: jsonb('mapping').notNull().default({}),
+    /** The parsed file; cleared once committed. */
+    payload: jsonb('payload'),
+    /** Snapshot of who uploaded it, filled by trigger. */
+    uploadedByName: text('uploaded_by_name'),
+    /** Per-row problems, retained after commit. */
+    issues: jsonb('issues').notNull().default([]),
+    uploadedBy: uuid('uploaded_by').references(() => users.id),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    committedAt: timestamp('committed_at', { withTimezone: true }),
+  },
+  (t) => [index('case_imports_created_ix').on(t.createdAt)],
+);
+
 export const caseStatusHistory = pgTable(
   'case_status_history',
   {
     id: bigserial('id', { mode: 'number' }).primaryKey(),
     caseId: uuid('case_id').notNull().references(() => cases.id),
-    actorId: uuid('actor_id').references(() => users.id), // null => system
+    // null => system, or an account that has since been permanently deleted
+    actorId: uuid('actor_id').references(() => users.id),
+    /**
+     * Who acted, copied in by trigger at insert. The timeline outlives the
+     * account: a case file that cannot say who closed the request is not much
+     * of a record, and it is the case file that gets produced when the
+     * handling of one is questioned.
+     */
+    actorName: text('actor_name'),
     fromStatus: text('from_status'),
     toStatus: text('to_status').notNull(),
     note: text('note'),
@@ -253,7 +326,10 @@ export const caseComments = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     caseId: uuid('case_id').notNull().references(() => cases.id),
-    authorId: uuid('author_id').notNull().references(() => users.id),
+    /** Nullable: a comment outlives the account that wrote it. */
+    authorId: uuid('author_id').references(() => users.id),
+    /** Snapshot of the author, filled by trigger. */
+    authorName: text('author_name'),
     body: text('body').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -337,9 +413,39 @@ export const emailLog = pgTable(
     status: text('status').notNull(), // 'sent' | 'failed'
     providerMessageId: text('provider_message_id'),
     error: text('error'),
+    attempt: integer('attempt').notNull().default(1),
+    /** 'provider' | 'throttled' | 'render' — why it did not go out. */
+    failureKind: text('failure_kind'),
+    /** Variables the template was rendered against, for a failed send. */
+    templateVariables: jsonb('template_variables'),
+    /** When a throttled message may next be attempted. */
+    blockedUntil: timestamp('blocked_until', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index('email_log_case_ix').on(t.caseId)],
+);
+
+/**
+ * Consecutive-failure state per send scope, so a broken provider or a dead
+ * address is backed off instead of retried indefinitely.
+ *
+ * Scoped rather than global: an outage at the provider should stop everything
+ * briefly, while one address that hard-bounces should stop being written to
+ * without silencing mail to everybody else.
+ */
+export const emailSendHealth = pgTable(
+  'email_send_health',
+  {
+    /** 'provider' | 'to:<address>' */
+    scope: text('scope').primaryKey(),
+    consecutiveFailures: integer('consecutive_failures').notNull().default(0),
+    totalFailures: integer('total_failures').notNull().default(0),
+    lastError: text('last_error'),
+    lastFailedAt: timestamp('last_failed_at', { withTimezone: true }),
+    lastSucceededAt: timestamp('last_succeeded_at', { withTimezone: true }),
+    blockedUntil: timestamp('blocked_until', { withTimezone: true }),
+  },
+  (t) => [index('email_send_health_blocked_ix').on(t.blockedUntil)],
 );
 
 /** Append-only. Migration installs a trigger rejecting UPDATE/DELETE. */
@@ -348,6 +454,13 @@ export const auditLog = pgTable(
   {
     id: bigserial('id', { mode: 'number' }).primaryKey(),
     actorId: uuid('actor_id'),
+    /**
+     * Who acted, snapshotted at write time rather than joined from `users`.
+     * An account can be permanently deleted; the trail it left cannot be, and
+     * a trail that cannot name the actor is not an audit trail.
+     */
+    actorName: text('actor_name'),
+    actorEmail: text('actor_email'),
     actorType: text('actor_type').notNull().default('user'), // 'user' | 'system' | 'public'
     action: text('action').notNull(), // 'case.view' | 'case.status_change' | ...
     entityType: text('entity_type').notNull(),

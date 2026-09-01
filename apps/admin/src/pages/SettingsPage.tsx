@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   api,
   type ConnectionStatus,
+  type EmailHealthRow,
   type DiagnosticReport,
   type SettingDef,
   type SettingsPayload,
@@ -262,6 +263,8 @@ export function SettingsPage() {
         <div className="space-y-4">
           {group === 'email' && (
             <>
+              <DeliveryHealth />
+
               <Card title="Connection check" subtitle="Probe the active provider without sending mail.">
                 <Button variant="secondary" icon="refresh" loading={probing} onClick={probe} className="w-full">
                   Test connection
@@ -396,5 +399,101 @@ export function SettingsPage() {
         </div>
       </div>
     </>
+  )
+}
+
+/**
+ * Who the portal has stopped writing to, and why.
+ *
+ * Repeated failures back a recipient — or the provider as a whole — off rather
+ * than retrying forever. That is the right behaviour and an invisible one: the
+ * symptom is "some people stopped getting mail" with nothing on screen to
+ * point at. Every paused scope is listed here with the error that caused it,
+ * and can be released once the underlying problem is fixed.
+ */
+function DeliveryHealth() {
+  const toast = useToast()
+  const [rows, setRows] = useState<EmailHealthRow[] | null>(null)
+  const [busy, setBusy] = useState('')
+
+  const load = useCallback(() => {
+    api
+      .get<EmailHealthRow[]>('/internal/admin/email-health')
+      .then(setRows)
+      .catch(() => setRows([]))
+  }, [])
+  useEffect(load, [load])
+
+  const clear = async (scope: string) => {
+    setBusy(scope)
+    try {
+      await api.post('/internal/admin/email-health/clear', { scope })
+      toast.success(scope === '*' ? 'All send throttles cleared' : `Sending resumed for ${scope}`)
+      load()
+    } catch (e) {
+      toast.error('Could not clear', (e as Error).message)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  if (!rows) return null
+
+  return (
+    <Card
+      title="Mail delivery health"
+      subtitle="Repeated failures pause a recipient or the provider rather than retrying indefinitely."
+      actions={
+        rows.length > 0 ? (
+          <Button variant="ghost" icon="refresh" loading={busy === '*'} onClick={() => void clear('*')}>
+            Clear all
+          </Button>
+        ) : undefined
+      }
+    >
+      {rows.length === 0 ? (
+        <p className="text-[13px] text-muted">Nothing is failing. Every recipient is reachable.</p>
+      ) : (
+        <ul className="space-y-2.5">
+          {rows.map((r) => {
+            const stillPaused = Boolean(r.blocked_until && new Date(r.blocked_until) > new Date())
+            return (
+              <li key={r.scope} className="rounded-lg border border-line bg-sunken/60 px-3 py-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="mono min-w-0 flex-1 truncate text-[12px] font-medium text-ink">
+                    {r.scope === 'provider' ? 'The email provider' : r.scope.replace(/^to:/, '')}
+                  </span>
+                  <Chip tone={stillPaused ? 'danger' : 'warning'}>
+                    {r.consecutive_failures} in a row
+                  </Chip>
+                </div>
+                {stillPaused && (
+                  <p className="mt-1 text-[11px] text-danger">
+                    Paused until {String(r.blocked_until).slice(11, 16)} UTC on{' '}
+                    {String(r.blocked_until).slice(0, 10)}
+                  </p>
+                )}
+                {r.last_error && (
+                  <p className="mt-1 break-words text-[11px] text-muted">{r.last_error}</p>
+                )}
+                <div className="mt-2">
+                  <Button
+                    variant="ghost"
+                    loading={busy === r.scope}
+                    onClick={() => void clear(r.scope)}
+                  >
+                    Resume sending
+                  </Button>
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      <p className="mt-3 border-t border-line pt-2.5 text-[11px] text-faint">
+        Every message that did not go out is recorded in full — recipients, subject and body —
+        on the case it belonged to and in the audit log.
+      </p>
+    </Card>
   )
 }

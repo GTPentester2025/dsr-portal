@@ -44,6 +44,8 @@ const P: Record<string, React.ReactNode> = {
   database: <><ellipse cx="12" cy="5.5" rx="8" ry="3.2" /><path d="M4 5.5v13c0 1.8 3.6 3.2 8 3.2s8-1.4 8-3.2v-13" /><path d="M4 12c0 1.8 3.6 3.2 8 3.2s8-1.4 8-3.2" /></>,
   filter: <path d="M4 5h16l-6.4 7.6V19l-3.2-2v-4.4z" />,
   download: <><path d="M12 3v12" /><path d="m7 11 5 5 5-5" /><path d="M4 19h16" /></>,
+  upload: <><path d="M12 21V9" /><path d="m7 13 5-5 5 5" /><path d="M4 5h16" /></>,
+  trash: <><path d="M4 6h16" /><path d="M9.5 6V4.5A1.5 1.5 0 0 1 11 3h2a1.5 1.5 0 0 1 1.5 1.5V6" /><path d="M6.5 6l.8 13a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9l.8-13" /><path d="M10 10.5v6M14 10.5v6" /></>,
   menu: <path d="M4 6h16M4 12h16M4 18h16" />,
   panelLeft: <><rect x="3" y="3.5" width="18" height="17" rx="2.5" /><path d="M9.5 3.5v17" /></>,
   loader: <path d="M12 3v4m0 10v4M5.6 5.6l2.8 2.8m7.2 7.2 2.8 2.8M3 12h4m10 0h4M5.6 18.4l2.8-2.8m7.2-7.2 2.8-2.8" />,

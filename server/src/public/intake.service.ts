@@ -16,13 +16,9 @@ import { validateSubmission, type FormSchemaDoc } from './form-validation';
 import { VerificationService } from './verification.service';
 import { AssignmentService } from '../cases/assignment.service';
 import { StorageService } from '../cases/storage.service';
+import { ENCRYPTED_FIELD_KEYS } from '../crypto/pii-fields';
 
-/** Direct identifiers stored envelope-encrypted (spec §9). */
-const ENCRYPTED_FIELD_KEYS = new Set([
-  'email', 'first_name', 'last_name', 'name', 'full_name', 'phone',
-  'phone_number', 'telephone', 'id_number', 'document_number', 'dni',
-  'address', 'address1', 'address2',
-]);
+
 
 @Injectable()
 export class IntakeService {
@@ -269,11 +265,12 @@ export class IntakeService {
       const result = await this.email.sendTransactional(to, 'submission-ack', {
         case_ref: caseRef,
         sla_statement: slaStatement,
-      }, { language });
+      }, { language, caseId, zoneId: zone });
       await this.logEmail(caseId, to, caseRef, 'sent', result.providerMessageId, null, result);
     } catch (err) {
+      // Not logged again here: the send guard has already recorded the failure
+      // against this case, including the rendered message that never arrived.
       this.log.error(`ack email failed for ${caseRef}: ${(err as Error).message}`);
-      await this.logEmail(caseId, to, caseRef, 'failed', null, (err as Error).message);
     }
   }
 
@@ -281,7 +278,7 @@ export class IntakeService {
     caseId: string,
     to: string,
     caseRef: string,
-    status: 'sent' | 'failed',
+    status: 'sent',
     providerMessageId: string | null,
     error: string | null,
     /** What the provider actually rendered, so the case Activity can replay

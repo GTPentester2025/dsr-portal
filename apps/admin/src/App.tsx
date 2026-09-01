@@ -13,6 +13,7 @@ import { AuditPage } from './pages/AuditPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { FormsPage } from './pages/FormsPage'
 import { FormEditorPage } from './pages/FormEditorPage'
+import { MigrationPage } from './pages/MigrationPage'
 
 function useHashRoute() {
   const [hash, setHash] = useState(window.location.hash || '#/')
@@ -28,6 +29,7 @@ function useHashRoute() {
 const GUARD: Record<string, string[]> = {
   '#/forms': ['super_admin', 'admin', 'zone_manager'],
   '#/team': ['super_admin', 'admin', 'zone_manager'],
+  '#/migration': ['super_admin', 'admin', 'zone_manager'],
   '#/audit': ['super_admin', 'admin', 'auditor'],
   '#/settings': ['super_admin'],
 }
@@ -99,6 +101,9 @@ export default function App() {
   } else if (hash.startsWith('#/templates')) {
     title = 'Templates'
     page = <TemplatesPage me={me} />
+  } else if (hash.startsWith('#/migration')) {
+    title = 'Migration'
+    page = <MigrationPage me={me} />
   } else if (hash.startsWith('#/team')) {
     title = 'Team & assignment'
     page = <TeamPage me={me} />

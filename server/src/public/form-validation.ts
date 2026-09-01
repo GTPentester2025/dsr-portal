@@ -5,7 +5,7 @@
  * payload. Unknown fields are rejected, not ignored (spec §9).
  */
 
-interface Component {
+export interface Component {
   key: string;
   type: string;
   label?: string;
@@ -81,8 +81,13 @@ function num(v: number | string | undefined): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-/** Collect every input component reachable in the schema, keyed. */
-function collectInputs(components: Component[]): Map<string, Component> {
+/**
+ * Collect every input component reachable in the schema, keyed, in the order
+ * they appear on the form. Insertion order matters to callers outside
+ * validation: the CSV export and the import mapper both present fields in the
+ * order a requester meets them, not alphabetically.
+ */
+export function collectInputs(components: Component[]): Map<string, Component> {
   const map = new Map<string, Component>();
   const walk = (list: Component[]) => {
     for (const c of list ?? []) {

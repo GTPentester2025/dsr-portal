@@ -53,6 +53,60 @@ export class CasesActionsController {
     });
   }
 
+  /**
+   * The outcome report has gone to the requester. Separate from closing: a
+   * case can be decided days before the answer actually reaches the person who
+   * asked, and the gap between the two is exactly what an audit looks at.
+   */
+  @Post('cases/:id/report/publish')
+  @Requires('cases.work')
+  publishReport(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { note?: string },
+  ) {
+    return this.workflow.markReportPublished(req.zoneCtx, id, req.user.id, body?.note);
+  }
+
+  /** Confirmed read by the data subject — a receipt, a reply, or a call. */
+  @Post('cases/:id/report/accessed')
+  @Requires('cases.work')
+  reportAccessed(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { note?: string },
+  ) {
+    return this.workflow.markReportAccessed(req.zoneCtx, id, req.user.id, body?.note);
+  }
+
+  /** Raise an appeal against a closed case; creates a linked new case. */
+  @Post('cases/:id/appeal')
+  @Requires('cases.work')
+  appeal(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { reason?: string },
+    @Ip() ip: string,
+  ) {
+    return this.workflow.openAppeal(req.zoneCtx, {
+      caseId: id,
+      reason: body?.reason ?? '',
+      actorId: req.user.id,
+      ip,
+    });
+  }
+
+  /** Record the decision on an appeal case. */
+  @Post('cases/:id/appeal/decide')
+  @Requires('cases.work')
+  decideAppeal(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { status?: string },
+  ) {
+    return this.workflow.setAppealStatus(req.zoneCtx, id, body?.status ?? '', req.user.id);
+  }
+
   @Post('cases/:id/assign')
   @Requires('cases.work')
   assign(

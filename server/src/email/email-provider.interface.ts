@@ -10,6 +10,13 @@ export interface SendTransactionalOptions {
   language?: string;
   replyTo?: string;
   fromDisplayName?: string;
+  /**
+   * Which case this message is about. Adapters ignore it; the dispatcher uses
+   * it so a message that fails is logged against the case rather than floating
+   * free of one.
+   */
+  caseId?: string;
+  zoneId?: string;
 }
 
 export interface SendAsUserArgs {
@@ -21,6 +28,9 @@ export interface SendAsUserArgs {
   /** HTML body. */
   body: string;
   attachments?: EmailAttachment[];
+  /** Case context for the log. Adapters ignore it. */
+  caseId?: string;
+  zoneId?: string;
 }
 
 export interface SendResult {

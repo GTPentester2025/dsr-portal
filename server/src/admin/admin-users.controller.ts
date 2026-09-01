@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Get, Ip, Logger, Param, ParseUUIDPipe, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, Ip, Logger, NotFoundException, Param, ParseUUIDPipe, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { Response } from 'express';
 import { toCsv, csvFilename, type CsvColumn } from '../cases/csv';
@@ -8,6 +8,7 @@ import { AuthService } from '../auth/auth.service';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { DbService } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
+import { SendGuardService } from '../email/send-guard.service';
 import { canAssignRole } from '../auth/admin-policy';
 import type { Role } from '../auth/permissions';
 
@@ -24,7 +25,30 @@ export class AdminUsersController {
     private readonly db: DbService,
     private readonly audit: AuditService,
     private readonly auth: AuthService,
+    private readonly sendGuard: SendGuardService,
   ) {}
+
+  /**
+   * Which recipients and providers sending is currently paused for, and why.
+   *
+   * Repeated failures back a scope off rather than retrying it forever, which
+   * is correct but invisible — without this the symptom is "some people
+   * stopped getting mail" with nothing to point at.
+   */
+  @Get('email-health')
+  @Requires('system.operate')
+  emailHealth() {
+    return this.sendGuard.health();
+  }
+
+  /** Lift the brake once the underlying problem is fixed. '*' clears all. */
+  @Post('email-health/clear')
+  @Requires('system.operate')
+  clearEmailThrottle(@Req() req: AuthedRequest, @Body() body: { scope?: string }) {
+    const scope = (body?.scope ?? '').trim();
+    if (!scope) throw new BadRequestException('Which scope should be cleared?');
+    return this.sendGuard.clear(scope, req.user.id);
+  }
 
   @Get('users')
   @Requires('team.manage')
@@ -143,6 +167,117 @@ export class AdminUsersController {
       after: { ...body },
     });
     return { ok: true };
+  }
+
+  /**
+   * Permanently erase a user account.
+   *
+   * Deactivating leaves the row, which is right for somebody on leave and
+   * wrong for somebody who has left, or who has asked for their own staff
+   * record to be erased. This removes the account outright: the row, its
+   * sessions, its login identities, its credentials, and every pointer to it.
+   *
+   * What it does not remove is the attribution. Audit entries, case timeline
+   * entries, comments and uploaded files each carry the actor's name on the
+   * row itself, copied in when the row was written, and those survive. An
+   * audit trail that cannot say who acted is not one, and neither is a case
+   * file whose timeline cannot say who closed the request — and it is the case
+   * file that gets produced when the handling of a request is questioned.
+   *
+   * Irreversible, and refused where it would leave the system unadministrable.
+   * `instance.administer` rather than `team.manage`: this sits with resetting
+   * another person's password, not with editing a roster.
+   */
+  @Delete('users/:id')
+  @Requires('instance.administer')
+  async deleteUser(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Ip() ip: string,
+  ) {
+    if (id === req.user.id) {
+      throw new BadRequestException('You cannot delete the account you are signed in with');
+    }
+
+    const target = await this.db.system(async (_db, client) => {
+      const res = await client.query('SELECT * FROM users WHERE id = $1', [id]);
+      return res.rows[0];
+    });
+    if (!target) throw new NotFoundException('No such user');
+
+    if (target.role === 'super_admin') {
+      const remaining = await this.db.system(async (_db, client) => {
+        const res = await client.query(
+          `SELECT count(*)::int AS n FROM users WHERE role = 'super_admin' AND id <> $1`,
+          [id],
+        );
+        return res.rows[0].n as number;
+      });
+      if (remaining === 0) {
+        throw new BadRequestException(
+          'This is the last super administrator — promote somebody else first',
+        );
+      }
+    }
+
+    // Work this person is holding does not vanish with them. The foreign key
+    // nulls the assignment on its own, but a case that silently loses its
+    // owner is how work goes missing, so it is counted, noted on each case's
+    // timeline, and reported back to whoever ran the deletion.
+    const summary = await this.db.system(async (_db, client) => {
+      const open = await client.query(
+        `SELECT id FROM cases WHERE assignee_id = $1 AND status <> 'closed'`,
+        [id],
+      );
+      for (const row of open.rows as { id: string }[]) {
+        await client.query(
+          `INSERT INTO case_status_history (case_id, actor_id, from_status, to_status, note)
+           SELECT $1, $2, status, status, $3 FROM cases WHERE id = $1`,
+          [row.id, req.user.id, "Unassigned: the owner's account was permanently deleted"],
+        );
+      }
+
+      const counts = await client.query(
+        `SELECT
+           (SELECT count(*)::int FROM cases WHERE assignee_id = $1) AS cases_assigned,
+           (SELECT count(*)::int FROM case_status_history WHERE actor_id = $1) AS timeline_entries,
+           (SELECT count(*)::int FROM case_comments WHERE author_id = $1) AS comments,
+           (SELECT count(*)::int FROM audit_log WHERE actor_id = $1) AS audit_entries`,
+        [id],
+      );
+
+      // Everything that references the row either nulls or cascades, arranged
+      // by the migration, so this one statement is the whole erasure.
+      await client.query('DELETE FROM users WHERE id = $1', [id]);
+
+      return {
+        openCasesUnassigned: open.rows.length,
+        ...(counts.rows[0] as Record<string, number>),
+      };
+    });
+
+    // The deleted person's name is passed in explicitly: by this point there
+    // is no row left to look it up from, and the trail must still name them.
+    await this.audit.record({
+      actorId: req.user.id,
+      actorType: 'user',
+      action: 'user.deleted',
+      entityType: 'user',
+      entityId: id,
+      zoneId: target.zone_id ?? undefined,
+      before: {
+        name: target.name,
+        email: target.email,
+        role: target.role,
+        zoneId: target.zone_id,
+        active: target.active,
+        createdAt: target.created_at,
+      },
+      after: { deleted: true, ...summary },
+      sourceIp: ip,
+    });
+
+    return { ok: true, ...summary };
   }
 
   // ---- assignment strategy / zone config ---------------------------------

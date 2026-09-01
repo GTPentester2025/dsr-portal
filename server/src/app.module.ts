@@ -11,6 +11,7 @@ import { PublicModule } from './public/public.module';
 import { AuthModule } from './auth/auth.module';
 import { CasesModule } from './cases/cases.module';
 import { FormsModule } from './forms/forms.module';
+import { MigrationModule } from './migration/migration.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { FormsModule } from './forms/forms.module';
     AuthModule,
     CasesModule,
     FormsModule,
+    MigrationModule,
   ],
   controllers: [AppController],
   providers: [AppService],

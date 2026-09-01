@@ -5,8 +5,17 @@ import { csvFilename, type CsvColumn } from './csv';
 import { streamCsv } from './csv-stream';
 import { CasePdfService } from './case-pdf.service';
 import type { AuthedRequest } from '../auth/auth.guard';
-import { CasesService, type CaseListRow } from './cases.service';
+import { CasesService, type CaseExportRow } from './cases.service';
 import { AuditService } from '../audit/audit.service';
+
+/**
+ * Booleans read as TRUE/FALSE in the tool this export has to interoperate
+ * with, and null means "not applicable" rather than "no" — a case that is
+ * still open has no answer yet to whether it finished late.
+ */
+function yesNo(value: boolean | null | undefined): string {
+  return value === null || value === undefined ? '' : value ? 'TRUE' : 'FALSE';
+}
 
 @Controller('internal/cases')
 @UseGuards(AuthGuard)
@@ -67,17 +76,62 @@ export class CasesController {
     @Query('to') to?: string,
   ) {
     const filters = { status, zone, slaState, requestType, from, to };
-    const columns: CsvColumn<CaseListRow>[] = [
+
+    // Which answer columns the file needs, settled before the header goes out
+    // — once the first byte is written the header cannot be revised. Both
+    // queries run before streaming starts, so a failure here is still a 500
+    // rather than a truncated download.
+    //
+    // The columns are driven by the data rather than hard-coded: each form
+    // asks different questions, and a fixed header list is how this export
+    // came to carry ten columns for a case that holds forty. Labels come from
+    // the form schema so the file reads the way the form did.
+    const { keys: presentKeys, formKeys } = await this.cases.exportFieldKeys(req.zoneCtx, filters);
+    const labels = await this.cases.fieldLabels(formKeys);
+    const present = new Set(presentKeys);
+    // Form order first, then whatever is left — a field dropped from a later
+    // schema version still has to appear rather than vanish from the record.
+    const fieldKeys = [
+      ...[...labels.keys()].filter((k) => present.has(k)),
+      ...presentKeys.filter((k) => !labels.has(k)),
+    ];
+
+    const columns: CsvColumn<CaseExportRow>[] = [
       { header: 'Reference', value: (r) => r.caseRef },
-      { header: 'Created', value: (r) => r.createdAt },
-      { header: 'Zone', value: (r) => r.zoneId },
-      { header: 'Country', value: (r) => r.country },
+      { header: 'Case ID', value: (r) => r.id },
+      { header: 'Source', value: (r) => r.source },
+      { header: 'Source ID', value: (r) => r.externalId },
+      { header: 'Source request ID', value: (r) => r.externalRequestId },
+      { header: 'Subject name', value: (r) => r.requesterName },
+      { header: 'Requester email', value: (r) => r.requesterEmail },
       { header: 'Request types', value: (r) => r.requestTypes },
       { header: 'Status', value: (r) => r.status },
+      { header: 'Progress', value: (r) => r.progress },
+      { header: 'Created', value: (r) => r.createdAt },
       { header: 'Due', value: (r) => r.dueAt },
-      { header: 'Requester email', value: (r) => r.requesterEmail },
+      { header: 'Completed', value: (r) => r.closedAt },
+      { header: 'Completed after deadline', value: (r) => yesNo(r.completedAfterDeadline) },
+      { header: 'Auto extended', value: (r) => yesNo(r.autoExtended) },
+      { header: 'Skip completion notification', value: (r) => yesNo(r.skipCompletionNotification) },
+      { header: 'Outcome', value: (r) => r.outcomeCode },
+      { header: 'Zone', value: (r) => r.zoneId },
+      { header: 'Country', value: (r) => r.country },
+      { header: 'Residency', value: (r) => r.residency },
+      { header: 'Owner', value: (r) => r.assigneeName },
+      { header: 'Owner email', value: (r) => r.assigneeEmail },
       { header: 'Approvers', value: (r) => r.approvers },
+      { header: 'Report published', value: (r) => r.reportPublishedAt },
+      { header: 'Report accessed', value: (r) => r.reportAccessedAt },
+      { header: 'Can be appealed', value: (r) => yesNo(r.canBeAppealed) },
+      { header: 'Can appeal until', value: (r) => r.canAppealUntil },
+      { header: 'Is appeal', value: (r) => yesNo(r.isAppeal) },
+      { header: 'Appeal status', value: (r) => r.appealStatus },
       { header: 'Form', value: (r) => r.formKey },
+      { header: 'Form version', value: (r) => r.formVersion },
+      ...fieldKeys.map((key) => ({
+        header: labels.get(key) ?? key,
+        value: (r: CaseExportRow) => r.fields[key],
+      })),
     ];
 
     // Every header before the first byte of the body: after that the status
@@ -104,8 +158,9 @@ export class CasesController {
           actorType: 'user',
           action: 'cases.exported',
           entityType: 'case',
-          // An export copies personal data out of the system; record how much.
-          after: { rows, complete: true, filters },
+          // An export copies personal data out of the system; record how much,
+          // and that it carried the answers themselves and not only metadata.
+          after: { rows, fieldColumns: fieldKeys.length, complete: true, filters },
         }),
     );
 

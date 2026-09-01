@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, ZONES, type Me, type UserRow, atLeast } from '../lib/api'
 import {
-  Alert, Button, Card, Chip, Field, PageHeader, Select, Switch, Table,
+  Alert, Button, Card, Chip, Field, Modal, PageHeader, Select, Switch, Table,
   Td, Th, Tr, TextInput,
 } from '../components/ui'
 import { Icon } from '../components/Icon'
@@ -36,6 +36,7 @@ function splitDelay(totalMinutes: number): { value: number; unit: DelayUnit } {
 export function TeamPage({ me }: { me: Me }) {
   const toast = useToast()
   const [resetting, setResetting] = useState<{ id: string; name: string; email: string } | null>(null)
+  const [deleting, setDeleting] = useState<UserRow | null>(null)
   const [users, setUsers] = useState<UserRow[]>([])
   const [cfg, setCfg] = useState<AssignCfg[]>([])
   const [err, setErr] = useState('')
@@ -358,6 +359,16 @@ export function TeamPage({ me }: { me: Me }) {
                       label={`Active status for ${u.name}`}
                       onChange={(v) => void patchUser(u.id, { active: v }, v ? 'Member activated' : 'Member deactivated')}
                     />
+                    {me.role === 'super_admin' && u.id !== me.id && (
+                      <Button
+                        variant="ghost"
+                        icon="trash"
+                        aria-label={`Permanently delete ${u.name}`}
+                        title="Permanently delete this account"
+                        className="text-danger hover:bg-danger/10"
+                        onClick={() => setDeleting(u)}
+                      />
+                    )}
                   </div>
                 </Td>
               </Tr>
@@ -366,6 +377,8 @@ export function TeamPage({ me }: { me: Me }) {
           <p className="flex items-center gap-1.5 border-t border-line px-4 py-3 text-[11px] text-faint">
             <Icon name="info" size={12} />
             Inactive members and anyone inside an out-of-office window are skipped by auto-assignment.
+            Deactivating keeps the account; deleting erases it while leaving their name on the
+            work they did.
           </p>
         </Card>
       </div>
@@ -373,6 +386,107 @@ export function TeamPage({ me }: { me: Me }) {
       {resetting && (
         <ResetPasswordModal user={resetting} onClose={() => setResetting(null)} />
       )}
+
+      {deleting && (
+        <DeleteUserModal
+          user={deleting}
+          onClose={() => setDeleting(null)}
+          onDeleted={() => {
+            setDeleting(null)
+            reload()
+          }}
+        />
+      )}
     </>
+  )
+}
+
+/**
+ * Permanent deletion, behind a typed confirmation.
+ *
+ * Deactivating is the reversible option and is one click away in the same row,
+ * so this dialog's job is to make sure the irreversible one was chosen on
+ * purpose — and to say plainly what survives, because "delete the user" and
+ * "delete their audit trail" are different things and only the first happens.
+ */
+function DeleteUserModal({
+  user,
+  onClose,
+  onDeleted,
+}: {
+  user: UserRow
+  onClose: () => void
+  onDeleted: () => void
+}) {
+  const toast = useToast()
+  const [typed, setTyped] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const confirmed = typed.trim().toLowerCase() === user.email.trim().toLowerCase()
+
+  const remove = async () => {
+    setBusy(true)
+    setErr('')
+    try {
+      const res = await api.del<{ openCasesUnassigned: number }>(`/internal/admin/users/${user.id}`)
+      toast.success(
+        `${user.name} deleted`,
+        res.openCasesUnassigned
+          ? `${res.openCasesUnassigned} open case(s) are now unassigned`
+          : undefined,
+      )
+      onDeleted()
+    } catch (e) {
+      setErr((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal
+      title={`Permanently delete ${user.name}?`}
+      description="This cannot be undone."
+      onClose={onClose}
+    >
+      <div className="space-y-4">
+        <Alert tone="error" title="What this removes">
+          The account, its password, and every session it has open. They will no longer
+          appear in the team list, be assignable, or be able to sign in. This cannot be
+          undone — there is no way to restore the account afterwards.
+        </Alert>
+        <Alert tone="info" title="What it keeps">
+          The record of what they did. <strong>{user.name}</strong> stays named against every
+          audit entry, case timeline entry, comment and file they touched — those are the
+          case file and the audit trail, and neither is worth much if it cannot say who
+          acted.
+        </Alert>
+        <p className="text-[13px] text-muted">
+          Any open cases assigned to them become unassigned, and a note saying so is added to
+          each one&rsquo;s timeline.
+        </p>
+
+        <Field
+          label={`Type ${user.email} to confirm`}
+          error={err || undefined}
+          htmlFor="confirm-delete-user"
+        >
+          <TextInput
+            id="confirm-delete-user"
+            value={typed}
+            autoComplete="off"
+            placeholder={user.email}
+            onChange={(e) => setTyped(e.target.value)}
+          />
+        </Field>
+
+        <div className="flex justify-end gap-2">
+          <Button onClick={onClose}>Cancel</Button>
+          <Button variant="danger" loading={busy} disabled={!confirmed} onClick={remove}>
+            Delete permanently
+          </Button>
+        </div>
+      </div>
+    </Modal>
   )
 }

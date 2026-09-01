@@ -21,12 +21,27 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   return data as T
 }
 
+/**
+ * Multipart POST. Kept separate from `call` because a file upload must not set
+ * a JSON content type — the browser has to write its own boundary, and setting
+ * it by hand is the classic way to get a 400 with no useful message.
+ */
+async function upload<T>(path: string, form: FormData): Promise<T> {
+  const res = await fetch(path, { method: 'POST', credentials: 'same-origin', body: form })
+  const data = await res.json().catch(() => null)
+  if (!res.ok) {
+    throw new ApiError(res.status, (data as { message?: string })?.message ?? `HTTP ${res.status}`)
+  }
+  return data as T
+}
+
 export const api = {
   get: <T>(path: string) => call<T>('GET', path),
   post: <T>(path: string, body?: unknown) => call<T>('POST', path, body),
   put: <T>(path: string, body?: unknown) => call<T>('PUT', path, body),
   patch: <T>(path: string, body?: unknown) => call<T>('PATCH', path, body),
   del: <T>(path: string) => call<T>('DELETE', path),
+  upload,
 }
 
 export interface Me {
@@ -57,6 +72,27 @@ export interface CaseListItem {
   /** Who the case is waiting on: 'customer' | 'internal' | null. */
   pendingParty: string | null
   pendingOn: string | null
+
+  // -- lifecycle beyond the status ------------------------------------------
+  /** One label spanning status, report delivery and appeal state. */
+  progress?: string
+  closedAt?: string | null
+  residency?: string | null
+  /** Null while the case is open: it has no answer yet. */
+  completedAfterDeadline?: boolean | null
+  autoExtended?: boolean
+  skipCompletionNotification?: boolean
+  reportPublishedAt?: string | null
+  reportAccessedAt?: string | null
+  canBeAppealed?: boolean
+  canAppealUntil?: string | null
+  isAppeal?: boolean
+  appealStatus?: string | null
+  /** 'portal' | 'import' */
+  source?: string
+  externalId?: string | null
+  externalRequestId?: string | null
+  assigneeName?: string | null
 }
 
 export interface CaseDetail extends CaseListItem {
@@ -244,3 +280,90 @@ export const OUTCOME_CODES = [
   'fulfilled', 'partially_fulfilled', 'refused', 'withdrawn',
   'identity_not_verified', 'out_of_scope',
 ]
+
+
+// --------------------------------------------------------------- migration --
+
+/** One column of an uploaded file and where it is proposed to go. */
+export interface ColumnProposal {
+  header: string
+  /** 'case:<id>' | 'field:<key>' | 'ignore' */
+  target: string
+  reason: string
+  /** True when the field key does not exist on the chosen form. */
+  novel: boolean
+  samples: string[]
+}
+
+export interface RowIssue {
+  row: number
+  column?: string
+  message: string
+  severity: 'error' | 'warning'
+}
+
+export interface ImportAnalysis {
+  id: string
+  filename: string
+  zoneId: string
+  formKey: string
+  formVersion: number
+  encoding: string
+  delimiter: string
+  totalRows: number
+  dateOrder: 'dmy' | 'mdy' | 'iso'
+  /** False when the file gave no evidence either way and a default was taken. */
+  dateOrderConfident: boolean
+  columns: ColumnProposal[]
+  targets: {
+    case: { id: string; label: string; help?: string }[]
+    field: { id: string; label: string; key: string }[]
+  }
+  sampleRows: {
+    row: number
+    caseProps: Record<string, unknown>
+    fields: Record<string, unknown>
+    reportPublished: boolean
+    reportAccessed: boolean
+    issues: RowIssue[]
+  }[]
+  issues: RowIssue[]
+  errorRows: number
+  duplicates: { count: number; sample: string[] }
+}
+
+export interface ImportRecord {
+  id: string
+  filename: string
+  zone_id: string
+  form_key: string
+  status: string
+  total_rows: number
+  imported: number
+  skipped: number
+  failed: number
+  created_at: string
+  committed_at: string | null
+  uploaded_by_name: string | null
+}
+
+export interface CommitResult {
+  ok: true
+  imported: number
+  skipped: number
+  failed: number
+  /** Rows imported against a placeholder address because the file had none. */
+  placeholderEmails: number
+  issues: RowIssue[]
+}
+
+/** A recipient or provider that sending is currently backed off for. */
+export interface EmailHealthRow {
+  scope: string
+  consecutive_failures: number
+  total_failures: number
+  last_error: string | null
+  last_failed_at: string | null
+  last_succeeded_at: string | null
+  blocked_until: string | null
+}

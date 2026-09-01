@@ -17,6 +17,8 @@ interface Policy {
   holidays: string[]
   pause_allowed: boolean
   extension_allowed_days: number
+  /** Days after closure in which the requester may appeal. 0 => no appeals. */
+  appeal_window_days: number
   reminder_thresholds: number[]
   escalation_threshold: number
 }
@@ -57,6 +59,7 @@ const blank = (zone: string): Partial<Policy> => ({
   holidays: [],
   pause_allowed: false,
   extension_allowed_days: 0,
+  appeal_window_days: 0,
   reminder_thresholds: [0.75, 0.9, 1],
   escalation_threshold: 0.9,
 })
@@ -97,6 +100,7 @@ export function SlaPolicies({ me }: { me: Me }) {
         holidays: editing.holidays ?? [],
         pauseAllowed: Boolean(editing.pause_allowed),
         extensionAllowedDays: Number(editing.extension_allowed_days ?? 0),
+        appealWindowDays: Number(editing.appeal_window_days ?? 0),
         reminderThresholds: editing.reminder_thresholds ?? [0.75, 0.9, 1],
         escalationThreshold: Number(editing.escalation_threshold ?? 0.9),
       })
@@ -150,7 +154,7 @@ export function SlaPolicies({ me }: { me: Me }) {
           head={
             <>
               <Th>Zone</Th><Th>Request type</Th><Th>Target</Th><Th>Calendar</Th>
-              <Th>Extension</Th><Th>Pause</Th><Th>Reminders</Th><Th />
+              <Th>Extension</Th><Th>Appeals</Th><Th>Pause</Th><Th>Reminders</Th><Th />
             </>
           }
         >
@@ -171,6 +175,9 @@ export function SlaPolicies({ me }: { me: Me }) {
               </Td>
               <Td className="text-[12px] text-muted">
                 {p.extension_allowed_days > 0 ? `+${p.extension_allowed_days} days` : 'Not allowed'}
+              </Td>
+              <Td className="text-[12px] text-muted">
+                {p.appeal_window_days > 0 ? `${p.appeal_window_days} days` : 'Not offered'}
               </Td>
               <Td>
                 {p.pause_allowed
@@ -268,6 +275,16 @@ export function SlaPolicies({ me }: { me: Me }) {
                 <TextInput
                   id="p-ext" type="number" min={0} max={365} value={editing.extension_allowed_days ?? 0}
                   onChange={(e) => setEditing({ ...editing, extension_allowed_days: Number(e.target.value) })}
+                />
+              </Field>
+              <Field
+                label="Appeal window"
+                hint="Days after closure in which the requester may appeal. 0 means appeals are not offered."
+                htmlFor="p-appeal"
+              >
+                <TextInput
+                  id="p-appeal" type="number" min={0} max={365} value={editing.appeal_window_days ?? 0}
+                  onChange={(e) => setEditing({ ...editing, appeal_window_days: Number(e.target.value) })}
                 />
               </Field>
               <Field label="Timezone" hint="Used for business-day maths." htmlFor="p-tz">

@@ -20,6 +20,16 @@ function neutralise(text: string): string {
   return /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
 }
 
+/**
+ * Excel also silently reformats long digit strings as floats. The export this
+ * one was measured against turned a 14-digit account id into `9.98486E+13`,
+ * destroying it. Identifiers are not quantities, so anything longer than an
+ * unpunctuated phone number is pinned to text the same way.
+ */
+function preserveDigits(text: string): string {
+  return /^\d{12,}$/.test(text) ? `'${text}` : text;
+}
+
 function cell(value: unknown): string {
   if (value === null || value === undefined) return '';
   const raw = value instanceof Date
@@ -29,7 +39,7 @@ function cell(value: unknown): string {
       : typeof value === 'object'
         ? JSON.stringify(value)
         : String(value);
-  const safe = neutralise(raw);
+  const safe = preserveDigits(neutralise(raw));
   return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 

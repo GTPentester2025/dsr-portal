@@ -11,6 +11,7 @@ import {
 } from '../db/schema';
 import { CryptoService } from '../crypto/crypto.service';
 import { cursorClause, nextCursor, type Cursor } from './keyset';
+import { collectInputs, type Component } from '../public/form-validation';
 
 export interface CaseListQuery {
   status?: string;
@@ -69,6 +70,24 @@ function listFilters(q: CaseListQuery): { sql: string; params: unknown[] } {
 }
 
 /**
+ * A single label for how far a case has travelled, spanning the two things the
+ * status column deliberately does not cover: that closing a case and getting
+ * the outcome report in front of the requester are different events, and that
+ * a closed case may still be inside its appeal window.
+ *
+ * Kept as a derived label rather than extra statuses so the SLA engine, the
+ * dashboard and the transition table keep working off the seven states they
+ * were built around.
+ */
+export function progressOf(r: Record<string, unknown>): string {
+  if (r.report_accessed_at) return 'Report accessed by data subject';
+  if (r.report_published_at) return 'Report published';
+  if (r.appeal_status === 'requested' || r.appeal_status === 'under_review') return 'Under appeal';
+  if (r.status === 'closed') return 'Closed — report not sent';
+  return String(r.status ?? '');
+}
+
+/**
  * One row per case with the columns an operator actually works from: when it
  * arrived, which country it came from, and who can act on it. Approvers are
  * derived from the zone because cases are not assigned to individuals.
@@ -82,9 +101,15 @@ const LIST_SELECT = `
      WHERE active AND role = 'approver'
      GROUP BY zone_id
   )
-  SELECT c.id, c.case_ref, c.zone_id, c.form_key, c.request_types, c.status,
-         c.assignee_id, c.due_at, c.created_at, c.requester_email_enc,
+  SELECT c.id, c.case_ref, c.zone_id, c.form_key, c.form_version, c.request_types, c.status,
+         c.assignee_id, c.due_at, c.created_at, c.requester_email_enc, c.requester_name_enc,
          c.pending_party, c.pending_on,
+         c.closed_at, c.outcome_code, c.closure_note, c.residency,
+         c.skip_completion_notification, c.completed_after_deadline, c.auto_extended,
+         c.report_published_at, c.report_accessed_at,
+         c.can_be_appealed, c.can_appeal_until, c.is_appeal, c.appeal_status,
+         c.source, c.external_id, c.external_request_id,
+         asg.name AS assignee_name, asg.email AS assignee_email,
          -- The export's keyset cursor, and only that: it is not shaped into a
          -- row and never reaches the CSV. timestamptz is stored to the
          -- microsecond and a JS Date holds milliseconds, so the key has to
@@ -95,6 +120,7 @@ const LIST_SELECT = `
          COALESCE(app.names, '') AS approvers,
          COALESCE(app.emails, ARRAY[]::text[]) AS approver_emails
     FROM cases c
+    LEFT JOIN users asg ON asg.id = c.assignee_id
     LEFT JOIN LATERAL (
       SELECT value_json FROM case_fields
        WHERE case_id = c.id AND field_key = 'country' LIMIT 1
@@ -154,6 +180,39 @@ export class CasesService {
       requesterEmail: this.safeDecrypt(r.requester_email_enc as string | null),
       pendingParty: (r.pending_party ?? null) as string | null,
       pendingOn: (r.pending_on ?? null) as string | null,
+      ...this.shapeLifecycle(r),
+    };
+  }
+
+  /**
+   * The lifecycle facts the case record keeps beyond its status: when the
+   * outcome report went out, whether the deadline was missed, and where the
+   * case is in its appeal window. Shared by the list, the detail view and the
+   * export so all three agree.
+   */
+  private shapeLifecycle(r: Record<string, unknown>) {
+    return {
+      formVersion: (r.form_version ?? null) as number | null,
+      closedAt: (r.closed_at ?? null) as string | null,
+      outcomeCode: (r.outcome_code ?? null) as string | null,
+      residency: (r.residency ?? null) as string | null,
+      skipCompletionNotification: Boolean(r.skip_completion_notification),
+      completedAfterDeadline: (r.completed_after_deadline ?? null) as boolean | null,
+      autoExtended: Boolean(r.auto_extended),
+      reportPublishedAt: (r.report_published_at ?? null) as string | null,
+      reportAccessedAt: (r.report_accessed_at ?? null) as string | null,
+      canBeAppealed: Boolean(r.can_be_appealed),
+      canAppealUntil: (r.can_appeal_until ?? null) as string | null,
+      isAppeal: Boolean(r.is_appeal),
+      appealStatus: (r.appeal_status ?? null) as string | null,
+      source: (r.source ?? 'portal') as string,
+      externalId: (r.external_id ?? null) as string | null,
+      externalRequestId: (r.external_request_id ?? null) as string | null,
+      assigneeName: (r.assignee_name ?? null) as string | null,
+      assigneeEmail: (r.assignee_email ?? null) as string | null,
+      requesterName: this.safeDecrypt(r.requester_name_enc as string | null),
+      /** Where the case sits in the delivery lifecycle, as one label. */
+      progress: progressOf(r),
     };
   }
 
@@ -197,7 +256,18 @@ export class CasesService {
         { statementTimeoutMs: 45_000 },
       );
       if (batch.length === 0) return;
-      yield batch.map((r) => this.shapeListRow(r));
+      // The answers, fetched for this batch only. The export used to carry ten
+      // columns of metadata for a record that holds forty, which is a case
+      // list rather than a case export. Batched with the rows so memory stays
+      // bounded by the batch, not by the size of the result.
+      const fields = await this.fieldsForCases(
+        ctx,
+        batch.map((r) => r.id as string),
+      );
+      yield batch.map((r) => ({
+        ...this.shapeListRow(r),
+        fields: fields.get(r.id as string) ?? {},
+      }));
       // From the text column, never from the shaped row: shapeListRow hands
       // back whatever pg parsed created_at into, which is a Date.
       cursor = nextCursor(
@@ -205,6 +275,116 @@ export class CasesService {
       );
       if (batch.length < size) return;
     }
+  }
+
+  /**
+   * Every answer held against the given cases, decrypted.
+   *
+   * Exporting is already the disclosure and the controller audits it as one,
+   * so the encrypted fields are resolved here rather than handed over as
+   * ciphertext nobody can read.
+   */
+  private async fieldsForCases(
+    ctx: ZoneContext,
+    ids: string[],
+  ): Promise<Map<string, Record<string, unknown>>> {
+    const byCase = new Map<string, Record<string, unknown>>();
+    if (ids.length === 0) return byCase;
+    const rows = await this.db.withContext(ctx, async (_db, client) => {
+      const r = await client.query(
+        `SELECT case_id, field_key, value_json, value_enc, encrypted
+           FROM case_fields WHERE case_id = ANY($1::uuid[])`,
+        [ids],
+      );
+      return r.rows as {
+        case_id: string; field_key: string;
+        value_json: unknown; value_enc: string | null; encrypted: boolean;
+      }[];
+    });
+    for (const f of rows) {
+      const bag = byCase.get(f.case_id) ?? {};
+      bag[f.field_key] = f.encrypted ? this.safeDecrypt(f.value_enc) : f.value_json;
+      byCase.set(f.case_id, bag);
+    }
+    return byCase;
+  }
+
+  /**
+   * Which answer columns the export needs, before a single row is streamed.
+   *
+   * The header has to be written first and cannot be revised afterwards, so
+   * the set of field keys is established in one pass over the filtered cases
+   * rather than accumulated as rows go by.
+   */
+  async exportFieldKeys(
+    ctx: ZoneContext,
+    q: CaseListQuery,
+  ): Promise<{ keys: string[]; formKeys: string[] }> {
+    return this.db.withContext(ctx, async (_db, client) => {
+      const { sql: filterSql, params } = listFilters(q);
+      const keys = await client.query(
+        `SELECT DISTINCT f.field_key
+           FROM case_fields f
+           JOIN cases c ON c.id = f.case_id
+          WHERE true ${filterSql}
+          ORDER BY f.field_key`,
+        params,
+      );
+      // Which forms are in this export, so the headers are labelled by the
+      // forms the answers actually came from.
+      const forms = await client.query(
+        `SELECT DISTINCT c.form_key FROM cases c WHERE true ${filterSql}`,
+        params,
+      );
+      return {
+        keys: keys.rows.map((x: { field_key: string }) => x.field_key),
+        formKeys: forms.rows.map((x: { form_key: string }) => x.form_key),
+      };
+    });
+  }
+
+  /**
+   * Human labels for form field keys, in form order, for the forms the given
+   * cases were submitted under.
+   *
+   * Without this the export headers read `cpf_brazil` and
+   * `does_your_request_involve_any_campaign_or_promotion`, which is a database
+   * dump rather than the record the previous tool produced. Later versions of
+   * a form win on ties, since that is the wording currently in use.
+   */
+  async fieldLabels(formKeys: string[]): Promise<Map<string, string>> {
+    const labels = new Map<string, string>();
+    const wanted = [...new Set(formKeys.filter(Boolean))];
+    if (wanted.length === 0) return labels;
+
+    const schemas = await this.db.system(async (_db, client) => {
+      const r = await client.query(
+        `SELECT DISTINCT ON (form_key) form_key, schema FROM form_versions
+          WHERE form_key = ANY($1::text[]) ORDER BY form_key, version DESC`,
+        [wanted],
+      );
+      return r.rows as { form_key: string; schema: { components?: Component[] } }[];
+    });
+
+    // Twelve forms label `requestDetails` twelve different ways. Taking the
+    // first one seen would put another country's wording on this country's
+    // column, so a key the exported forms disagree about falls back to the key
+    // itself: unlovely, but unambiguous, which prose that is quietly wrong is
+    // not.
+    const seen = new Map<string, Set<string>>();
+    for (const sc of schemas) {
+      for (const [key, c] of collectInputs(sc.schema?.components ?? [])) {
+        const label = c.label?.trim() || key;
+        const bag = seen.get(key) ?? new Set<string>();
+        bag.add(label);
+        seen.set(key, bag);
+        if (!labels.has(key)) labels.set(key, label);
+      }
+    }
+    for (const [key, variants] of seen) {
+      if (variants.size > 1) labels.set(key, key);
+    }
+    return labels;
   }
 
   async detail(ctx: ZoneContext, id: string) {
@@ -222,7 +402,9 @@ export class CasesService {
           toStatus: caseStatusHistory.toStatus,
           note: caseStatusHistory.note,
           createdAt: caseStatusHistory.createdAt,
-          actorName: users.name,
+          // The stored name wins: it is the one that survives the account
+          // being deleted, and it is what the row was written with.
+          actorName: sql<string | null>`COALESCE(${caseStatusHistory.actorName}, ${users.name})`,
           actorEmail: users.email,
           actorRole: users.role,
         })
@@ -236,7 +418,10 @@ export class CasesService {
       // status untouched: SLA extensions, sends, views.
       const activityRows = await client.query(
         `SELECT a.id, a.action, a.created_at, a.before, a.after, a.source_ip,
-                a.actor_type, u.name AS actor_name, u.email AS actor_email, u.role AS actor_role
+                a.actor_type,
+                COALESCE(a.actor_name, u.name) AS actor_name,
+                COALESCE(a.actor_email, u.email) AS actor_email,
+                u.role AS actor_role
            FROM audit_log a
       LEFT JOIN users u ON u.id = a.actor_id
           WHERE a.entity_type = 'case' AND a.entity_id = $1
@@ -277,6 +462,13 @@ export class CasesService {
         requesterNameEnc: undefined,
         requesterEmail: this.safeDecrypt(row.requesterEmailEnc),
         requesterName: row.requesterNameEnc ? this.safeDecrypt(row.requesterNameEnc) : null,
+        // Same derivation as the list, from the snake_case shape it expects.
+        progress: progressOf({
+          status: row.status,
+          appeal_status: row.appealStatus,
+          report_published_at: row.reportPublishedAt,
+          report_accessed_at: row.reportAccessedAt,
+        }),
         fields: fields.map((f) => ({
           key: f.fieldKey,
           value: f.encrypted ? this.safeDecrypt(f.valueEnc ?? '') : f.valueJson,
@@ -371,3 +563,6 @@ export class CasesService {
  * actually contains.
  */
 export type CaseListRow = ReturnType<CasesService['shapeListRow']>;
+
+/** A row as the export streams it: the case, plus the answers on it. */
+export type CaseExportRow = CaseListRow & { fields: Record<string, unknown> };
