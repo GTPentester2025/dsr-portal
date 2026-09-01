@@ -12,6 +12,7 @@ import { Icon } from '../components/Icon'
 import { Attachments } from '../components/Attachments'
 import { FieldValue, humaniseKey } from '../components/FieldValue'
 import { CaseShare } from '../components/CaseShare'
+import { DelegationCard } from '../components/DelegationCard'
 import { useToast } from '../components/Toast'
 
 export function CaseDetailPage({ me, caseId }: { me: Me; caseId: string }) {
@@ -159,6 +160,8 @@ export function CaseDetailPage({ me, caseId }: { me: Me; caseId: string }) {
 
 
         <DeliveryCard c={c} canAct={canAct} reload={reload} />
+
+        <DelegationCard c={c} canAct={canAct} reload={reload} />
 
         <Card title="Files" subtitle="Everything held against this case">
           <Attachments caseId={caseId} canUpload={canAct} onChanged={reload} />
