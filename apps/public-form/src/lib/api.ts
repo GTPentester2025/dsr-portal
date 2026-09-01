@@ -27,6 +27,10 @@ export const loadCountries = async (): Promise<Country[]> => {
 
 // ---- backend intake API -----------------------------------------------------
 
+/** Attached to errors thrown by `backend`/`uploadFile` so callers can tell a
+ *  missing resource (bad or expired link) apart from a rejected request. */
+export type BackendError = Error & { status?: number; issues?: unknown }
+
 async function backend<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -36,10 +40,22 @@ async function backend<T>(method: string, path: string, body?: unknown): Promise
   })
   const data = (await res.json().catch(() => null)) as T & { message?: string; issues?: unknown }
   if (!res.ok) {
-    const err = new Error((data as { message?: string })?.message || `HTTP ${res.status}`) as Error & {
-      issues?: unknown
-    }
+    const err = new Error((data as { message?: string })?.message || `HTTP ${res.status}`) as BackendError
+    err.status = res.status
     err.issues = (data as { issues?: unknown })?.issues
+    throw err
+  }
+  return data
+}
+
+/** Same contract as `backend`, but posts a `FormData` body — used for the one
+ *  upload this app makes, where the payload is a file rather than JSON. */
+async function backendUpload<T>(path: string, form: FormData): Promise<T> {
+  const res = await fetch(path, { method: 'POST', credentials: 'same-origin', body: form })
+  const data = (await res.json().catch(() => null)) as T & { message?: string }
+  if (!res.ok) {
+    const err = new Error((data as { message?: string })?.message || `HTTP ${res.status}`) as BackendError
+    err.status = res.status
     throw err
   }
   return data
@@ -56,3 +72,35 @@ export const getDraftStatus = (draftId: string) =>
 
 export const submitForm = (draftId: string, formKey: string, values: Record<string, unknown>) =>
   backend<{ caseRef: string }>('POST', '/public/submissions', { draftId, formKey, values })
+
+// ---- delegation link ---------------------------------------------------------
+//
+// What the emailed link opens: no login, no draft, just a token that resolves
+// to a bounded view of one case. See PublicDelegationView on the server for
+// exactly what's included -- deliberately nothing about the requester.
+
+export type DelegationStage = 'sent' | 'accepted' | 'closed'
+
+export interface DelegationView {
+  caseRef: string
+  requestType: string
+  dueDate: string | null
+  note: string
+  groupName: string
+  stage: DelegationStage
+  acceptedBy: string | null
+  members: { id: string; name: string }[]
+  files: { filename: string; uploadedAt: string }[]
+}
+
+export const getDelegation = (token: string) =>
+  backend<DelegationView>('GET', `/public/delegation/${token}`)
+
+export const acceptDelegation = (token: string, memberId: string) =>
+  backend<DelegationView>('POST', `/public/delegation/${token}/accept`, { memberId })
+
+export const uploadDelegationFile = (token: string, file: File) => {
+  const form = new FormData()
+  form.append('file', file)
+  return backendUpload<DelegationView>(`/public/delegation/${token}/upload`, form)
+}

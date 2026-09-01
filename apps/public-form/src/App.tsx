@@ -3,6 +3,7 @@ import type { Manifest } from './types'
 import { loadManifest } from './lib/api'
 import { FormPage } from './FormPage'
 import { PreviewPage } from './PreviewPage'
+import { DelegationPage } from './DelegationPage'
 import { isPreviewRoute } from './lib/preview'
 
 const ZONE_LABELS: Record<string, string> = {
@@ -56,6 +57,9 @@ export default function App() {
   // public route so a preview never falls through to a submittable form.
   const previewKey = isPreviewRoute(hash)
   if (previewKey) return <PreviewPage formKey={previewKey} />
+
+  const delegation = /^#\/delegation\/([A-Za-z0-9_-]{20,})$/.exec(hash)
+  if (delegation) return <DelegationPage token={delegation[1]} />
 
   const m = /^#\/form\/([a-z0-9-]+)(?:\?lang=([a-z-]+))?$/.exec(hash)
   if (m) {
