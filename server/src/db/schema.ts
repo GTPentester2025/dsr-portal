@@ -307,6 +307,66 @@ export const caseImports = pgTable(
   (t) => [index('case_imports_created_ix').on(t.createdAt)],
 );
 
+/** A standing list of people outside the portal who can be sent a case. */
+export const caseGroups = pgTable(
+  'case_groups',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    zoneId: text('zone_id').notNull().references(() => zones.id),
+    name: text('name').notNull(),
+    /** Pre-filled when sending to this group, editable before it goes. */
+    defaultMessage: text('default_message').notNull().default(''),
+    active: boolean('active').notNull().default(true),
+    createdBy: uuid('created_by').references(() => users.id),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('case_groups_zone_name_ux').on(t.zoneId, t.name)],
+);
+
+/** No account, no password, no role: a name and somewhere to write to. */
+export const caseGroupMembers = pgTable(
+  'case_group_members',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    groupId: uuid('group_id').notNull().references(() => caseGroups.id),
+    name: text('name').notNull(),
+    email: text('email').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('case_group_members_group_email_ux').on(t.groupId, t.email)],
+);
+
+/**
+ * One send to one group.
+ *
+ * `stage` is what the token permits, not merely where the work has got to:
+ * 'sent' allows accepting, 'accepted' allows uploading, 'closed' allows
+ * nothing. An action becomes impossible the moment its stage is past.
+ */
+export const caseDelegations = pgTable(
+  'case_delegations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    caseId: uuid('case_id').notNull().references(() => cases.id),
+    groupId: uuid('group_id').notNull().references(() => caseGroups.id),
+    zoneId: text('zone_id').notNull().references(() => zones.id),
+    /** SHA-256 of the token; the plaintext exists only in the email. */
+    tokenHash: text('token_hash').notNull(),
+    stage: text('stage').notNull().default('sent'),
+    note: text('note').notNull().default(''),
+    acceptedByMemberId: uuid('accepted_by_member_id').references(() => caseGroupMembers.id),
+    acceptedAt: timestamp('accepted_at', { withTimezone: true }),
+    closedAt: timestamp('closed_at', { withTimezone: true }),
+    closedBy: uuid('closed_by').references(() => users.id),
+    createdBy: uuid('created_by').references(() => users.id),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('case_delegations_token_ux').on(t.tokenHash),
+    index('case_delegations_case_ix').on(t.caseId),
+  ],
+);
+
 export const caseStatusHistory = pgTable(
   'case_status_history',
   {
