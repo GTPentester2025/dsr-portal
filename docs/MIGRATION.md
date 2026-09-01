@@ -120,9 +120,31 @@ rather than a lost import.
   deadlines that passed months ago.
 - Encrypts direct identifiers (name, phone, national id, address) at rest, by
   the same rule intake uses.
-- Marks every case `source = 'import'`. **No mail is ever sent about an
-  imported case** — the portal did not receive these requests and must not
-  write to people about correspondence that happened somewhere else.
+- Marks every case `source = 'import'`.
+
+### Importing never sends email
+
+Pressing **Import** sends nothing, and nothing is sent afterwards on account of
+what was imported. That holds for three separate senders, all of which had to
+be dealt with:
+
+| Sender | Would have sent | Why it stays quiet |
+|---|---|---|
+| Intake acknowledgement | "we have received your request" to the requester | The importer never calls it. These requests were received somewhere else, possibly years ago. |
+| SLA reminders (every 60s) | "deadline approaching" to the zone's approvers | Each clock is written with its reminder thresholds already marked fired. |
+| SLA escalations (every 60s) | `case-escalated` and `case-unassigned` to the zone's managers | Each case is written with `unassigned_escalated_at` and `escalated_at` already stamped. |
+
+The last one matters most and is the least obvious: escalation fires on any
+open case past its deadline, and an imported backlog is *entirely* made of
+those. Without the markers, importing a few hundred open historical cases would
+put a few hundred escalation emails into the zone's inbox within a minute.
+They go to managers rather than to requesters, but nobody asked for them, and
+importing history is not an event that needs alerting.
+
+An imported backlog is still **visible** — the cases are marked breached by the
+sweep and show as overdue on the dashboard, which is where a backlog belongs.
+Escalation is suppressed for imported history only; a case raised through the
+portal escalates exactly as before.
 - Records the source id, so re-uploading the same file imports nothing and
   reports the rows as skipped.
 

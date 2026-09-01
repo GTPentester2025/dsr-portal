@@ -387,9 +387,10 @@ export class MigrationService {
             residency, skip_completion_notification, completed_after_deadline,
             auto_extended, report_published_at, report_accessed_at,
             can_be_appealed, can_appeal_until, is_appeal, appeal_status,
-            source, external_id, external_request_id, imported_at)
+            source, external_id, external_request_id, imported_at,
+            unassigned_escalated_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13,$14,$15,$16,$17,$18,$19,
-                 $20,$21,$22,$23,'import',$24,$25,now())
+                 $20,$21,$22,$23,'import',$24,$25,now(),now())
          RETURNING id`,
         [
           caseRef,
@@ -459,13 +460,23 @@ export class MigrationService {
       );
 
       if (policy) {
-        // Thresholds are recorded as already fired so the reminder cron does
-        // not send a burst of "your deadline is approaching" mail about cases
-        // whose deadlines passed months ago.
+        // Every "somebody should look at this" marker is pre-set, so the SLA
+        // sweep — which runs every minute — treats an imported backlog as
+        // already handled rather than as news.
+        //
+        // Without this an import of open historical cases sends a burst of
+        // mail within sixty seconds: reminders at each threshold, a
+        // `case-escalated` for every case past its escalation fraction (all of
+        // them, since the deadlines are months old), and a `case-unassigned`
+        // for every case with no owner. Those go to the zone's managers, not
+        // to requesters, but nobody asked for them and importing history is
+        // not an event anyone needs alerting to. The cases still show as
+        // overdue on the dashboard, which is where a backlog belongs.
         await client.query(
           `INSERT INTO sla_clocks
-             (case_id, policy_id, started_at, due_at, original_due_at, state, fired_thresholds)
-           VALUES ($1,$2,$3,$4,$4,$5,$6::jsonb)`,
+             (case_id, policy_id, started_at, due_at, original_due_at, state,
+              fired_thresholds, escalated_at)
+           VALUES ($1,$2,$3,$4,$4,$5,$6::jsonb,now())`,
           [
             caseId,
             policy.id,
