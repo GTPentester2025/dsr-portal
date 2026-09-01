@@ -126,6 +126,35 @@ export interface CaseDetail extends CaseListItem {
     ccAddrs?: string[] | null; bccAddrs?: string[] | null
     fromAddr?: string | null; bodyHtml?: string | null; error?: string | null
   }[]
+  delegations?: CaseDelegation[]
+}
+
+export interface GroupMember {
+  id?: string
+  name: string
+  email: string
+}
+
+/** A standing list of people outside the portal a case can be sent to. */
+export interface CaseGroup {
+  id: string
+  zone_id: string
+  name: string
+  default_message: string
+  active: boolean
+  members: GroupMember[]
+}
+
+export interface CaseDelegation {
+  id: string
+  stage: 'sent' | 'accepted' | 'closed'
+  note: string
+  group_name: string
+  accepted_by: string | null
+  sent_by: string | null
+  created_at: string
+  accepted_at: string | null
+  closed_at: string | null
 }
 
 export interface UserRow {

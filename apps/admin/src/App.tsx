@@ -9,6 +9,7 @@ import { CasesPage } from './pages/CasesPage'
 import { CaseDetailPage } from './pages/CaseDetailPage'
 import { TemplatesPage } from './pages/TemplatesPage'
 import { TeamPage } from './pages/TeamPage'
+import { GroupsPage } from './pages/GroupsPage'
 import { AuditPage } from './pages/AuditPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { FormsPage } from './pages/FormsPage'
@@ -29,6 +30,7 @@ function useHashRoute() {
 const GUARD: Record<string, string[]> = {
   '#/forms': ['super_admin', 'admin', 'zone_manager'],
   '#/team': ['super_admin', 'admin', 'zone_manager'],
+  '#/groups': ['super_admin', 'admin', 'zone_manager', 'approver'],
   '#/migration': ['super_admin', 'admin', 'zone_manager'],
   '#/audit': ['super_admin', 'admin', 'auditor'],
   '#/settings': ['super_admin'],
@@ -107,6 +109,9 @@ export default function App() {
   } else if (hash.startsWith('#/team')) {
     title = 'Team & assignment'
     page = <TeamPage me={me} />
+  } else if (hash.startsWith('#/groups')) {
+    title = 'Groups'
+    page = <GroupsPage me={me} />
   } else if (hash.startsWith('#/audit')) {
     title = 'Audit log'
     page = <AuditPage />
