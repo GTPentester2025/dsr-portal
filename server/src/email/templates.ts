@@ -44,6 +44,34 @@ export const TEMPLATE_VARIABLES: Record<string, string[]> = {
   'test-email': ['provider', 'sent_at'],
 };
 
+/**
+ * Variables that must never be written down, per template.
+ *
+ * `TEMPLATE_VARIABLES` above says what a template may reference. This says
+ * which of those values are capabilities rather than content: both of these
+ * are links carrying a bearer token, and whoever holds one can act as the
+ * person the message was addressed to. Each feature says the same thing about
+ * its token — the plaintext exists in the email and nowhere else, so that a
+ * database dump does not hand over working links.
+ *
+ * A failed send was the one path contradicting that. `EmailDispatcher` hands
+ * `SendGuardService.recordUndelivered` the rendered body and the variables it
+ * was rendered from, and both land in `email_log` and `audit_log` — where
+ * `email_log.body_html` is read straight back out onto the case screen. One
+ * bouncing address was enough to leave a live, clickable link sitting in a
+ * case's email history, and after two consecutive failures the guard throttles
+ * that recipient, so every later send takes the same path.
+ *
+ * Listing a template here masks the named variables and suppresses its
+ * rendered body on that path. Everything else a failure record is for
+ * survives: the recipients, the subject, the template id, the error and the
+ * failure kind are what make it useful. It is the token that must not.
+ */
+export const SENSITIVE_VARIABLES: Record<string, string[]> = {
+  'verify-email': ['verification_url'],
+  'delegation-invite': ['link'],
+};
+
 /** Shown in the console so an editor knows what each message is for. */
 export const TEMPLATE_LABELS: Record<string, { label: string; description: string }> = {
   'verify-email': {

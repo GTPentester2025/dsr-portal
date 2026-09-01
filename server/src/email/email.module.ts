@@ -15,7 +15,44 @@ import { SystemTemplateService } from './system-template.service';
 import { SystemTemplateController } from './system-template.controller';
 import { AuthModule } from '../auth/auth.module';
 import { SendGuardService, type AttemptedMessage } from './send-guard.service';
-import { renderTemplate } from './templates';
+import { renderTemplate, SENSITIVE_VARIABLES } from './templates';
+
+/** Stands in for a masked variable, so the record still shows it was there. */
+const REDACTED = '[redacted]';
+
+/**
+ * Strip the capabilities out of a message before it is written down.
+ *
+ * Only the failure paths below record a message at all, and they record it
+ * into `email_log` and `audit_log` — the first of which is rendered onto the
+ * case screen, `body_html` included. For most templates that is exactly right:
+ * "what did the requester not receive?" is unanswerable without it. For the
+ * two templates whose link *is* a bearer token, it turned every bounce into a
+ * working, clickable link persisted in the case's own mail history.
+ *
+ * The body is dropped rather than scrubbed. The token appears in the rendered
+ * HTML as an href, and a template edited from the admin console can put it
+ * anywhere else in the markup as well — there is no substitution that stays
+ * correct as the template changes, and not storing the body is the only form
+ * of this that cannot be edited back into a leak. Which recipients, which
+ * subject, which template, which error: all still recorded.
+ */
+function withoutCapabilities(message: AttemptedMessage): AttemptedMessage {
+  const sensitive = message.templateId ? SENSITIVE_VARIABLES[message.templateId] : undefined;
+  if (!sensitive?.length) return message;
+  return {
+    ...message,
+    body: null,
+    variables: message.variables
+      ? Object.fromEntries(
+          Object.entries(message.variables).map(([key, value]) => [
+            key,
+            sensitive.includes(key) ? REDACTED : value,
+          ]),
+        )
+      : message.variables,
+  };
+}
 
 /**
  * Raised instead of calling the provider when a scope is backed off. Carries
@@ -124,7 +161,10 @@ export class EmailDispatcher implements EmailProvider {
       } catch {
         /* recorded with the template id and variables instead */
       }
-      return {
+      // Masked here rather than at each recordUndelivered call: describe() is
+      // reached only when a send has already failed, and it is the only thing
+      // either failure path below hands the guard.
+      return withoutCapabilities({
         to: [to],
         subject,
         body,
@@ -132,7 +172,7 @@ export class EmailDispatcher implements EmailProvider {
         variables,
         caseId: options?.caseId ?? null,
         zoneId: options?.zoneId ?? null,
-      };
+      });
     };
 
     const blocked = await this.guard.blockedScope(scopes);
