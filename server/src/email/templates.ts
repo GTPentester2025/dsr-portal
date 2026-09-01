@@ -40,6 +40,7 @@ export const TEMPLATE_VARIABLES: Record<string, string[]> = {
   'case-unassigned': [
     'case_ref', 'zone', 'request_type', 'waiting', 'submission_date', 'due_date', 'case_url',
   ],
+  'delegation-invite': ['case_ref', 'zone', 'request_type', 'due_date', 'note', 'link', 'from_name'],
   'test-email': ['provider', 'sent_at'],
 };
 
@@ -151,6 +152,15 @@ const DEFAULTS: Record<string, EmailTemplate> = {
   'test-email': {
     subject: 'DSR portal — test email',
     html: `<p>This is a test email from the DSR portal.</p><p>Active provider: <strong>{{provider}}</strong>. Sent at {{sent_at}}.</p>`,
+  },
+  'delegation-invite': {
+    subject: 'Help needed on privacy request {{case_ref}}',
+    html: `<p>{{from_name}} has asked for your help with privacy request
+<strong>{{case_ref}}</strong>, which is due by {{due_date}}.</p>
+<blockquote>{{note}}</blockquote>
+<p><a href="{{link}}">Open the request</a> to accept it and send documents back.</p>
+<p>This link does not show the requester's personal details. If you need them,
+reply to this email and ask.</p>`,
   },
 };
 
