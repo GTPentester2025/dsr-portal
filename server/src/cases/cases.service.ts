@@ -455,6 +455,19 @@ export class CasesService {
         [row.zoneId],
       );
 
+      // What the case has been sent out to, and where that got to.
+      const delegations = await client.query(
+        `SELECT d.id, d.stage, d.note, d.created_at, d.accepted_at, d.closed_at,
+                g.name AS group_name, COALESCE(d.accepted_by_name, m.name) AS accepted_by, u.name AS sent_by
+           FROM case_delegations d
+           JOIN case_groups g ON g.id = d.group_id
+      LEFT JOIN case_group_members m ON m.id = d.accepted_by_member_id
+      LEFT JOIN users u ON u.id = d.created_by
+          WHERE d.case_id = $1
+          ORDER BY d.created_at DESC`,
+        [id],
+      );
+
       return {
         ...row,
         approverEmails: approverRows.rows.map((r: { email: string }) => r.email),
@@ -479,6 +492,7 @@ export class CasesService {
         activity: activityRows.rows,
         slaClock: clock ?? null,
         emails,
+        delegations: delegations.rows,
       };
     });
   }
