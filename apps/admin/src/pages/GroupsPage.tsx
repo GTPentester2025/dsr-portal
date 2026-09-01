@@ -21,7 +21,12 @@ export function GroupsPage({ me }: { me: Me }) {
   const [editing, setEditing] = useState<CaseGroup | null>(null)
 
   const reload = useCallback(() => {
-    api.get<CaseGroup[]>('/internal/groups').then(setGroups).catch((e) => setErr((e as Error).message))
+    api.get<CaseGroup[]>('/internal/groups')
+      .then(setGroups)
+      .catch((e) => {
+        setErr((e as Error).message)
+        setGroups([])
+      })
   }, [])
   useEffect(reload, [reload])
 

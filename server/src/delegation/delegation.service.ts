@@ -209,8 +209,42 @@ export class DelegationService {
    * the requester. A `SELECT *` here would quietly undo it the next time a
    * column is added.
    */
-  async resolve(token: string): Promise<PublicDelegationView> {
+  async resolve(token: string, ip?: string): Promise<PublicDelegationView> {
     const d = await this.load(token);
+
+    // The link is a bearer token: anyone it's forwarded to can open it, so
+    // "opened, at this time, from this address" is recorded on every view --
+    // it's the one signal an investigation into a leaked link would need.
+    // A failed write must not stop someone holding a valid link from seeing
+    // the page, the same way a bookkeeping failure elsewhere in this file
+    // (email_log, above) doesn't undo the thing it's just recording.
+    try {
+      await this.audit.record({
+        actorType: 'public',
+        action: 'delegation.viewed',
+        entityType: 'case',
+        entityId: d.case_id,
+        zoneId: d.zone_id,
+        after: { delegationId: d.id },
+        sourceIp: ip,
+      });
+    } catch (err) {
+      this.log.error(`failed to record delegation.viewed audit for ${d.id}: ${(err as Error).message}`);
+    }
+
+    return this.buildView(d);
+  }
+
+  /**
+   * Assemble the page's payload for an already-loaded delegation row.
+   *
+   * Split out of `resolve()` so `accept()` and `upload()` can rebuild the
+   * view after their own mutation without each also counting as a
+   * `delegation.viewed` -- that audit belongs only to the page actually
+   * being opened (the controller's `GET`), not to every response that
+   * happens to carry the same shape.
+   */
+  private async buildView(d: Awaited<ReturnType<DelegationService['load']>>): Promise<PublicDelegationView> {
     const files = await this.db.system(async (_db, client) => {
       const r = await client.query(
         `SELECT filename, created_at FROM case_attachments
@@ -288,7 +322,7 @@ export class DelegationService {
       after: { delegationId: d.id, memberId },
       sourceIp: ip,
     });
-    return this.resolve(token);
+    return this.buildView(await this.load(token));
   }
 
   async upload(
@@ -341,7 +375,7 @@ export class DelegationService {
       after: { delegationId: d.id, filename: stored.filename, bytes: stored.sizeBytes },
       sourceIp: ip,
     });
-    return this.resolve(token);
+    return this.buildView(await this.load(token));
   }
 
   // ---- internals ----------------------------------------------------------

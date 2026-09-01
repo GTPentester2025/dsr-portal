@@ -16,9 +16,10 @@ const STAGE_TONE: Record<CaseDelegation['stage'], 'brand' | 'positive' | 'neutra
  *
  * The server allows only one open (non-closed) delegation per case, so this
  * card either offers to start one or shows the one in flight — never both.
- * `delegations` comes back newest first, and a new one can only be created
- * once the previous is closed, so the first row is the open one whenever
- * one exists.
+ * A partial unique index enforces that at the database level (at most one
+ * non-closed delegation per case), so `.find(d => d.stage !== 'closed')`
+ * below is guaranteed to find at most one match regardless of `delegations`
+ * order.
  */
 export function DelegationCard({
   c,

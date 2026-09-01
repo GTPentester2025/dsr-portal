@@ -28,8 +28,8 @@ export class PublicDelegationController {
   constructor(private readonly delegation: DelegationService) {}
 
   @Get(':token')
-  async view(@Param('token') token: string) {
-    return this.delegation.resolve(token);
+  async view(@Param('token') token: string, @Ip() ip: string) {
+    return this.delegation.resolve(token, ip);
   }
 
   @Post(':token/accept')

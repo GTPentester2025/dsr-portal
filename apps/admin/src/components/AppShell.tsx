@@ -11,7 +11,7 @@ const NAV = [
   { path: '#/forms', label: 'Forms & SLAs', icon: 'panelLeft', roles: ['super_admin', 'admin', 'zone_manager'] },
   { path: '#/templates', label: 'Templates', icon: 'file' },
   { path: '#/team', label: 'Team', icon: 'users', roles: ['super_admin', 'admin', 'zone_manager'] },
-  { path: '#/groups', label: 'Groups', icon: 'users', roles: ['super_admin', 'admin', 'zone_manager', 'approver'] },
+  { path: '#/groups', label: 'Groups', icon: 'send', roles: ['super_admin', 'admin', 'zone_manager', 'approver'] },
   { path: '#/migration', label: 'Migration', icon: 'upload', roles: ['super_admin', 'admin', 'zone_manager'] },
   { path: '#/audit', label: 'Audit log', icon: 'shield', roles: ['super_admin', 'admin', 'auditor'] },
   { path: '#/settings', label: 'Settings', icon: 'settings', roles: ['super_admin'] },

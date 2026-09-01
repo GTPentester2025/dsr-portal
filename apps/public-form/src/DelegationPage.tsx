@@ -57,6 +57,11 @@ export function DelegationPage({ token }: { token: string }) {
       setView(await acceptDelegation(token, selectedMember))
     } catch (err) {
       setAcceptError((err as BackendError).message)
+      // Most likely cause: someone else in the group accepted first. Re-sync
+      // to whatever the server now says instead of leaving the page stuck on
+      // a stage that no longer applies -- this reader has no account and no
+      // other way back in than the link they already used.
+      refresh()
     } finally {
       setAccepting(false)
     }
@@ -169,6 +174,16 @@ function DelegationBody({
       </dl>
 
       {view.note && <p className="dsr-delegation-note">{view.note}</p>}
+
+      {/* Covers the case that sent us here: an accept that lost a race
+          against another group member moves the page off the "sent" stage,
+          and the fieldset below (which normally carries this message) no
+          longer renders once that happens. Shown here so the explanation
+          survives the re-sync instead of the screen just changing under
+          them with no reason given. */}
+      {acceptError && view.stage !== 'sent' && (
+        <p className="dsr-delegation-error" role="alert">{acceptError}</p>
+      )}
 
       {view.stage === 'sent' && (
         <fieldset className="dsr-delegation-section">
