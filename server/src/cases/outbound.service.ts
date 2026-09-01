@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Inject,
   Injectable,
   NotFoundException,
@@ -12,6 +13,7 @@ import { WorkflowService } from './workflow.service';
 import { cases, emailLog, templates, users } from '../db/schema';
 import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../crypto/crypto.service';
+import { SOURCE_IMPORT } from './case-source.guard';
 import { EMAIL_PROVIDER, type EmailProvider } from '../email/email-provider.interface';
 
 /** Case response templates + outbound send (spec §10). */
@@ -299,6 +301,18 @@ export class OutboundService {
       if (!row) throw new NotFoundException();
       return row;
     });
+
+    // Checked here as well as at the route. This is the last point before a
+    // message leaves the building, and every send path in the portal passes
+    // through it — a guard one screen forgets is not a guard. Writing to
+    // somebody about a request another system answered years ago is the
+    // failure this refuses.
+    if (c.source === SOURCE_IMPORT) {
+      throw new ForbiddenException(
+        `${c.caseRef} was imported from another system and is kept as a record only. ` +
+          'Nothing is ever sent about an imported case.',
+      );
+    }
 
     // No fallback: boot validation guarantees PRIVACY_MAILBOX is set, and an
     // invented example.com sender on the path that emails data subjects would

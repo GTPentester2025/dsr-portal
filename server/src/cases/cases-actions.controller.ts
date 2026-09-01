@@ -17,6 +17,7 @@ import { AssignmentService } from './assignment.service';
 import { SlaService } from './sla.service';
 import { OutboundService } from './outbound.service';
 import { DashboardService } from './dashboard.service';
+import { CaseSourceGuard } from './case-source.guard';
 
 @Controller('internal')
 @UseGuards(AuthGuard)
@@ -27,11 +28,12 @@ export class CasesActionsController {
     private readonly sla: SlaService,
     private readonly outbound: OutboundService,
     private readonly dashboard: DashboardService,
+    private readonly source: CaseSourceGuard,
   ) {}
 
   @Post('cases/:id/status')
   @Requires('cases.work')
-  changeStatus(
+  async changeStatus(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: {
@@ -40,6 +42,7 @@ export class CasesActionsController {
     },
     @Ip() ip: string,
   ) {
+    await this.source.assertLive(req.zoneCtx, id, 'moved to another status');
     return this.workflow.changeStatus(req.zoneCtx, {
       caseId: id,
       toStatus: body?.toStatus ?? '',
@@ -60,34 +63,37 @@ export class CasesActionsController {
    */
   @Post('cases/:id/report/publish')
   @Requires('cases.work')
-  publishReport(
+  async publishReport(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: { note?: string },
   ) {
+    await this.source.assertLive(req.zoneCtx, id, 'marked as answered');
     return this.workflow.markReportPublished(req.zoneCtx, id, req.user.id, body?.note);
   }
 
   /** Confirmed read by the data subject — a receipt, a reply, or a call. */
   @Post('cases/:id/report/accessed')
   @Requires('cases.work')
-  reportAccessed(
+  async reportAccessed(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: { note?: string },
   ) {
+    await this.source.assertLive(req.zoneCtx, id, 'marked as read');
     return this.workflow.markReportAccessed(req.zoneCtx, id, req.user.id, body?.note);
   }
 
   /** Raise an appeal against a closed case; creates a linked new case. */
   @Post('cases/:id/appeal')
   @Requires('cases.work')
-  appeal(
+  async appeal(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: { reason?: string },
     @Ip() ip: string,
   ) {
+    await this.source.assertLive(req.zoneCtx, id, 'appealed here');
     return this.workflow.openAppeal(req.zoneCtx, {
       caseId: id,
       reason: body?.reason ?? '',
@@ -99,22 +105,24 @@ export class CasesActionsController {
   /** Record the decision on an appeal case. */
   @Post('cases/:id/appeal/decide')
   @Requires('cases.work')
-  decideAppeal(
+  async decideAppeal(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: { status?: string },
   ) {
+    await this.source.assertLive(req.zoneCtx, id, 'decided here');
     return this.workflow.setAppealStatus(req.zoneCtx, id, body?.status ?? '', req.user.id);
   }
 
   @Post('cases/:id/assign')
   @Requires('cases.work')
-  assign(
+  async assign(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: { assigneeId: string; reason?: string },
     @Ip() ip: string,
   ) {
+    await this.source.assertLive(req.zoneCtx, id, 'assigned to somebody');
     return this.assignment.assign(req.zoneCtx, {
       caseId: id,
       assigneeId: body?.assigneeId ?? '',
@@ -127,11 +135,12 @@ export class CasesActionsController {
   /** Grant more time on an open case. Approvers can do this; auditors cannot. */
   @Post('cases/:id/sla/extend')
   @Requires('cases.work')
-  extendSla(
+  async extendSla(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: { value?: number; unit?: 'minutes' | 'hours' | 'days'; justification?: string },
   ) {
+    await this.source.assertLive(req.zoneCtx, id, 'given more time');
     return this.sla.extend(
       req.zoneCtx,
       id,
@@ -146,13 +155,15 @@ export class CasesActionsController {
 
   @Post('cases/:id/sla/pause')
   @Requires('cases.work')
-  pause(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
+  async pause(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
+    await this.source.assertLive(req.zoneCtx, id, 'paused');
     return this.sla.pause(req.zoneCtx, id, req.user.id);
   }
 
   @Post('cases/:id/sla/resume')
   @Requires('cases.work')
-  resume(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
+  async resume(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
+    await this.source.assertLive(req.zoneCtx, id, 'resumed');
     return this.sla.resume(req.zoneCtx, id, req.user.id);
   }
 
@@ -197,7 +208,7 @@ export class CasesActionsController {
 
   @Post('cases/:id/send-email')
   @Requires('cases.work')
-  sendEmail(
+  async sendEmail(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: {
@@ -206,6 +217,9 @@ export class CasesActionsController {
     },
     @Ip() ip: string,
   ) {
+    // The one that matters most: writing to somebody about a request they made
+    // years ago, already answered by a system that no longer runs.
+    await this.source.assertLive(req.zoneCtx, id, 'written to');
     return this.outbound.send(req.zoneCtx, {
       caseId: id,
       to: body?.to ?? [],
@@ -228,11 +242,12 @@ export class CasesActionsController {
    */
   @Post('cases/:id/pending')
   @Requires('cases.work')
-  setPending(
+  async setPending(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: { to?: string[] },
   ) {
+    await this.source.assertLive(req.zoneCtx, id, 'marked as awaiting a reply');
     return this.outbound.markPending(req.zoneCtx, id, body?.to ?? [], req.user.id);
   }
 

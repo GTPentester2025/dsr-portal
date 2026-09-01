@@ -171,3 +171,50 @@ counts and the filename.
   tool. Upload them against the case from the case screen.
 - **Correspondence history.** Emails sent by the other tool are not in the
   export. Record any that matter as an attachment on the case.
+
+## What an imported case is
+
+An imported case is a **record of something another system already handled**.
+It was received, worked and answered elsewhere, and the person who raised it
+has had their reply. This portal keeps it findable, exportable and auditable —
+it does not work it.
+
+Cases raised through the public form are unaffected: they get the whole
+featureset exactly as before.
+
+|  | Imported | Raised in the portal |
+|---|---|---|
+| Shown as | tagged **Imported** in the list and on the case | ordinary case |
+| Email to the requester | **never** | acknowledgement, replies, closure |
+| Status, assignment, SLA clock | refused | full workflow |
+| Report delivery, appeals | refused | available |
+| New attachments | refused | allowed |
+| SLA reminders and escalation | never fire | fire as configured |
+| Changed by | uploading a newer export | working the case |
+| Read, search, export, audit | yes | yes |
+
+### Enforced, not just hidden
+
+The console withholds the controls, but that only prevents the honest mistake
+— it does nothing about a stale tab, a script or a screen added later. The rule
+lives at the server: every mutation route checks `cases.source` first, and the
+send path checks again immediately before a message would leave, because every
+send in the portal passes through that one function.
+
+`cases.source` is set when the row is created and a database trigger refuses
+any change to it, so a case cannot be "unlocked" by editing the column.
+
+### Changing an imported case
+
+Upload a newer export. Rows whose source id is already held **update** the case
+rather than being skipped: status, completion date, the appeal fields and any
+answer that has changed. A row is left alone where the file says nothing, so a
+narrower export cannot blank what a wider one filled in.
+
+The result reports four outcomes — new cases, cases updated, rows that changed
+nothing, and rows that failed — and each update is noted on the case's own
+timeline.
+
+A row whose source id belongs to a case **raised in this portal** fails and is
+reported. An upload can never overwrite a request this portal actually
+received.

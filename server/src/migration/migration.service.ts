@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { desc, eq } from 'drizzle-orm';
 import { DbService, ZoneContext } from '../db/db.module';
+import type { PoolClient } from 'pg';
 import { formVersions } from '../db/schema';
 import { CryptoService } from '../crypto/crypto.service';
 import { AuditService } from '../audit/audit.service';
@@ -242,6 +243,7 @@ export class MigrationService {
     const owners = await this.ownerIndex(record.zone_id);
     const issues: RowIssue[] = [];
     let imported = 0;
+    let updated = 0;
     let skipped = 0;
     let failed = 0;
     let placeholderEmails = 0;
@@ -256,12 +258,27 @@ export class MigrationService {
       try {
         const result = await this.writeCase(record, row, owners, actorId);
         issues.push(...row.issues);
-        if (result.duplicate) {
+        if (result.outcome === 'conflict') {
           issues.push({
             row: row.index,
-            message: `Already imported as ${result.caseRef}`,
+            message:
+              `${result.caseRef} was raised in this portal, not imported — an upload cannot ` +
+              'overwrite it',
+            severity: 'error',
+          });
+          failed++;
+          continue;
+        }
+        if (result.outcome === 'updated') {
+          issues.push({
+            row: row.index,
+            message: `Updated ${result.caseRef} from this upload`,
             severity: 'warning',
           });
+          updated++;
+          continue;
+        }
+        if (result.outcome === 'unchanged') {
           skipped++;
           continue;
         }
@@ -281,9 +298,11 @@ export class MigrationService {
       await client.query(
         `UPDATE case_imports
             SET status = 'committed', mapping = $2, imported = $3, skipped = $4,
-                failed = $5, issues = $6, payload = NULL, committed_at = now()
+                failed = $5, issues = $6, payload = NULL, committed_at = now(),
+                updated = $7
           WHERE id = $1`,
-        [id, JSON.stringify(mapping), imported, skipped, failed, JSON.stringify(issues.slice(0, 2000))],
+        [id, JSON.stringify(mapping), imported, skipped, failed,
+         JSON.stringify(issues.slice(0, 2000)), updated],
       );
     });
 
@@ -298,6 +317,7 @@ export class MigrationService {
         filename: record.filename,
         formKey: record.form_key,
         imported,
+        updated,
         skipped,
         failed,
         placeholderEmails,
@@ -309,7 +329,15 @@ export class MigrationService {
       sourceIp: ip,
     });
 
-    return { ok: true, imported, skipped, failed, placeholderEmails, issues: issues.slice(0, 500) };
+    return {
+      ok: true,
+      imported,
+      updated,
+      skipped,
+      failed,
+      placeholderEmails,
+      issues: issues.slice(0, 500),
+    };
   }
 
   /**
@@ -326,15 +354,44 @@ export class MigrationService {
     row: CoercedRow,
     owners: Map<string, string>,
     actorId: string,
-  ): Promise<{ caseRef: string; duplicate: boolean; placeholderEmail: boolean }> {
+  ): Promise<{
+    caseRef: string;
+    outcome: 'created' | 'updated' | 'unchanged' | 'conflict';
+    placeholderEmail: boolean;
+  }> {
     const props = row.caseProps as Record<string, any>;
     const externalId = props.externalId ? String(props.externalId) : null;
 
     return this.db.system(async (db, client) => {
+      // A row whose source id is already here is not a duplicate to be thrown
+      // away: it is a newer copy of the same record. Re-uploading the export is
+      // the only way an imported case changes — the workflow is closed to
+      // them — so a second upload has to be able to move one from `open` to
+      // `closed`, fill in a completion date, or correct an answer.
+      //
+      // Only ever an imported case. A portal case that somehow carried this id
+      // is left alone and reported: an upload must not be able to overwrite a
+      // request this portal actually received.
       if (externalId) {
-        const seen = await client.query('SELECT case_ref FROM cases WHERE external_id = $1', [externalId]);
-        if (seen.rows[0]) {
-          return { caseRef: seen.rows[0].case_ref as string, duplicate: true, placeholderEmail: false };
+        const seen = await client.query(
+          'SELECT id, case_ref, source FROM cases WHERE external_id = $1',
+          [externalId],
+        );
+        const existing = seen.rows[0];
+        if (existing && existing.source !== 'import') {
+          return {
+            caseRef: existing.case_ref as string,
+            outcome: 'conflict' as const,
+            placeholderEmail: false,
+          };
+        }
+        if (existing) {
+          const changed = await this.updateImportedCase(client, existing.id as string, row, owners);
+          return {
+            caseRef: existing.case_ref as string,
+            outcome: changed ? ('updated' as const) : ('unchanged' as const),
+            placeholderEmail: false,
+          };
         }
       }
 
@@ -488,8 +545,161 @@ export class MigrationService {
         );
       }
 
-      return { caseRef, duplicate: false, placeholderEmail };
+      return { caseRef, outcome: 'created', placeholderEmail };
     });
+  }
+
+  /**
+   * Bring an already-imported case up to date from a newer upload.
+   *
+   * The only way an imported case changes. Its workflow is closed — no status
+   * button, no assignment, no correspondence — because the system that is
+   * actually handling it is the one the export comes from. So a second upload
+   * has to be able to move a case from `open` to `closed`, fill in a
+   * completion date, or correct an answer that was wrong the first time.
+   *
+   * Everything the file asserts is applied; everything it is silent about is
+   * left alone, so a narrower export does not blank fields a wider one filled.
+   * The case reference, its id and its arrival record are never touched — the
+   * case is the same case.
+   *
+   * Returns whether anything actually changed, so an unchanged re-upload is
+   * reported as skipped rather than as a stream of no-op edits.
+   */
+  private async updateImportedCase(
+    client: PoolClient,
+    caseId: string,
+    row: CoercedRow,
+    owners: Map<string, string>,
+  ): Promise<boolean> {
+    const props = row.caseProps as Record<string, any>;
+    const before = (
+      await client.query('SELECT * FROM cases WHERE id = $1', [caseId])
+    ).rows[0];
+
+    const closedAt = props.closedAt ? new Date(String(props.closedAt)) : null;
+    const dueAt = props.dueAt ? new Date(String(props.dueAt)) : null;
+    const ownerId = this.matchOwner(owners, props.assigneeEmail);
+
+    // COALESCE on the parameter, not the column: a null here means the file
+    // said nothing, which must not erase what an earlier upload established.
+    const res = await client.query(
+      `UPDATE cases SET
+         status = COALESCE($2, status),
+         closed_at = COALESCE($3, closed_at),
+         due_at = COALESCE($4, due_at),
+         residency = COALESCE($5, residency),
+         assignee_id = COALESCE($6, assignee_id),
+         completed_after_deadline = COALESCE($7, completed_after_deadline),
+         auto_extended = COALESCE($8, auto_extended),
+         skip_completion_notification = COALESCE($9, skip_completion_notification),
+         can_be_appealed = COALESCE($10, can_be_appealed),
+         can_appeal_until = COALESCE($11, can_appeal_until),
+         is_appeal = COALESCE($12, is_appeal),
+         appeal_status = COALESCE($13, appeal_status),
+         external_request_id = COALESCE($14, external_request_id),
+         report_published_at = CASE WHEN $15::boolean
+           THEN COALESCE(report_published_at, COALESCE($3, now())) ELSE report_published_at END,
+         report_accessed_at = CASE WHEN $16::boolean
+           THEN COALESCE(report_accessed_at, COALESCE($3, now())) ELSE report_accessed_at END,
+         updated_at = now(),
+         imported_at = now()
+       WHERE id = $1 AND source = 'import'
+       RETURNING status, closed_at, due_at, residency, assignee_id,
+                 completed_after_deadline, appeal_status, report_published_at`,
+      [
+        caseId,
+        props.status ?? null,
+        closedAt,
+        dueAt,
+        props.residency ?? null,
+        ownerId,
+        props.completedAfterDeadline ?? (closedAt && dueAt ? closedAt > dueAt : null),
+        props.autoExtended ?? null,
+        props.skipCompletionNotification ?? null,
+        props.canBeAppealed ?? null,
+        props.canAppealUntil ? new Date(String(props.canAppealUntil)) : null,
+        props.isAppeal ?? null,
+        props.appealStatus ?? null,
+        props.externalRequestId ?? null,
+        row.reportPublished,
+        row.reportAccessed,
+      ],
+    );
+    const after = res.rows[0];
+
+    // Answers are replaced key by key rather than wholesale: the upload may
+    // carry fewer columns than the one before it, and dropping the rest would
+    // lose detail this record is the only copy of.
+    let fieldsChanged = false;
+    for (const [key, value] of Object.entries(row.fields)) {
+      if (value === null || value === '') continue;
+      const encrypted = ENCRYPTED_FIELD_KEYS.has(key) && typeof value === 'string';
+      const existing = await client.query(
+        'SELECT value_json, value_enc FROM case_fields WHERE case_id = $1 AND field_key = $2',
+        [caseId, key],
+      );
+      const current = existing.rows[0];
+      if (current) {
+        // Encrypted values re-encrypt to different ciphertext every time, so
+        // they are compared decrypted; anything else would report a change on
+        // every upload.
+        const same = encrypted
+          ? this.safeDecrypt(current.value_enc) === value
+          : JSON.stringify(current.value_json) === JSON.stringify(value);
+        if (same) continue;
+      }
+      await client.query(
+        `INSERT INTO case_fields (case_id, field_key, value_json, value_enc, encrypted)
+         VALUES ($1,$2,$3::jsonb,$4,$5)
+         ON CONFLICT (case_id, field_key) DO UPDATE SET
+           value_json = EXCLUDED.value_json,
+           value_enc = EXCLUDED.value_enc,
+           encrypted = EXCLUDED.encrypted`,
+        [
+          caseId,
+          key,
+          encrypted ? null : JSON.stringify(value),
+          encrypted ? this.crypto.encrypt(value as string) : null,
+          encrypted,
+        ],
+      );
+      fieldsChanged = true;
+    }
+
+    const caseChanged =
+      String(before.status) !== String(after.status) ||
+      String(before.closed_at) !== String(after.closed_at) ||
+      String(before.due_at) !== String(after.due_at) ||
+      String(before.residency) !== String(after.residency) ||
+      String(before.assignee_id) !== String(after.assignee_id) ||
+      String(before.appeal_status) !== String(after.appeal_status) ||
+      String(before.report_published_at) !== String(after.report_published_at);
+
+    if (!caseChanged && !fieldsChanged) return false;
+
+    // The SLA clock follows the status, so a case the upload closes stops
+    // being counted as outstanding.
+    if (after.status === 'closed') {
+      await client.query(
+        `UPDATE sla_clocks SET state = 'stopped' WHERE case_id = $1 AND state <> 'stopped'`,
+        [caseId],
+      );
+    }
+
+    await client.query(
+      `INSERT INTO case_status_history (case_id, from_status, to_status, note)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        caseId,
+        before.status,
+        after.status,
+        before.status === after.status
+          ? 'Updated by a later upload'
+          : `Updated by a later upload: ${before.status} to ${after.status}`,
+      ],
+    );
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -599,6 +809,16 @@ export class MigrationService {
         sample: r.rows.slice(0, 10).map((x: { external_id: string }) => x.external_id),
       };
     });
+  }
+
+  /** An unreadable value must not fail an upload; it just counts as changed. */
+  private safeDecrypt(value: string | null): string | null {
+    if (!value) return null;
+    try {
+      return this.crypto.decrypt(value);
+    } catch {
+      return null;
+    }
   }
 
   /** Portal accounts, indexed by both email and name, for the Owner column. */

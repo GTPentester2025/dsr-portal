@@ -352,6 +352,8 @@ export interface ImportRecord {
 export interface CommitResult {
   ok: true
   imported: number
+  /** Cases already held that this upload changed. */
+  updated: number
   skipped: number
   failed: number
   /** Rows imported against a placeholder address because the file had none. */

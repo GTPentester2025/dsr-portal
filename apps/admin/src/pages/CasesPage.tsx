@@ -203,7 +203,21 @@ export function CasesPage({ me }: { me: Me }) {
 
                   <Td className="align-top">
                     <StatusBadge status={c.status} />
-                    <span className="mt-1 block text-[11px] text-faint">{c.zoneId}</span>
+                    <span className="mt-1 flex items-center gap-1.5 text-[11px] text-faint">
+                      {c.zoneId}
+                      {/* A record from another system, not a case being worked
+                          here. Marked in the list so a queue does not read as
+                          longer than the work in it actually is. */}
+                      {c.source === 'import' && (
+                        <span
+                          title="Imported from another system — kept as a record, not worked here"
+                          className="inline-flex items-center gap-1 rounded px-1 py-px text-[10px] font-medium text-muted ring-1 ring-line"
+                        >
+                          <Icon name="upload" size={9} />
+                          Imported
+                        </span>
+                      )}
+                    </span>
                   </Td>
 
                   <Td className="min-w-0 align-top">

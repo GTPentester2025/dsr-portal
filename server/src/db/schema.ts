@@ -258,7 +258,11 @@ export const caseFields = pgTable(
     valueEnc: text('value_enc'),
     encrypted: boolean('encrypted').notNull().default(false),
   },
-  (t) => [index('case_fields_case_ix').on(t.caseId)],
+  (t) => [
+    index('case_fields_case_ix').on(t.caseId),
+    // One answer per case per field: a re-import upserts on this.
+    uniqueIndex('case_fields_case_key_ux').on(t.caseId, t.fieldKey),
+  ],
 );
 
 /**
@@ -282,6 +286,8 @@ export const caseImports = pgTable(
     status: text('status').notNull().default('analysed'),
     totalRows: integer('total_rows').notNull().default(0),
     imported: integer('imported').notNull().default(0),
+    /** Rows that changed a case already held. */
+    updated: integer('updated').notNull().default(0),
     skipped: integer('skipped').notNull().default(0),
     failed: integer('failed').notNull().default(0),
     /** Header -> target, as confirmed by the operator. */

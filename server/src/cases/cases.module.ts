@@ -18,6 +18,7 @@ import { OutboundService } from './outbound.service';
 import { DashboardService } from './dashboard.service';
 import { AdminUsersController } from '../admin/admin-users.controller';
 import { CryptoService } from '../crypto/crypto.service';
+import { CaseSourceGuard } from './case-source.guard';
 
 @Module({
   imports: [AuthModule, EmailModule],
@@ -31,7 +32,8 @@ import { CryptoService } from '../crypto/crypto.service';
     OutboundService,
     DashboardService,
     CryptoService,
+    CaseSourceGuard,
   ],
-  exports: [CasesService, AssignmentService, SlaService],
+  exports: [CasesService, AssignmentService, SlaService, CaseSourceGuard],
 })
 export class CasesModule {}

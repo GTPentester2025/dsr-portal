@@ -21,6 +21,7 @@ import type { AuthedRequest } from '../auth/auth.guard';
 import { DbService } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
 import { StorageService, MAX_UPLOAD_BYTES } from './storage.service';
+import { CaseSourceGuard } from './case-source.guard';
 
 /**
  * Files held against a case: what the requester sent, and what came back.
@@ -36,6 +37,7 @@ export class AttachmentsController {
     private readonly db: DbService,
     private readonly audit: AuditService,
     private readonly storage: StorageService,
+    private readonly source: CaseSourceGuard,
   ) {}
 
   @Get()
@@ -120,6 +122,9 @@ export class AttachmentsController {
   ) {
     if (!file) throw new BadRequestException('Choose a file to upload');
     const row = await this.assertCaseVisible(req, id);
+    // The file record for an imported case belongs to the system that handled
+    // it. Adding evidence here would create a case file that is half ours.
+    await this.source.assertLive(req.zoneCtx, id, 'added to');
 
     const source = body?.source === 'internal' ? 'internal' : 'response';
     const stored = await this.storage.save({

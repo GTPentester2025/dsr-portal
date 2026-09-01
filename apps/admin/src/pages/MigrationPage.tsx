@@ -272,9 +272,9 @@ export function MigrationPage({ me }: { me: Me }) {
                 hint={ignored ? `${ignored} ignored` : undefined}
               />
               <Stat
-                label="Already imported"
+                label="Already held"
                 value={String(analysis.duplicates.count)}
-                hint={analysis.duplicates.count ? 'will be skipped' : undefined}
+                hint={analysis.duplicates.count ? 'will be updated' : undefined}
               />
             </div>
             <p className="mt-3 text-[11px] text-faint">
@@ -382,8 +382,8 @@ export function MigrationPage({ me }: { me: Me }) {
           <div className="flex flex-wrap items-center justify-end gap-2">
             <Button onClick={discard}>Discard</Button>
             <Button variant="primary" icon="database" loading={busy} onClick={commit}>
-              Import {analysis.totalRows - analysis.errorRows - analysis.duplicates.count} case
-              {analysis.totalRows - analysis.errorRows - analysis.duplicates.count === 1 ? '' : 's'}
+              Import {analysis.totalRows - analysis.errorRows} row
+              {analysis.totalRows - analysis.errorRows === 1 ? '' : 's'}
             </Button>
           </div>
         </div>
@@ -394,20 +394,24 @@ export function MigrationPage({ me }: { me: Me }) {
         <div className="space-y-5">
           <Card title="Import finished">
             <div className="grid gap-3 sm:grid-cols-4">
-              <Stat label="Imported" value={String(result.imported)} />
-              <Stat label="Skipped" value={String(result.skipped)} hint="already present" />
+              <Stat label="New cases" value={String(result.imported)} />
+              <Stat label="Updated" value={String(result.updated)} hint="already held" />
+              <Stat label="Unchanged" value={String(result.skipped)} />
               <Stat label="Failed" value={String(result.failed)} />
-              <Stat label="No email address" value={String(result.placeholderEmails)} />
             </div>
             {result.placeholderEmails > 0 && (
-              <div className="mt-4">
-                <Alert tone="warning" title="Some rows had no email address">
-                  {result.placeholderEmails} case(s) were imported against a placeholder address on
-                  the reserved <span className="mono">import.invalid</span> domain. They are intact
-                  and searchable, but nothing can be sent to them until a real address is recorded.
-                </Alert>
-              </div>
+              <p className="mt-3 text-[11px] text-faint">
+                {result.placeholderEmails} of the new cases had no email address in the file.
+              </p>
             )}
+            <div className="mt-4">
+              <Alert tone="info" title="These cases are records, not work">
+                Imported cases are marked <strong>Imported</strong> throughout the console. They
+                are never written to, never assigned, and never picked up by the SLA engine —
+                the system they came from is the one that handled them. Uploading a newer export
+                is how their status changes.
+              </Alert>
+            </div>
             <div className="mt-4">
               <a href="#/cases" className="text-[13px] font-medium text-brand-ink hover:underline">
                 Go to cases →

@@ -46,7 +46,12 @@ export function CaseDetailPage({ me, caseId }: { me: Me; caseId: string }) {
 
   const due = c.slaClock ? new Date(c.slaClock.dueAt) : c.dueAt ? new Date(c.dueAt) : null
   const daysLeft = due ? Math.ceil((due.getTime() - Date.now()) / 86400000) : null
-  const canAct = me.role !== 'auditor' && c.status !== 'closed'
+  // An imported case is a record of something another system already handled.
+  // Nothing in the workflow applies to it and nothing is ever sent about it,
+  // so every control that would act on it is withheld — the server refuses
+  // these too, this only stops an operator being offered them.
+  const imported = c.source === 'import'
+  const canAct = me.role !== 'auditor' && c.status !== 'closed' && !imported
 
   const slaTone =
     daysLeft === null ? 'neutral' : daysLeft < 0 ? 'danger' : daysLeft <= 3 ? 'warning' : 'positive'
@@ -62,6 +67,11 @@ export function CaseDetailPage({ me, caseId }: { me: Me; caseId: string }) {
           <h1 className="mono text-[19px] font-semibold tracking-tight text-ink">{c.caseRef}</h1>
           <Chip>{c.zoneId}</Chip>
           <StatusBadge status={c.status} />
+          {imported && (
+            <Chip tone="neutral" icon="upload">
+              Imported{c.externalId ? ` · ${c.externalId}` : ''}
+            </Chip>
+          )}
           {c.pendingOn && (
             <Chip
               tone={c.pendingParty === 'customer' ? 'warning' : 'brand'}
@@ -103,6 +113,17 @@ export function CaseDetailPage({ me, caseId }: { me: Me; caseId: string }) {
       {/* minmax(0,1fr) rather than an implicit track: a grid track's automatic
           minimum is its content, which let a long SLA line push the whole page
           sideways on a phone. */}
+      {imported && (
+        <div className="mx-auto mb-4 max-w-6xl">
+          <Alert tone="info" title="Imported record — not worked here">
+            This case was brought in from another system, which received and answered it. It is
+            kept so it can be found, exported and audited. Nothing is ever sent to the requester
+            about it, and its status changes only by uploading a newer export on the{' '}
+            <a href="#/migration" className="font-medium underline">Migration</a> page.
+          </Alert>
+        </div>
+      )}
+
       <div className="mx-auto grid max-w-6xl grid-cols-[minmax(0,1fr)] items-start gap-4 lg:grid-cols-[minmax(0,1fr)_20rem]">
         <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] items-start gap-4">
           {c.slaClock && (
@@ -1392,6 +1413,9 @@ function DeliveryCard({
 
   // Nothing to show or do until a case is decided, unless it is itself an
   // appeal — that is worth surfacing from the moment it is raised.
+  // Delivery and appeals are workflow: an imported case's belong to the system
+  // that handled it, and the facts it carries are already shown above.
+  if (c.source === 'import') return null
   if (c.status !== 'closed' && !c.isAppeal) return null
 
   const act = async (path: string, label: string) => {
