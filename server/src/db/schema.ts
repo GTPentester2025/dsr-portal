@@ -419,6 +419,17 @@ export const caseAttachments = pgTable(
     sha256: text('sha256').notNull(),
     // 'pending' | 'clean' | 'infected' | 'error'
     scanStatus: text('scan_status').notNull().default('pending'),
+    /**
+     * The delegation a delegate upload arrived through.
+     *
+     * A case can be delegated more than once — HR, then Legal — and each
+     * delegation's public page must list only its own files: a filename is
+     * free text chosen by an unauthenticated uploader, so showing one group's
+     * to another is a disclosure over a bearer link. Null for every other kind
+     * of attachment, and for delegate uploads that predate this column, which
+     * therefore belong to no delegation and appear on none.
+     */
+    delegationId: uuid('delegation_id').references(() => caseDelegations.id),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index('case_attachments_case_ix').on(t.caseId)],

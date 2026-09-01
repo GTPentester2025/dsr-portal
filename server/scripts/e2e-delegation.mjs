@@ -77,6 +77,13 @@ function assertNoRequesterData(label, view) {
   }
   for (const [what, value] of [
     ['requester email address', REQ_EMAIL],
+    // First and last separately as well as joined: the joined string is the
+    // only form the payload would carry today, so searching for it alone
+    // would miss a leak that greeted them by first name, reordered the two,
+    // or put them in different fields -- and the point of this assertion is
+    // to survive exactly the convenience that has not been thought of yet.
+    ['requester first name', REQ_FIRST],
+    ['requester last name', REQ_LAST],
     ['requester name', REQ_NAME],
     ['seeded CPF', CPF],
     ['seeded date of birth', DOB],
@@ -177,7 +184,6 @@ check('member 2 (the accepter) resolved', Boolean(member2));
 
 // --- 2. send the case to it --------------------------------------------------
 const noteText = "Please confirm this person's employment dates before we respond.";
-const sentAt = Date.now();
 r = await api('POST', `/internal/cases/${caseId}/delegate`, admin, { groupId, note: noteText });
 check('delegate ok', (r.status === 201 || r.status === 200) && r.data.sentTo === 3, JSON.stringify(r));
 const delegationId = r.data.id;
@@ -204,9 +210,10 @@ const logRows = (
   )
 ).rows;
 check('3 emails recorded in email_log for the send', logRows.length === 3,
-  `found ${logRows.length} -- delegation.service.ts#send() never writes to email_log on a successful ` +
-  `sendTransactional, unlike every other call site (public/intake.service.ts, cases/assignment.service.ts, ` +
-  `cases/outbound.service.ts all insert a row on success; EmailDispatcher only logs failures). Real gap, not a test bug.`);
+  `found ${logRows.length} -- delegation.service.ts#send() writes one email_log row per recipient, ` +
+  `deliberately without body_html because this message's link is a bearer token. Fewer than 3 means a ` +
+  `recipient's send threw or was throttled, in which case EmailDispatcher's guard will have written its ` +
+  `own status='failed' row for that address instead; check email_log.failure_kind and email_send_health.`);
 
 const tokenMatch = /#\/delegation\/([A-Za-z0-9_-]{20,})/.exec(inviteLines[0]?.payload.html ?? '');
 check('token recovered from the invite email', Boolean(tokenMatch));
@@ -231,6 +238,10 @@ r = await pub('POST', `/public/delegation/${token}/accept`, { memberId: member2.
 check('accept ok', r.status === 200 || r.status === 201, JSON.stringify(r));
 check('stage now accepted', r.data?.stage === 'accepted', r.data?.stage);
 check('acceptedBy is member 2', r.data?.acceptedBy === member2.name, r.data?.acceptedBy);
+// accept and upload return the same payload as the GET, from different routes:
+// the guarantee has to hold on all three, not only the one that is easiest to
+// look at.
+assertNoRequesterData('accept response', r.data);
 
 r = await api('GET', `/internal/cases/${caseId}`, admin);
 const namesAccepter = (r.data.history ?? []).some(
@@ -253,6 +264,7 @@ r = await pubUpload(token, realPdf, 'evidence.pdf', 'application/pdf');
 check('real pdf upload ok', r.status === 200 || r.status === 201, JSON.stringify(r));
 check('uploaded file listed on the view', (r.data?.files ?? []).some((f) => f.filename.includes('evidence')),
   JSON.stringify(r.data?.files));
+assertNoRequesterData('upload response', r.data);
 
 const attachRow = (
   await db.query(
@@ -302,7 +314,96 @@ check('view after close -> 200', r.status === 200, JSON.stringify(r));
 check('view says closed', r.data?.stage === 'closed', r.data?.stage);
 assertNoRequesterData('view after close', r.data);
 
-// --- 13. delegate an imported case ------------------------------------------------
+
+// --- 13. a second delegation must not see the first one's files -------------------
+// The real lifecycle, not a contrived one: HR first, closed when they are done,
+// then Legal. Both delegations sit on the same case, so a payload keyed on the
+// case rather than on the delegation hands Legal every filename HR chose -- and
+// a filename is free text, typed by an unauthenticated uploader who was told in
+// the approver's note whose case this is. It runs in the other direction too:
+// HR's link stays live and forwardable in three mailboxes, so a closed
+// delegation that keeps reporting is a channel that never shuts.
+const legalMembers = [{ name: 'Rosa Lindqvist', email: `rosa.legal+${RUN}@example.com` }];
+r = await api('POST', '/internal/groups', admin, {
+  zoneId: 'EUR', name: `E2E Legal Group ${RUN}`,
+  defaultMessage: 'Please check for a legal hold.', members: legalMembers,
+});
+check('second group created', (r.status === 201 || r.status === 200) && Boolean(r.data.id),
+  JSON.stringify(r));
+const legalGroupId = r.data.id;
+
+r = await api('GET', '/internal/groups', admin);
+const legalMemberId = (r.data ?? []).find((g) => g.id === legalGroupId)?.members?.[0]?.id;
+check('second group member resolved', Boolean(legalMemberId));
+
+// Only possible because the first delegation is closed: case_delegations_one_open_ux
+// allows exactly one live delegation per case.
+r = await api('POST', `/internal/cases/${caseId}/delegate`, admin, {
+  groupId: legalGroupId, note: 'Is this record under legal hold?',
+});
+check('second delegate ok', (r.status === 201 || r.status === 200) && r.data.sentTo === 1,
+  JSON.stringify(r));
+
+const legalInvite = emailLines().findLast(
+  (l) => l.payload.templateId === 'delegation-invite' && l.payload.to === legalMembers[0].email,
+);
+check('second invite email captured', Boolean(legalInvite));
+const secondToken = /#\/delegation\/([A-Za-z0-9_-]{20,})/.exec(legalInvite?.payload.html ?? '')?.[1] ?? '';
+check('second token recovered from the invite email', Boolean(secondToken));
+
+// The filename as stored, which is what the payload would actually carry --
+// storage may rewrite what was uploaded.
+const firstFilename = attachRow.filename;
+check('first delegation has a stored filename to look for', Boolean(firstFilename), firstFilename);
+
+r = await pub('GET', `/public/delegation/${secondToken}`);
+check('second delegation view 200', r.status === 200, JSON.stringify(r));
+check('second delegation lists no files at all before anything is sent to it',
+  (r.data?.files ?? []).length === 0, JSON.stringify(r.data?.files));
+check("second delegation does not list the first delegation's upload",
+  !JSON.stringify(r.data?.files ?? []).includes(firstFilename), JSON.stringify(r.data?.files));
+assertNoRequesterData('second delegation view', r.data);
+
+r = await pub('POST', `/public/delegation/${secondToken}/accept`, { memberId: legalMemberId });
+check('second delegation accepted', r.status === 200 || r.status === 201, JSON.stringify(r));
+check("second delegation still shows none of the first's files after accepting",
+  !JSON.stringify(r.data?.files ?? []).includes(firstFilename), JSON.stringify(r.data?.files));
+assertNoRequesterData('second delegation accept response', r.data);
+
+r = await pubUpload(secondToken, realPdf, 'legal-hold-check.pdf', 'application/pdf');
+check('second delegation upload ok', r.status === 200 || r.status === 201, JSON.stringify(r));
+check('second delegation lists its own upload',
+  (r.data?.files ?? []).some((f) => f.filename.includes('legal-hold-check')),
+  JSON.stringify(r.data?.files));
+check("second delegation lists only its own upload",
+  (r.data?.files ?? []).length === 1 &&
+    !JSON.stringify(r.data?.files).includes(firstFilename),
+  JSON.stringify(r.data?.files));
+assertNoRequesterData('second delegation upload response', r.data);
+
+// And back the other way: the closed link still resolves, per spec section 2,
+// but has nothing left to say.
+r = await pub('GET', `/public/delegation/${token}`);
+check('closed delegation still resolves', r.status === 200, JSON.stringify(r));
+check('closed delegation stays closed', r.data?.stage === 'closed', r.data?.stage);
+check('closed delegation reports no files at all', (r.data?.files ?? []).length === 0,
+  JSON.stringify(r.data?.files));
+check("closed delegation does not list the second delegation's upload",
+  !JSON.stringify(r.data?.files ?? []).includes('legal-hold-check'), JSON.stringify(r.data?.files));
+assertNoRequesterData('closed delegation view after a later delegation', r.data);
+
+// Close it so the case is left with no live delegation, the same state the
+// first half of this run started from.
+const secondDelegationId = (
+  await db.query(
+    "SELECT id FROM case_delegations WHERE case_id = $1 AND stage <> 'closed'",
+    [caseId],
+  )
+).rows[0]?.id;
+r = await api('POST', `/internal/cases/${caseId}/delegations/${secondDelegationId}/close`, admin);
+check('second delegation closed', r.status === 200 || r.status === 201, JSON.stringify(r));
+
+// --- 14. delegate an imported case ------------------------------------------------
 const importedRef = `DSR-EUR-IMPORT-${RUN}`;
 const importedRow = await db.query(
   `INSERT INTO cases (case_ref, zone_id, form_key, form_version, request_types,
@@ -315,7 +416,7 @@ const importedCaseId = importedRow.rows[0].id;
 r = await api('POST', `/internal/cases/${importedCaseId}/delegate`, admin, { groupId, note: 'x' });
 check('delegating an imported case -> 403 from CaseSourceGuard', r.status === 403, JSON.stringify(r));
 
-// --- 14. nothing ever sent to the requester --------------------------------------
+// --- 15. nothing ever sent to the requester --------------------------------------
 const sentToRequester = emailLines().some(
   (l) => l.kind === 'transactional' && l.payload.to === REQ_EMAIL && l.payload.templateId !== 'verify-email'
     && l.payload.templateId !== 'submission-ack',

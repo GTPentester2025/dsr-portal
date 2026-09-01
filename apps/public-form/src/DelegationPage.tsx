@@ -163,8 +163,16 @@ function DelegationBody({
           <dt>Type</dt>
           <dd>{view.requestType}</dd>
         </div>
+        {/* Two different people, and the labels used to be swapped: the group
+            is who was asked, not who is asking. Priya in HR opened her link
+            and read "Asked by: HR". Section 8 wants this page to say who is
+            asking, and sentBy is the only field that does. */}
         <div>
           <dt>Asked by</dt>
+          <dd>{view.sentBy}</dd>
+        </div>
+        <div>
+          <dt>Sent to</dt>
           <dd>{view.groupName}</dd>
         </div>
         <div>

@@ -24,6 +24,13 @@ export interface PublicDelegationView {
   requestType: string;
   dueDate: string | null;
   note: string;
+  /**
+   * Who is asking: the case's owner, by name. The same value the invite email
+   * opens with, so the page and the email agree about who to reply to. A
+   * portal operator's own name, never anything belonging to the requester.
+   */
+  sentBy: string;
+  /** Who was asked: the group the link went to. */
   groupName: string;
   stage: DelegationStage;
   acceptedBy: string | null;
@@ -245,12 +252,28 @@ export class DelegationService {
    * happens to carry the same shape.
    */
   private async buildView(d: Awaited<ReturnType<DelegationService['load']>>): Promise<PublicDelegationView> {
-    const files = await this.db.system(async (_db, client) => {
+    // Scoped to this delegation, and to nothing at all once it is closed.
+    //
+    // Keyed on the case instead, as it was, this listed every delegate upload
+    // the case had ever received. The lifecycle is send to HR, close, send to
+    // Legal -- so Legal's link listed the filenames HR chose, and HR's
+    // closed-but-still-resolvable link went on listing Legal's. A filename is
+    // free text typed by an unauthenticated uploader who was told in the note
+    // who the case is about, so that is one group's writing carried to another
+    // over a bearer token: the one thing section 5 says this link never does.
+    //
+    // A closed delegation returns nothing rather than its own files. It
+    // permits no action, so it has nothing left to report, and the link stays
+    // live and forwardable in three mailboxes indefinitely.
+    //
+    // delegation_id is NULL on delegate uploads that predate the column, so
+    // they belong to no delegation and appear on none rather than on all.
+    const files = d.stage === 'closed' ? [] : await this.db.system(async (_db, client) => {
       const r = await client.query(
         `SELECT filename, created_at FROM case_attachments
-          WHERE case_id = $1 AND source = 'delegate'
+          WHERE delegation_id = $1 AND source = 'delegate'
           ORDER BY created_at`,
-        [d.case_id],
+        [d.id],
       );
       return r.rows as { filename: string; created_at: string }[];
     });
@@ -268,6 +291,7 @@ export class DelegationService {
       requestType: (d.request_types ?? []).join(', ') || 'not stated',
       dueDate: d.due_at ? new Date(d.due_at).toISOString().slice(0, 10) : null,
       note: d.note,
+      sentBy: d.sent_by,
       groupName: d.group_name,
       stage: d.stage as DelegationStage,
       acceptedBy: d.accepted_by ?? null,
@@ -349,14 +373,18 @@ export class DelegationService {
 
     await this.db.system(async (_db, client) => {
       await client.query(
+        // delegation_id, not only case_id: a case can be delegated more than
+        // once, and each delegation's page may list only the files that
+        // arrived through it.
         `INSERT INTO case_attachments
            (case_id, zone_id, case_ref, filename, mime_type, size_bytes, storage_key,
-            sha256, scan_status, source, note)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'clean','delegate',$9)`,
+            sha256, scan_status, source, note, delegation_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'clean','delegate',$9,$10)`,
         [
           d.case_id, d.zone_id, d.case_ref, stored.filename, stored.mimeType,
           stored.sizeBytes, stored.storageKey, stored.sha256,
           `Sent by ${d.accepted_by ?? 'a member'} (${d.group_name})`,
+          d.id,
         ],
       );
       await client.query(
@@ -397,13 +425,18 @@ export class DelegationService {
     const hash = this.crypto.sha256Hex(token);
     const row = await this.db.system(async (_db, client) => {
       const r = await client.query(
+        // sent_by is the case owner's name, resolved exactly as caseContext()
+        // resolves from_name for the invite email, so the page names the same
+        // person the email did. It is a portal operator, not the requester.
         `SELECT d.id, d.case_id, d.group_id, d.zone_id, d.stage, d.note,
                 c.case_ref, c.request_types, c.due_at,
-                g.name AS group_name, COALESCE(d.accepted_by_name, m.name) AS accepted_by
+                g.name AS group_name, COALESCE(d.accepted_by_name, m.name) AS accepted_by,
+                COALESCE(owner.name, 'The privacy team') AS sent_by
            FROM case_delegations d
            JOIN cases c ON c.id = d.case_id
            JOIN case_groups g ON g.id = d.group_id
       LEFT JOIN case_group_members m ON m.id = d.accepted_by_member_id
+      LEFT JOIN users owner ON owner.id = c.assignee_id
           WHERE d.token_hash = $1`,
         [hash],
       );

@@ -86,6 +86,9 @@ export interface DelegationView {
   requestType: string
   dueDate: string | null
   note: string
+  /** The case owner's name -- who is asking. Never the requester. */
+  sentBy: string
+  /** The group the link was sent to -- who was asked. */
   groupName: string
   stage: DelegationStage
   acceptedBy: string | null

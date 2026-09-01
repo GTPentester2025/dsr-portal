@@ -73,15 +73,45 @@ export class DelegationRateGuard implements CanActivate {
     const token = (req.params?.token as string | undefined) ?? '';
     const tokenHash = this.crypto.sha256Hex(token);
 
-    const [tokenOk, ipOk] = await Promise.all([
-      this.rate.consume(`delegation:${budget.name}:token:${tokenHash}`, budget.tokenLimit),
-      this.rate.consume(`delegation:${budget.name}:ip:${req.ip}`, budget.ipLimit),
-    ]);
-
-    if (!tokenOk || !ipOk) {
+    // Sequential rather than Promise.all: each consume is its own write with
+    // no transaction spanning the pair, so running them together spends the
+    // token's budget even on a request the IP budget was always going to
+    // reject. Whichever limit is reached first stops the request and the other
+    // is left untouched.
+    if (!(await this.consume(`delegation:${budget.name}:token:${tokenHash}`, budget.tokenLimit))) {
+      throw new HttpException('Too many attempts. Try again shortly.', HttpStatus.TOO_MANY_REQUESTS);
+    }
+    if (!(await this.consume(`delegation:${budget.name}:ip:${req.ip}`, budget.ipLimit))) {
       throw new HttpException('Too many attempts. Try again shortly.', HttpStatus.TOO_MANY_REQUESTS);
     }
     return true;
+  }
+
+  /**
+   * Spend one unit of a budget, or fail open.
+   *
+   * `RateLimitService.consume` is an `INSERT ... ON CONFLICT` — a write, on
+   * every public request, the plain `GET` that only reads a page included.
+   * Unhandled, any database trouble there becomes a 500 on every delegation
+   * link at once, for people who have no account and nobody to ask. Section 2
+   * of the design is explicit that even a dead link must resolve to a page
+   * that explains itself "rather than a 404"; a generic 500 is worse than
+   * either.
+   *
+   * So a limiter that cannot reach its counters lets the request through and
+   * says so in the log. A brief unlimited window is the smaller risk here:
+   * what a link can actually do is bounded by the delegation's stage, not by
+   * this. The key is logged, not the token — it carries the SHA-256.
+   */
+  private async consume(key: string, limit: number): Promise<boolean> {
+    try {
+      return await this.rate.consume(key, limit);
+    } catch (err) {
+      this.log.error(
+        `rate limit unavailable for ${key}; letting the request through: ${(err as Error).message}`,
+      );
+      return true;
+    }
   }
 
   private budgetFor(req: Request): RouteBudget {
