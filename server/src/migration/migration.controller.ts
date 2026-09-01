@@ -66,15 +66,17 @@ export class MigrationController {
   ) {
     if (!file) throw new BadRequestException('Choose a CSV file to import');
     const zoneId = (body?.zoneId ?? '').trim();
-    const formKey = (body?.formKey ?? '').trim();
-    if (!formKey) throw new BadRequestException('Choose which form these cases were submitted on');
     this.assertZone(req, zoneId);
 
+    // The form is worked out from the file. `formKey` stays accepted as an
+    // override for an API caller that already knows, but the console does not
+    // send one: asking an operator to name a schema from somebody else's
+    // spreadsheet is a question the file answers better than they can.
     return this.migration.analyse({
       buffer: file.buffer,
       filename: file.originalname,
       zoneId,
-      formKey,
+      formKey: (body?.formKey ?? '').trim() || undefined,
       actorId: req.user.id,
       ip,
     });

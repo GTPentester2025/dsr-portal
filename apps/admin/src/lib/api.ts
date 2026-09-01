@@ -306,7 +306,9 @@ export interface ImportAnalysis {
   id: string
   filename: string
   zoneId: string
+  /** The zone's import schema, not a country form the operator picked. */
   formKey: string
+  formName: string
   formVersion: number
   encoding: string
   delimiter: string

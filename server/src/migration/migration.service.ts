@@ -5,7 +5,7 @@ import { formVersions } from '../db/schema';
 import { CryptoService } from '../crypto/crypto.service';
 import { AuditService } from '../audit/audit.service';
 import { ENCRYPTED_FIELD_KEYS } from '../crypto/pii-fields';
-import { collectInputs } from '../public/form-validation';
+import { collectInputs, type Component } from '../public/form-validation';
 import {
   CASE_TARGETS,
   type ColumnProposal,
@@ -21,6 +21,7 @@ import {
   parseDelimited,
   proposeMapping,
 } from './csv-import';
+import { buildZoneImportSchema, canonicalJson, importFormKey } from './import-form';
 
 /**
  * Ceilings on a single upload. Both are about keeping one click from taking
@@ -59,7 +60,8 @@ export class MigrationService {
     buffer: Buffer;
     filename: string;
     zoneId: string;
-    formKey: string;
+    /** Optional override; normally worked out from the file itself. */
+    formKey?: string;
     actorId: string;
     ip?: string;
   }) {
@@ -84,7 +86,9 @@ export class MigrationService {
       );
     }
 
-    const { form, version } = await this.loadForm(args.formKey, args.zoneId);
+    const { form, version, formKey, formName } = args.formKey
+      ? await this.loadForm(args.formKey, args.zoneId)
+      : await this.zoneImportForm(args.zoneId);
     const proposals = proposeMapping(file, form);
 
     // Date order is sniffed across every column proposed as a date, not just
@@ -113,7 +117,7 @@ export class MigrationService {
         [
           args.filename,
           args.zoneId,
-          args.formKey,
+          formKey,
           version,
           file.rows.length,
           JSON.stringify(mapping),
@@ -138,6 +142,7 @@ export class MigrationService {
         columns: file.headers.length,
         encoding,
         delimiter: file.delimiter,
+        formKey,
       },
       sourceIp: args.ip,
     });
@@ -146,7 +151,8 @@ export class MigrationService {
       id: record.id,
       filename: args.filename,
       zoneId: args.zoneId,
-      formKey: args.formKey,
+      formKey,
+      formName,
       formVersion: version,
       encoding,
       delimiter: file.delimiter,
@@ -605,7 +611,7 @@ export class MigrationService {
     return owners.get(raw.trim().toLowerCase()) ?? null;
   }
 
-  private async loadForm(formKey: string, zoneId: string) {
+  private async loadForm(formKey: string, zoneId: string): Promise<LoadedForm> {
     const version = await this.db.system((db) =>
       db.query.formVersions.findFirst({
         where: eq(formVersions.formKey, formKey),
@@ -616,9 +622,78 @@ export class MigrationService {
     if (version.zoneId !== zoneId) {
       throw new BadRequestException(`Form ${formKey} belongs to zone ${version.zoneId}, not ${zoneId}`);
     }
+    const schema = version.schema as { name?: string };
     return {
       form: indexForm(version.schema as never, collectInputs),
       version: version.version,
+      formKey,
+      formName: schema?.name ?? formKey,
+    };
+  }
+
+  /**
+   * The form imported cases are recorded against, published on demand.
+   *
+   * Not one of the zone's country forms: within a zone they are
+   * field-identical down to the wording of the request types, so nothing in a
+   * CSV says whether a case is Brazilian or Argentine, and stamping every
+   * imported case with a country it may not be from would put a false fact on
+   * a compliance record. The zone gets one form of its own instead, the union
+   * of what its country forms collect.
+   *
+   * Republished only when the union actually changes, so re-importing does not
+   * pile up versions.
+   */
+  private async zoneImportForm(zoneId: string): Promise<LoadedForm> {
+    const formKey = importFormKey(zoneId);
+    const sources = await this.db.system(async (_db, client) => {
+      const r = await client.query(
+        `SELECT DISTINCT ON (form_key) form_key, schema
+           FROM form_versions
+          WHERE zone_id = $1 AND form_key <> $2
+          ORDER BY form_key, version DESC`,
+        [zoneId, formKey],
+      );
+      return r.rows as { form_key: string; schema: { components?: Component[] } }[];
+    });
+    if (sources.length === 0) {
+      throw new BadRequestException(`No forms are published for zone ${zoneId}`);
+    }
+
+    const schema = buildZoneImportSchema(
+      zoneId,
+      sources.map((r) => ({ formKey: r.form_key, schema: r.schema })),
+      collectInputs,
+    );
+
+    const version = await this.db.system(async (_db, client) => {
+      const current = await client.query(
+        `SELECT version, schema FROM form_versions
+          WHERE form_key = $1 ORDER BY version DESC LIMIT 1`,
+        [formKey],
+      );
+      const latest = current.rows[0];
+      // Canonical on both sides: jsonb hands the schema back with its own key
+      // order, so a plain stringify comparison never matches and every import
+      // would publish another version of an unchanged schema.
+      if (latest && canonicalJson(latest.schema) === canonicalJson(schema)) {
+        return latest.version as number;
+      }
+      const next = latest ? Number(latest.version) + 1 : 1;
+      await client.query(
+        `INSERT INTO form_versions (form_key, zone_id, version, schema)
+         VALUES ($1, $2, $3, $4::jsonb)
+         ON CONFLICT (form_key, version) DO NOTHING`,
+        [formKey, zoneId, next, JSON.stringify(schema)],
+      );
+      return next;
+    });
+
+    return {
+      form: indexForm(schema as never, collectInputs),
+      version,
+      formKey,
+      formName: schema.name,
     };
   }
 
@@ -654,6 +729,14 @@ export class MigrationService {
   private ctxFor(zoneId: string): ZoneContext {
     return { role: 'system', zone: zoneId };
   }
+}
+
+/** A form resolved for an import, and how sure we are it is the right one. */
+interface LoadedForm {
+  form: FormIndex;
+  version: number;
+  formKey: string;
+  formName: string;
 }
 
 interface ImportRecord {

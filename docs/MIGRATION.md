@@ -14,27 +14,37 @@ import silently.
   importer does not open it. Excel's *Save As → CSV UTF-8* is fine; so is a
   plain `Save As → CSV`, which usually writes the Windows code page. Both are
   read correctly.
-- **Know which form the cases came from.** Column headings are matched against
-  that form's field labels, and request-type wording against its options, so
-  `CPF` finds `cpf_brazil` and *"Ter acesso aos meus dados pessoais"* becomes
-  `access`. The form also fixes the zone.
+- **Know which zone the cases belong to.** That is the only thing you are
+  asked. Which of the zone's forms the export came from is worked out from the
+  file — see below.
 - Limits are **25 MB** and **20,000 rows** per file. Split anything larger; the
   imports are independent and can be run back to back.
 
 ## Step 1 — analyse
 
-Choose the zone and form, pick the file, and press **Read the file**. Nothing
-is written to the case tables at this point.
+Choose the zone, pick the file, and press **Read the file**. Nothing is
+written to the case tables at this point.
 
-The result shows:
+### Which form the cases are recorded against
 
-| What | Why it matters |
-|---|---|
-| Encoding and delimiter | Confirms the file was read as you expect. Comma, semicolon, tab and pipe are all detected. |
-| Date order | See below. This is the one to check. |
-| Column mapping | Every column and where it will land. |
-| Preview | The first ten rows exactly as they would be written. |
-| Already imported | Rows whose source id is already in the database. |
+You are not asked, because the question has no answer. Within a zone the
+country forms are field-identical — SAZ's six agree down to the wording of
+every request type, and all of them carry `cpf_brazil` — so nothing in a CSV
+distinguishes a Brazilian case from an Argentine one.
+
+Rather than pick one and have every imported case claim a country it may not
+be from, each zone has **one form of its own for imports**: `saz-import`,
+`eur-import`, `maz-import`. It is the union of every field the zone's country
+forms collect, generated on first use and regenerated whenever those forms
+change. Because the fields are the same either way, a case renders exactly as
+it would have against the country form the requester actually filled in.
+
+Where the zone's forms label the same field differently — MAZ words
+`requestDetails` three ways — the field key is used as the label instead of
+picking one country's wording for another country's case.
+
+These schemas are not intake forms: they never appear in the public form list
+or the forms editor, and nobody fills one in.
 
 ### Date order
 

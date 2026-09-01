@@ -100,9 +100,14 @@ export class FormsService {
     // to the caller's own zone afterwards. These rows are configuration, not
     // case data.
     return this.db.system(async (_db, client) => {
+      // The per-zone import schemas are excluded. They are not intake forms:
+      // nobody fills one in, the public manifest must not offer one, and the
+      // builder must not invite anyone to edit one — they are generated from
+      // the country forms and regenerated whenever those change.
       const res = await client.query(`
         SELECT DISTINCT ON (form_key) form_key, zone_id, version, schema, imported_at
           FROM form_versions
+         WHERE form_key NOT LIKE '%-import'
          ORDER BY form_key, version DESC
       `);
       return res.rows.map((r) => ({

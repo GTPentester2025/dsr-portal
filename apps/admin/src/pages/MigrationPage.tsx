@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ApiError, ZONES, api,
   type ColumnProposal, type CommitResult, type ImportAnalysis, type ImportRecord,
@@ -10,7 +10,6 @@ import {
 } from '../components/ui'
 import { Icon } from '../components/Icon'
 import { useToast } from '../components/Toast'
-import type { FormSummary } from './FormsPage'
 
 /**
  * Bringing case history over from another DSR tool.
@@ -66,10 +65,8 @@ export function MigrationPage({ me }: { me: Me }) {
   const toast = useToast()
   const fileInput = useRef<HTMLInputElement>(null)
 
-  const [forms, setForms] = useState<FormSummary[] | null>(null)
   const [history, setHistory] = useState<ImportRecord[] | null>(null)
   const [zoneId, setZoneId] = useState(me.zoneId ?? 'EUR')
-  const [formKey, setFormKey] = useState('')
   const [file, setFile] = useState<File | null>(null)
 
   const [step, setStep] = useState<Step>('upload')
@@ -85,23 +82,10 @@ export function MigrationPage({ me }: { me: Me }) {
     api.get<ImportRecord[]>('/internal/migration/imports').then(setHistory).catch(() => setHistory([]))
   }, [])
 
-  useEffect(() => {
-    api.get<FormSummary[]>('/internal/forms').then(setForms).catch((e) => setError(String(e)))
-    loadHistory()
-  }, [loadHistory])
+  useEffect(loadHistory, [loadHistory])
 
-  // A zone manager has exactly one zone; nobody else should be able to pick a
-  // form that belongs somewhere other than the zone they chose.
+  // A zone manager has exactly one zone and cannot import into another.
   const zonesAvailable = me.role === 'zone_manager' && me.zoneId ? [me.zoneId] : [...ZONES]
-  const formsInZone = useMemo(
-    () => (forms ?? []).filter((f) => f.zone === zoneId),
-    [forms, zoneId],
-  )
-  useEffect(() => {
-    if (formsInZone.length && !formsInZone.some((f) => f.key === formKey)) {
-      setFormKey(formsInZone[0].key)
-    }
-  }, [formsInZone, formKey])
 
   async function analyse() {
     if (!file) return
@@ -111,7 +95,6 @@ export function MigrationPage({ me }: { me: Me }) {
       const form = new FormData()
       form.append('file', file)
       form.append('zoneId', zoneId)
-      form.append('formKey', formKey)
       const res = await api.upload<ImportAnalysis>('/internal/migration/analyse', form)
       setAnalysis(res)
       setMapping(Object.fromEntries(res.columns.map((c) => [c.header, c.target])))
@@ -219,32 +202,18 @@ export function MigrationPage({ me }: { me: Me }) {
             title="Upload an export"
             subtitle="A CSV of cases. Save an .xlsx as CSV first — the importer reads text, not the compressed spreadsheet format."
           >
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field
-                label="Zone"
-                hint="Which zone these cases belong to. Their references are issued in this zone's sequence."
+            <Field
+              label="Zone"
+              hint="Which zone these cases belong to. Their references are issued in this zone's sequence; which form they came from is worked out from the file."
+            >
+              <Select
+                value={zoneId}
+                onChange={(e) => setZoneId(e.target.value)}
+                disabled={zonesAvailable.length === 1}
               >
-                <Select
-                  value={zoneId}
-                  onChange={(e) => setZoneId(e.target.value)}
-                  disabled={zonesAvailable.length === 1}
-                >
-                  {zonesAvailable.map((z) => <option key={z} value={z}>{z}</option>)}
-                </Select>
-              </Field>
-
-              <Field
-                label="Form"
-                hint="Used to match column headings to fields and request-type wording to codes."
-              >
-                <Select value={formKey} onChange={(e) => setFormKey(e.target.value)}>
-                  {formsInZone.length === 0 && <option value="">No forms in this zone</option>}
-                  {formsInZone.map((f) => (
-                    <option key={f.key} value={f.key}>{f.name} (v{f.version})</option>
-                  ))}
-                </Select>
-              </Field>
-            </div>
+                {zonesAvailable.map((z) => <option key={z} value={z}>{z}</option>)}
+              </Select>
+            </Field>
 
             <div className="mt-4">
               <label
@@ -278,7 +247,7 @@ export function MigrationPage({ me }: { me: Me }) {
                 variant="primary"
                 icon="arrowUpRight"
                 loading={busy}
-                disabled={!file || !formKey}
+                disabled={!file}
                 onClick={analyse}
               >
                 Read the file
@@ -311,8 +280,10 @@ export function MigrationPage({ me }: { me: Me }) {
             <p className="mt-3 text-[11px] text-faint">
               Read as {analysis.encoding}, delimiter{' '}
               <span className="mono">{analysis.delimiter === '\t' ? 'tab' : analysis.delimiter}</span>.
-              Cases will be created on <span className="mono">{analysis.formKey}</span> v
-              {analysis.formVersion} in {analysis.zoneId}.
+              Cases will be created in {analysis.zoneId} against{' '}
+              <strong className="text-muted">{analysis.formName}</strong>{' '}
+              (<span className="mono">{analysis.formKey}</span> v{analysis.formVersion}) — the
+              zone&rsquo;s import schema, which collects every field its country forms do.
             </p>
           </Card>
 
