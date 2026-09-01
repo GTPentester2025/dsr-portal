@@ -114,6 +114,11 @@ export class GroupsService {
     if (members && members.length === 0) {
       throw new BadRequestException('A group with nobody in it cannot be sent anything');
     }
+    let name: string | null = null;
+    if (patch.name !== undefined) {
+      name = patch.name.trim();
+      if (!name) throw new BadRequestException('The group needs a name');
+    }
 
     await this.db.withContext(ctx, async (_db, client) => {
       await client.query(
@@ -122,18 +127,49 @@ export class GroupsService {
            default_message = COALESCE($3, default_message),
            active = COALESCE($4, active)
          WHERE id = $1`,
-        [id, patch.name?.trim() ?? null, patch.defaultMessage ?? null, patch.active ?? null],
+        [id, name, patch.defaultMessage ?? null, patch.active ?? null],
       );
       if (members) {
-        // Replaced wholesale: the screen edits the list as a list, and a
-        // member removed there has to actually go, or they keep receiving
-        // invitations nobody meant to send them.
-        await client.query('DELETE FROM case_group_members WHERE group_id = $1', [id]);
+        // Diffed against what is there now, matched on lowercased email --
+        // the same key as case_group_members_group_email_ux -- rather than
+        // replaced wholesale. A delegation can hold accepted_by_member_id
+        // pointing at a member row; an edit that has nothing to do with that
+        // member must not delete and reinsert them under a fresh id, or it
+        // trips the foreign key the moment any delegation has been accepted.
+        // A member removed from the incoming list still actually goes, so
+        // they stop receiving invitations nobody meant to send them.
+        const existing = await client.query(
+          'SELECT id, name, email FROM case_group_members WHERE group_id = $1',
+          [id],
+        );
+        const existingByEmail = new Map<string, { id: string; name: string; email: string }>(
+          existing.rows.map((r: { id: string; name: string; email: string }) => [
+            r.email.toLowerCase(),
+            r,
+          ]),
+        );
+        const incomingEmails = new Set(members.map((m) => m.email));
+
         for (const m of members) {
-          await client.query(
-            'INSERT INTO case_group_members (group_id, name, email) VALUES ($1,$2,$3)',
-            [id, m.name, m.email],
-          );
+          const match = existingByEmail.get(m.email);
+          if (match) {
+            if (match.name !== m.name) {
+              await client.query('UPDATE case_group_members SET name = $2 WHERE id = $1', [
+                match.id,
+                m.name,
+              ]);
+            }
+          } else {
+            await client.query(
+              'INSERT INTO case_group_members (group_id, name, email) VALUES ($1,$2,$3)',
+              [id, m.name, m.email],
+            );
+          }
+        }
+        for (const row of existing.rows as { id: string; email: string }[]) {
+          if (!incomingEmails.has(row.email.toLowerCase())) {
+            await client.query('DELETE FROM case_group_members WHERE id = $1', [row.id]);
+          }
         }
       }
     });

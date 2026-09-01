@@ -355,6 +355,8 @@ export const caseDelegations = pgTable(
     stage: text('stage').notNull().default('sent'),
     note: text('note').notNull().default(''),
     acceptedByMemberId: uuid('accepted_by_member_id').references(() => caseGroupMembers.id),
+    /** Snapshot of the accepting member's name; survives the row above being nulled. */
+    acceptedByName: text('accepted_by_name'),
     acceptedAt: timestamp('accepted_at', { withTimezone: true }),
     closedAt: timestamp('closed_at', { withTimezone: true }),
     closedBy: uuid('closed_by').references(() => users.id),
