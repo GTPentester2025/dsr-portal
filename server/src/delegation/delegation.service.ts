@@ -82,12 +82,27 @@ export class DelegationService {
           `This case is already with ${open.rows[0].name}. Finish that first.`,
         );
       }
-      const r = await client.query(
-        `INSERT INTO case_delegations (case_id, group_id, zone_id, token_hash, note, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-        [args.caseId, args.groupId, row.zoneId, tokenHash, args.note ?? '', args.actorId],
-      );
-      return r.rows[0].id as string;
+      // The SELECT above takes no lock, so two concurrent sends for the same
+      // case can both see "none open" and both reach this INSERT. The partial
+      // unique index (case_delegations_one_open_ux) is what actually decides
+      // in that race; catch its violation and turn it into the same friendly
+      // message rather than letting the raw Postgres error escape as a 500.
+      try {
+        const r = await client.query(
+          `INSERT INTO case_delegations (case_id, group_id, zone_id, token_hash, note, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [args.caseId, args.groupId, row.zoneId, tokenHash, args.note ?? '', args.actorId],
+        );
+        return r.rows[0].id as string;
+      } catch (err) {
+        if (
+          (err as { code?: string; constraint?: string }).code === '23505' &&
+          (err as { constraint?: string }).constraint === 'case_delegations_one_open_ux'
+        ) {
+          throw new BadRequestException('This case is already with a group. Finish that first.');
+        }
+        throw err;
+      }
     });
 
     const context = await this.caseContext(args.caseId);
