@@ -61,6 +61,14 @@ The **Migration** page uploads a CSV export from an existing privacy tool and
 creates the cases here — column mapping and date order are proposed, shown, and
 confirmed before anything is written. See [docs/MIGRATION.md](docs/MIGRATION.md).
 
+## Sending a case to people with no account
+
+**Delegation** sends a case to a named group of outsiders (HR, Legal, whoever
+the request needs) with one emailed link; a member accepts it, uploads PDFs
+that land in the case file, and the approver ends it when they have what they
+need — with ownership, the queue and the SLA clock never moving. See
+[docs/DELEGATION.md](docs/DELEGATION.md).
+
 ## Architecture decisions (deviations from the spec's suggestions)
 
 - **12 forms, not 3.** The source estate is 2 EUR + 6 SAZ + 4 MAZ country
