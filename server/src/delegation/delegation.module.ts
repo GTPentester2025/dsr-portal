@@ -7,10 +7,12 @@ import { StorageService } from '../cases/storage.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { RateLimitService } from '../public/rate-limit.service';
 import { DelegationService } from './delegation.service';
+import { DelegationController } from './delegation.controller';
+import { PublicDelegationController } from './public-delegation.controller';
 
 @Module({
   imports: [AuthModule, CasesModule, EmailModule],
-  controllers: [],
+  controllers: [DelegationController, PublicDelegationController],
   providers: [GroupsService, StorageService, CryptoService, RateLimitService, DelegationService],
 })
 export class DelegationModule {}
