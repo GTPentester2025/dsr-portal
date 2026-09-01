@@ -118,7 +118,9 @@ export function CaseDetailPage({ me, caseId }: { me: Me; caseId: string }) {
           <Alert tone="info" title="Imported record — not worked here">
             This case was brought in from another system, which received and answered it. It is
             kept so it can be found, exported and audited. Nothing is ever sent to the requester
-            about it, and its status changes only by uploading a newer export on the{' '}
+            about it, and its status is whatever the export said
+            {c.sourceStatus ? <> — <span className="mono">{c.sourceStatus}</span></> : null}, changing
+            only by uploading a newer export on the{' '}
             <a href="#/migration" className="font-medium underline">Migration</a> page.
           </Alert>
         </div>

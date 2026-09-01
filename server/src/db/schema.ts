@@ -231,6 +231,8 @@ export const cases = pgTable(
     appealStatus: text('appeal_status'),
     /** 'portal' | 'import'. Imported cases never trigger requester email. */
     source: text('source').notNull().default('portal'),
+    /** Imported cases: the progress value exactly as the source export wrote it. */
+    sourceStatus: text('source_status'),
     /** Identifiers the case carried in the tool it was migrated from. */
     externalId: text('external_id'),
     externalRequestId: text('external_request_id'),

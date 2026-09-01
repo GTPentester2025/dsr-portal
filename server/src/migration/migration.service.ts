@@ -445,9 +445,9 @@ export class MigrationService {
             auto_extended, report_published_at, report_accessed_at,
             can_be_appealed, can_appeal_until, is_appeal, appeal_status,
             source, external_id, external_request_id, imported_at,
-            unassigned_escalated_at)
+            unassigned_escalated_at, source_status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13,$14,$15,$16,$17,$18,$19,
-                 $20,$21,$22,$23,'import',$24,$25,now(),now())
+                 $20,$21,$22,$23,'import',$24,$25,now(),now(),$26)
          RETURNING id`,
         [
           caseRef,
@@ -476,6 +476,7 @@ export class MigrationService {
           props.appealStatus ?? null,
           externalId,
           props.externalRequestId ?? null,
+          row.sourceStatus,
         ],
       );
       const caseId = inserted.rows[0].id as string;
@@ -533,15 +534,8 @@ export class MigrationService {
           `INSERT INTO sla_clocks
              (case_id, policy_id, started_at, due_at, original_due_at, state,
               fired_thresholds, escalated_at)
-           VALUES ($1,$2,$3,$4,$4,$5,$6::jsonb,now())`,
-          [
-            caseId,
-            policy.id,
-            createdAt,
-            dueAt,
-            status === 'closed' ? 'stopped' : 'running',
-            JSON.stringify([0.75, 0.9, 1]),
-          ],
+           VALUES ($1,$2,$3,$4,$4,'stopped',$5::jsonb,now())`,
+          [caseId, policy.id, createdAt, dueAt, JSON.stringify([0.75, 0.9, 1])],
         );
       }
 
@@ -598,6 +592,7 @@ export class MigrationService {
          is_appeal = COALESCE($12, is_appeal),
          appeal_status = COALESCE($13, appeal_status),
          external_request_id = COALESCE($14, external_request_id),
+         source_status = COALESCE($17, source_status),
          report_published_at = CASE WHEN $15::boolean
            THEN COALESCE(report_published_at, COALESCE($3, now())) ELSE report_published_at END,
          report_accessed_at = CASE WHEN $16::boolean
@@ -624,6 +619,7 @@ export class MigrationService {
         props.externalRequestId ?? null,
         row.reportPublished,
         row.reportAccessed,
+        row.sourceStatus,
       ],
     );
     const after = res.rows[0];

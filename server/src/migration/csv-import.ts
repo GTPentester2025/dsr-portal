@@ -347,10 +347,10 @@ const PROGRESS_MAP: { match: RegExp; result: ProgressMapping }[] = [
   { match: /\b(pending approv\w*|awaiting approv\w*|approval)\b/i, result: { status: 'pending_approver', published: false, accessed: false } },
   { match: /\b(pending|awaiting|on hold|waiting)\b/i, result: { status: 'pending', published: false, accessed: false } },
   { match: /\bextend(ed|ing)?\b/i, result: { status: 'extended', published: false, accessed: false } },
-  // Overdue is set by the SLA engine from the deadline, never asserted by a
-  // file. Importing it as `open` lets the engine reach its own conclusion,
-  // which will be the same one if the deadline really has passed.
-  { match: /\b(overdue|breach\w*|late)\b/i, result: { status: 'open', published: false, accessed: false } },
+  // Taken at face value, like every other status here. The SLA engine does not
+  // reconsider an imported case: its clock is stopped and the sweep skips it,
+  // so if the file says overdue, nothing else is going to say otherwise.
+  { match: /\b(overdue|breach\w*|late)\b/i, result: { status: 'overdue', published: false, accessed: false } },
   { match: /\b(in progress|in review|under review|processing|open|assigned|new|submitted|verification)\b/i, result: { status: 'open', published: false, accessed: false } },
 ];
 
@@ -537,6 +537,8 @@ export interface RowIssue {
 export interface CoercedRow {
   index: number;
   caseProps: Record<string, unknown>;
+  /** The progress column exactly as the file wrote it, before mapping. */
+  sourceStatus: string | null;
   fields: Record<string, unknown>;
   /** Delivery stamps derived from the progress column. */
   reportPublished: boolean;
@@ -565,6 +567,7 @@ export function coerceRow(
   const out: CoercedRow = {
     index,
     caseProps: {},
+    sourceStatus: null,
     fields: {},
     reportPublished: false,
     reportAccessed: false,
@@ -646,6 +649,9 @@ export function coerceRow(
         break;
       }
       case 'progress': {
+        // Kept whatever it maps to. A record should be able to show what the
+        // system of record called it, not only this portal's nearest status.
+        out.sourceStatus = raw;
         const mapped = mapProgress(raw);
         if (!mapped) {
           out.issues.push({

@@ -147,8 +147,11 @@ describe('progress', () => {
     });
   });
 
-  it('imports an overdue case as open and lets the SLA engine decide', () => {
-    expect(mapProgress('Overdue')?.status).toBe('open');
+  it('takes overdue at face value rather than second-guessing the file', () => {
+    // The SLA engine does not reconsider an imported case: its clock is
+    // stopped and the sweep skips it, so nothing else would ever say overdue.
+    expect(mapProgress('Overdue')?.status).toBe('overdue');
+    expect(mapProgress('Breached')?.status).toBe('overdue');
   });
 
   it('reads "pending" out of a longer phrase rather than giving up on it', () => {

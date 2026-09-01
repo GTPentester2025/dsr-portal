@@ -92,12 +92,20 @@ apart here:
 | `Completed`, `Closed`, `Fulfilled` | `closed` | — |
 | `Pending`, `Awaiting…` | `pending` | — |
 | `Pending approval` | `pending_approver` | — |
-| `Overdue`, `Breached` | `open` | — |
+| `Overdue`, `Breached` | `overdue` | — |
 | anything unrecognised | `open` | a warning against that row |
 
-`Overdue` is imported as `open` deliberately. Overdue is set by the SLA engine
-from the deadline, never asserted by a file — and the engine will reach the
-same conclusion within a minute if the deadline really has passed.
+Whatever the file says is what the case gets, `Overdue` included. The SLA
+engine does not second-guess an imported case: its clock is stopped at import
+and the sweep skips it entirely, so nothing rewrites a status that arrived from
+an export.
+
+The raw value is kept too. `cases.source_status` holds the progress column
+exactly as the file wrote it, and it is shown on the case and carried in the
+export — so a record can always show what the system of record called it, not
+only this portal's nearest equivalent. That matters most where the wording maps
+approximately: "Awaiting third party" becomes `pending`, and the original is
+still there to read.
 
 ## Step 2 — import
 
@@ -189,7 +197,9 @@ featureset exactly as before.
 | Status, assignment, SLA clock | refused | full workflow |
 | Report delivery, appeals | refused | available |
 | New attachments | refused | allowed |
+| SLA clock | stopped at import | runs |
 | SLA reminders and escalation | never fire | fire as configured |
+| Status | exactly what the file said | moves as the case is worked |
 | Changed by | uploading a newer export | working the case |
 | Read, search, export, audit | yes | yes |
 

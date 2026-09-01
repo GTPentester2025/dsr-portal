@@ -107,6 +107,7 @@ export class CasesController {
       { header: 'Request types', value: (r) => r.requestTypes },
       { header: 'Status', value: (r) => r.status },
       { header: 'Progress', value: (r) => r.progress },
+      { header: 'Source status', value: (r) => r.sourceStatus },
       { header: 'Created', value: (r) => r.createdAt },
       { header: 'Due', value: (r) => r.dueAt },
       { header: 'Completed', value: (r) => r.closedAt },

@@ -49,6 +49,12 @@ export class SlaService {
       if (!lock.rows[0].ok) return { breached: 0, reminders: 0, escalations: 0 };
 
       // 1. Breaches: running clocks past due -> case Overdue (system-set).
+      //
+      // Imported cases are excluded here as well as having their clocks
+      // stopped at import. Their status is whatever the source export said and
+      // changes only by a later upload, so the sweep must not rewrite it —
+      // and an imported backlog is entirely made of open, long-past-due cases,
+      // which is exactly what this query looks for.
       const breachedRes = await client.query(
         `UPDATE sla_clocks sc
             SET state = 'breached'
@@ -57,6 +63,7 @@ export class SlaService {
            AND sc.state = 'running'
            AND sc.due_at < now()
            AND c.status NOT IN ('closed')
+           AND c.source <> 'import'
         RETURNING sc.case_id`,
       );
       for (const row of breachedRes.rows) {
@@ -153,7 +160,8 @@ export class SlaService {
     LEFT JOIN users u ON u.id = c.assignee_id
         WHERE sc.escalated_at IS NULL
           AND sc.state IN ('running', 'breached')
-          AND c.status NOT IN ('closed')`,
+          AND c.status NOT IN ('closed')
+          AND c.source <> 'import'`,
     );
 
     let sent = 0;
@@ -211,6 +219,7 @@ export class SlaService {
         WHERE c.assignee_id IS NULL
           AND c.unassigned_escalated_at IS NULL
           AND c.status NOT IN ('closed')
+          AND c.source <> 'import'
           AND c.created_at < now() - (ac.escalation_after_minutes * interval '1 minute')`,
     );
 

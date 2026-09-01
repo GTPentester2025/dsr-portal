@@ -90,6 +90,8 @@ export interface CaseListItem {
   appealStatus?: string | null
   /** 'portal' | 'import' */
   source?: string
+  /** Imported cases: the progress value exactly as the source export wrote it. */
+  sourceStatus?: string | null
   externalId?: string | null
   externalRequestId?: string | null
   assigneeName?: string | null

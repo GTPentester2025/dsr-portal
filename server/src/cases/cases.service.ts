@@ -108,7 +108,7 @@ const LIST_SELECT = `
          c.skip_completion_notification, c.completed_after_deadline, c.auto_extended,
          c.report_published_at, c.report_accessed_at,
          c.can_be_appealed, c.can_appeal_until, c.is_appeal, c.appeal_status,
-         c.source, c.external_id, c.external_request_id,
+         c.source, c.source_status, c.external_id, c.external_request_id,
          asg.name AS assignee_name, asg.email AS assignee_email,
          -- The export's keyset cursor, and only that: it is not shaped into a
          -- row and never reaches the CSV. timestamptz is stored to the
@@ -206,6 +206,7 @@ export class CasesService {
       isAppeal: Boolean(r.is_appeal),
       appealStatus: (r.appeal_status ?? null) as string | null,
       source: (r.source ?? 'portal') as string,
+      sourceStatus: (r.source_status ?? null) as string | null,
       externalId: (r.external_id ?? null) as string | null,
       externalRequestId: (r.external_request_id ?? null) as string | null,
       assigneeName: (r.assignee_name ?? null) as string | null,
