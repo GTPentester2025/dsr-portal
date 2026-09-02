@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
-  api, OUTCOME_CODES, STATUS_LABELS,
-  type CaseDetail, type Me, type Template, type UserRow,
+  api, atLeast, OUTCOME_CODES, STATUS_LABELS,
+  type CaseDeletionSummary, type CaseDetail, type Me, type Template, type UserRow,
 } from '../lib/api'
 import {
   Alert, Button, Card, Chip, EmptyState, Field, Modal, Select, Skeleton, StatusBadge,
@@ -20,6 +20,7 @@ export function CaseDetailPage({ me, caseId }: { me: Me; caseId: string }) {
   const [c, setC] = useState<CaseDetail | null>(null)
   const [error, setError] = useState('')
   const [modal, setModal] = useState<'' | 'extend'>('')
+  const [deleting, setDeleting] = useState(false)
   // The reply composer lives in the page, not a dialog, so its open state does
   // too — the header button scrolls to it rather than covering the record.
   const [replyOpen, setReplyOpen] = useState(false)
@@ -91,6 +92,16 @@ export function CaseDetailPage({ me, caseId }: { me: Me; caseId: string }) {
           {/* Export is always available: an auditor and a closed case still need it. */}
           <div className="ml-auto flex flex-wrap gap-2">
             <CaseShare c={c} onSent={reload} />
+            {atLeast(me.role, 'admin') && (
+              <Button
+                variant="ghost"
+                icon="trash"
+                className="text-danger hover:bg-danger/10"
+                onClick={() => setDeleting(true)}
+              >
+                Delete case
+              </Button>
+            )}
           </div>
 
           {canAct && (
@@ -220,7 +231,109 @@ export function CaseDetailPage({ me, caseId }: { me: Me; caseId: string }) {
         />
       )}
 
+      {deleting && <DeleteCaseModal c={c} onClose={() => setDeleting(false)} />}
+
     </>
+  )
+}
+
+/**
+ * Destroying a case, behind a typed confirmation and a stated reason.
+ *
+ * The reason is not ceremony. A deleted request is a hole in a compliance
+ * record, and the only thing that makes one explicable a year later is
+ * somebody having written down at the time why they made it. The server
+ * refuses a blank or perfunctory one.
+ */
+function DeleteCaseModal({ c, onClose }: { c: CaseDetail; onClose: () => void }) {
+  const toast = useToast()
+  const [reason, setReason] = useState('')
+  const [typed, setTyped] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const confirmed = typed.trim().toUpperCase() === c.caseRef.toUpperCase()
+
+  const purge = async () => {
+    setBusy(true)
+    setErr('')
+    try {
+      const s = await api.del<CaseDeletionSummary>(`/internal/cases/${c.id}`, { reason })
+      const rows = Object.values(s.removed).reduce((a, b) => a + b, 0)
+      toast.success(
+        `${s.caseRef} deleted`,
+        `${rows} record${rows === 1 ? '' : 's'} and ${s.filesRemoved} file${s.filesRemoved === 1 ? '' : 's'} removed`,
+      )
+      location.hash = '#/cases'
+    } catch (e) {
+      setErr((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal
+      title={`Delete ${c.caseRef}?`}
+      description="This cannot be undone."
+      onClose={onClose}
+    >
+      <div className="space-y-4">
+        <Alert tone="error" title="What this destroys">
+          The request and everything belonging to it — the answers the requester gave, the
+          timeline, comments, correspondence, any delegation, the SLA clock, and the uploaded
+          files themselves, deleted from storage rather than merely unlinked.
+        </Alert>
+        <Alert tone="info" title="What survives">
+          The audit log. Every entry recording what was done to this case stays, including this
+          deletion and the reason you give below — that record is what an investigation reads,
+          and nothing in the console can remove it.
+        </Alert>
+        <p className="text-[13px] text-muted">
+          Deleting a case is not the same as erasing the person. Earlier audit entries can
+          contain their email address, and those are kept.
+        </p>
+
+        <Field
+          label="Why is this case being deleted?"
+          hint="Recorded permanently. Write what somebody reading it in a year would need."
+          htmlFor="delete-reason"
+        >
+          <Textarea
+            id="delete-reason"
+            rows={3}
+            value={reason}
+            placeholder="Duplicate of DSR-SAZ-2026-00042, submitted twice by the same person."
+            onChange={(e) => setReason(e.target.value)}
+          />
+        </Field>
+
+        <Field
+          label={`Type ${c.caseRef} to confirm`}
+          error={err || undefined}
+          htmlFor="delete-confirm"
+        >
+          <TextInput
+            id="delete-confirm"
+            value={typed}
+            autoComplete="off"
+            placeholder={c.caseRef}
+            onChange={(e) => setTyped(e.target.value)}
+          />
+        </Field>
+
+        <div className="flex justify-end gap-2">
+          <Button onClick={onClose}>Cancel</Button>
+          <Button
+            variant="danger"
+            loading={busy}
+            disabled={!confirmed || reason.trim().length < 10}
+            onClick={purge}
+          >
+            Delete permanently
+          </Button>
+        </div>
+      </div>
+    </Modal>
   )
 }
 

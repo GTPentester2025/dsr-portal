@@ -21,6 +21,7 @@ import { SchemaController } from '../admin/schema.controller';
 import { SchemaService } from '../admin/schema.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { CaseSourceGuard } from './case-source.guard';
+import { CaseDeletionService } from './case-deletion.service';
 
 @Module({
   imports: [AuthModule, EmailModule],
@@ -36,6 +37,7 @@ import { CaseSourceGuard } from './case-source.guard';
     CryptoService,
     CaseSourceGuard,
     SchemaService,
+    CaseDeletionService,
   ],
   exports: [CasesService, AssignmentService, SlaService, CaseSourceGuard],
 })

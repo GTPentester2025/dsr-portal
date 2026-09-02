@@ -36,6 +36,16 @@ export const PERMISSIONS = [
    */
   'users.administer',
   /**
+   * Destroy a case and everything hanging off it.
+   *
+   * Apart from `cases.work` because working a case and erasing one are
+   * different trusts: an approver decides an outcome, and this removes the
+   * evidence that the decision was ever made. Apart from `users.administer`
+   * because the two answer to different people — a departed colleague is HR's
+   * business, a deleted request is Legal's.
+   */
+  'cases.administer',
+  /**
    * Apply pending database migrations.
    *
    * Its own permission, and not folded into `system.operate`, because it is
@@ -60,6 +70,16 @@ export const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
     'audit.read',
     'system.operate',
     'users.administer',
+  /**
+   * Destroy a case and everything hanging off it.
+   *
+   * Apart from `cases.work` because working a case and erasing one are
+   * different trusts: an approver decides an outcome, and this removes the
+   * evidence that the decision was ever made. Apart from `users.administer`
+   * because the two answer to different people — a departed colleague is HR's
+   * business, a deleted request is Legal's.
+   */
+  'cases.administer',
     'schema.migrate',
     'instance.administer',
   ],
@@ -73,6 +93,16 @@ export const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
     'audit.read',
     'system.operate',
     'users.administer',
+  /**
+   * Destroy a case and everything hanging off it.
+   *
+   * Apart from `cases.work` because working a case and erasing one are
+   * different trusts: an approver decides an outcome, and this removes the
+   * evidence that the decision was ever made. Apart from `users.administer`
+   * because the two answer to different people — a departed colleague is HR's
+   * business, a deleted request is Legal's.
+   */
+  'cases.administer',
     'schema.migrate',
   ],
   zone_manager: ['cases.work', 'team.manage', 'config.manage', 'reports.run'],

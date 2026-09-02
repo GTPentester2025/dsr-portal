@@ -40,7 +40,9 @@ export const api = {
   post: <T>(path: string, body?: unknown) => call<T>('POST', path, body),
   put: <T>(path: string, body?: unknown) => call<T>('PUT', path, body),
   patch: <T>(path: string, body?: unknown) => call<T>('PATCH', path, body),
-  del: <T>(path: string) => call<T>('DELETE', path),
+  // A body on DELETE is unusual but right here: deleting a case requires a
+  // reason, and a reason is part of the request, not a query string.
+  del: <T>(path: string, body?: unknown) => call<T>('DELETE', path, body),
   upload,
 }
 
@@ -417,4 +419,12 @@ export interface MigrateResult {
   applied: string[]
   /** The migration script's own output, shown verbatim. */
   output: string
+}
+
+/** What a case deletion actually removed. */
+export interface CaseDeletionSummary {
+  caseRef: string
+  removed: Record<string, number>
+  filesRemoved: number
+  filesMissing: number
 }

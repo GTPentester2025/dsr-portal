@@ -1,11 +1,12 @@
-import { Controller, Get, Ip, Logger, Param, ParseUUIDPipe, Query, Req, Res, StreamableFile, UseGuards } from '@nestjs/common';
-import { AuthGuard } from '../auth/auth.guard';
+import { Body, Controller, Delete, Get, Ip, Logger, Param, ParseUUIDPipe, Query, Req, Res, StreamableFile, UseGuards } from '@nestjs/common';
+import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { Response } from 'express';
 import { csvFilename, type CsvColumn } from './csv';
 import { streamCsv } from './csv-stream';
 import { CasePdfService } from './case-pdf.service';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { CasesService, type CaseExportRow } from './cases.service';
+import { CaseDeletionService } from './case-deletion.service';
 import { AuditService } from '../audit/audit.service';
 
 /**
@@ -26,7 +27,36 @@ export class CasesController {
     private readonly cases: CasesService,
     private readonly audit: AuditService,
     private readonly casePdf: CasePdfService,
+    private readonly deletion: CaseDeletionService,
   ) {}
+
+  /**
+   * Destroy a case and everything belonging to it — fields, timeline,
+   * comments, correspondence, delegations, its SLA clock, and the attachment
+   * files on disk.
+   *
+   * The audit trail is untouched by design: `audit_log.entity_id` carries no
+   * foreign key, so every entry about this case outlives it. The record that a
+   * request existed and was deleted is exactly what an investigation needs,
+   * and is the one thing this must not be able to remove.
+   *
+   * `cases.administer`, not `cases.work`: deciding an outcome and erasing the
+   * evidence that a decision was made are different trusts.
+   */
+  @Delete(':id')
+  @Requires('cases.administer')
+  deleteCase(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { reason?: string },
+    @Ip() ip: string,
+  ) {
+    return this.deletion.purge(req.zoneCtx, id, {
+      reason: body?.reason ?? '',
+      actorId: req.user.id,
+      ip,
+    });
+  }
 
   @Get()
   list(
