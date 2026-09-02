@@ -15,6 +15,7 @@ import { SettingsPage } from './pages/SettingsPage'
 import { FormsPage } from './pages/FormsPage'
 import { FormEditorPage } from './pages/FormEditorPage'
 import { MigrationPage } from './pages/MigrationPage'
+import { SystemPage } from './pages/SystemPage'
 
 function useHashRoute() {
   const [hash, setHash] = useState(window.location.hash || '#/')
@@ -33,6 +34,7 @@ const GUARD: Record<string, string[]> = {
   '#/groups': ['super_admin', 'admin', 'zone_manager', 'approver'],
   '#/migration': ['super_admin', 'admin', 'zone_manager'],
   '#/audit': ['super_admin', 'admin', 'auditor'],
+  '#/system': ['super_admin', 'admin'],
   '#/settings': ['super_admin'],
 }
 
@@ -115,6 +117,9 @@ export default function App() {
   } else if (hash.startsWith('#/audit')) {
     title = 'Audit log'
     page = <AuditPage />
+  } else if (hash.startsWith('#/system')) {
+    title = 'System'
+    page = <SystemPage />
   } else if (hash.startsWith('#/settings')) {
     title = 'Settings'
     page = <SettingsPage />

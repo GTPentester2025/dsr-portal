@@ -14,6 +14,7 @@ const NAV = [
   { path: '#/groups', label: 'Groups', icon: 'send', roles: ['super_admin', 'admin', 'zone_manager', 'approver'] },
   { path: '#/migration', label: 'Migration', icon: 'upload', roles: ['super_admin', 'admin', 'zone_manager'] },
   { path: '#/audit', label: 'Audit log', icon: 'shield', roles: ['super_admin', 'admin', 'auditor'] },
+  { path: '#/system', label: 'System', icon: 'database', roles: ['super_admin', 'admin'] },
   { path: '#/settings', label: 'Settings', icon: 'settings', roles: ['super_admin'] },
 ] as const
 

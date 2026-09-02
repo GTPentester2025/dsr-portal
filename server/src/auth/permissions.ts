@@ -27,7 +27,25 @@ export const PERMISSIONS = [
   'audit.read',
   /** Instance-wide operations: SLA recompute, report send, system templates. */
   'system.operate',
-  /** Change instance configuration and reset another user's password. */
+  /**
+   * Administer accounts destructively: delete a user, reset another person's
+   * password. Separate from `instance.administer` because the two are
+   * different trusts — an administrator who should be able to remove a
+   * departed colleague is not necessarily one who should hold the mail
+   * provider's credentials.
+   */
+  'users.administer',
+  /**
+   * Apply pending database migrations.
+   *
+   * Its own permission, and not folded into `system.operate`, because it is
+   * the most consequential action the console offers: migrations add columns,
+   * rewrite foreign keys and alter the row-level security policies that keep
+   * zones apart. A grant this sharp should be revocable on its own rather than
+   * arriving as a side effect of being allowed to recompute an SLA.
+   */
+  'schema.migrate',
+  /** Change instance configuration: mail provider, secrets, system templates. */
   'instance.administer',
 ] as const;
 
@@ -41,9 +59,22 @@ export const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
     'reports.run',
     'audit.read',
     'system.operate',
+    'users.administer',
+    'schema.migrate',
     'instance.administer',
   ],
-  admin: ['cases.work', 'team.manage', 'config.manage', 'reports.run', 'audit.read', 'system.operate'],
+  // An administrator may remove an account and apply a migration, but not read
+  // or change the instance's stored secrets — that stays with super_admin.
+  admin: [
+    'cases.work',
+    'team.manage',
+    'config.manage',
+    'reports.run',
+    'audit.read',
+    'system.operate',
+    'users.administer',
+    'schema.migrate',
+  ],
   zone_manager: ['cases.work', 'team.manage', 'config.manage', 'reports.run'],
   approver: ['cases.work'],
   auditor: ['audit.read'],

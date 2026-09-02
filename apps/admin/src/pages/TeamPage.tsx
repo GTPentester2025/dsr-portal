@@ -344,7 +344,7 @@ export function TeamPage({ me }: { me: Me }) {
                 </Td>
                 <Td>
                   <div className="flex items-center justify-end gap-1">
-                    {me.role === 'super_admin' && (
+                    {atLeast(me.role, 'admin') && (
                       <Button
                         variant="ghost"
                         icon="key"
@@ -359,7 +359,12 @@ export function TeamPage({ me }: { me: Me }) {
                       label={`Active status for ${u.name}`}
                       onChange={(v) => void patchUser(u.id, { active: v }, v ? 'Member activated' : 'Member deactivated')}
                     />
-                    {me.role === 'super_admin' && u.id !== me.id && (
+                    {/* An administrator may remove an account but not one that
+                        outranks them — the server refuses it too; this only
+                        stops the button being offered. */}
+                    {atLeast(me.role, 'admin') &&
+                      u.id !== me.id &&
+                      (u.role !== 'super_admin' || me.role === 'super_admin') && (
                       <Button
                         variant="ghost"
                         icon="trash"

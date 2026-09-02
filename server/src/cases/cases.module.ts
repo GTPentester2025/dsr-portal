@@ -17,12 +17,14 @@ import { SlaService } from './sla.service';
 import { OutboundService } from './outbound.service';
 import { DashboardService } from './dashboard.service';
 import { AdminUsersController } from '../admin/admin-users.controller';
+import { SchemaController } from '../admin/schema.controller';
+import { SchemaService } from '../admin/schema.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { CaseSourceGuard } from './case-source.guard';
 
 @Module({
   imports: [AuthModule, EmailModule],
-  controllers: [ReportController, AttachmentsController, CasesController, CasesActionsController, AdminUsersController],
+  controllers: [ReportController, AttachmentsController, CasesController, CasesActionsController, AdminUsersController, SchemaController],
   providers: [ReportService, ReportPdfService, StorageService, CasePdfService, 
     CasesService,
     WorkflowService,
@@ -33,6 +35,7 @@ import { CaseSourceGuard } from './case-source.guard';
     DashboardService,
     CryptoService,
     CaseSourceGuard,
+    SchemaService,
   ],
   exports: [CasesService, AssignmentService, SlaService, CaseSourceGuard],
 })

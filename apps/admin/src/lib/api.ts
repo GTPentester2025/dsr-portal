@@ -402,3 +402,19 @@ export interface EmailHealthRow {
   last_succeeded_at: string | null
   blocked_until: string | null
 }
+
+// ------------------------------------------------------------------ schema --
+
+/** What the database has had applied, and what the code is still waiting on. */
+export interface SchemaStatus {
+  applied: { name: string; appliedAt: string }[]
+  pending: string[]
+  upToDate: boolean
+}
+
+export interface MigrateResult {
+  ok: boolean
+  applied: string[]
+  /** The migration script's own output, shown verbatim. */
+  output: string
+}

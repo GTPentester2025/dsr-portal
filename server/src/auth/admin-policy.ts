@@ -41,3 +41,38 @@ export function canAssignRole(
   }
   return null;
 }
+
+/**
+ * Whether `actor` may permanently delete the account `target`.
+ *
+ * Returns a refusal to show the operator, or null when it is allowed.
+ *
+ * The rule mirrors `canAssignRole`: only a super admin may grant that role, so
+ * only a super admin may take it away. Without this, an administrator could
+ * remove every super admin but the last — the last-one guard in the controller
+ * stops the account list emptying, not an administrator clearing out everybody
+ * who outranks them, which is the harm worth preventing.
+ *
+ * A zone manager holds `team.manage` but not `users.administer`, so deletion
+ * never reaches this function for them; the zone rule is stated anyway so the
+ * policy reads completely rather than depending on a permission check
+ * elsewhere staying as it is.
+ *
+ * Refusing to delete your own account is the controller's, not this
+ * function's: it needs the actor's id, and `RoleActor` deliberately carries
+ * only what a policy decision needs.
+ */
+export function canDeleteUser(
+  actor: RoleActor,
+  target: { role: Role; zoneId: string | null },
+): string | null {
+  if (target.role === 'super_admin' && actor.role !== 'super_admin') {
+    return 'Only a super admin can delete a super admin';
+  }
+  if (actor.role === 'zone_manager') {
+    if (seesEveryZone(target.role) || target.zoneId !== actor.zoneId) {
+      return 'Zone managers can only manage their own zone';
+    }
+  }
+  return null;
+}

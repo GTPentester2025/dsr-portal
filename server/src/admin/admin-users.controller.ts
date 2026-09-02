@@ -9,7 +9,7 @@ import type { AuthedRequest } from '../auth/auth.guard';
 import { DbService } from '../db/db.module';
 import { AuditService } from '../audit/audit.service';
 import { SendGuardService } from '../email/send-guard.service';
-import { canAssignRole } from '../auth/admin-policy';
+import { canAssignRole, canDeleteUser } from '../auth/admin-policy';
 import type { Role } from '../auth/permissions';
 
 const ROLES = new Set(['super_admin', 'admin', 'zone_manager', 'approver', 'auditor']);
@@ -185,11 +185,13 @@ export class AdminUsersController {
    * file that gets produced when the handling of a request is questioned.
    *
    * Irreversible, and refused where it would leave the system unadministrable.
-   * `instance.administer` rather than `team.manage`: this sits with resetting
-   * another person's password, not with editing a roster.
+   * `users.administer` rather than `team.manage`: this sits with resetting
+   * another person's password, not with editing a roster — and deliberately
+   * apart from `instance.administer`, so an administrator trusted to remove a
+   * departed colleague does not thereby hold the mail provider's credentials.
    */
   @Delete('users/:id')
-  @Requires('instance.administer')
+  @Requires('users.administer')
   async deleteUser(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
@@ -204,6 +206,15 @@ export class AdminUsersController {
       return res.rows[0];
     });
     if (!target) throw new NotFoundException('No such user');
+
+    // Only a super admin may grant that role, so only a super admin may take
+    // it away. Without this an administrator could remove everyone who
+    // outranks them, stopping only at the last-one guard below.
+    const refusal = canDeleteUser(
+      { role: req.user.role, zoneId: req.user.zoneId ?? null },
+      { role: target.role, zoneId: target.zone_id ?? null },
+    );
+    if (refusal) throw new BadRequestException(refusal);
 
     if (target.role === 'super_admin') {
       const remaining = await this.db.system(async (_db, client) => {
@@ -314,7 +325,7 @@ export class AdminUsersController {
    * immediate access to another person's account.
    */
   @Post('users/:id/reset-password')
-  @Requires('instance.administer')
+  @Requires('users.administer')
   async resetPassword(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
