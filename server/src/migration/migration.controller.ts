@@ -18,6 +18,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { AuthGuard, Requires } from '../auth/auth.guard';
 import type { AuthedRequest } from '../auth/auth.guard';
 import { MAX_IMPORT_BYTES, MigrationService } from './migration.service';
+import { ImportUndoService } from './import-undo.service';
 import type { DateOrder } from './csv-import';
 
 const ZONES = new Set(['EUR', 'SAZ', 'MAZ']);
@@ -33,7 +34,10 @@ const ZONES = new Set(['EUR', 'SAZ', 'MAZ']);
 @Controller('internal/migration')
 @UseGuards(AuthGuard)
 export class MigrationController {
-  constructor(private readonly migration: MigrationService) {}
+  constructor(
+    private readonly migration: MigrationService,
+    private readonly undoService: ImportUndoService,
+  ) {}
 
   /** Zone managers import into their own zone; administrators into any. */
   private assertZone(req: AuthedRequest, zone: string) {
@@ -108,5 +112,29 @@ export class MigrationController {
   @Requires('config.manage')
   discard(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
     return this.migration.discard(req.zoneCtx, id, req.user.id);
+  }
+
+  /**
+   * Delete every case a committed upload created.
+   *
+   * Gated on `cases.administer`, not the `config.manage` that runs the import
+   * itself. Committing an upload adds records; undoing one destroys them in
+   * bulk, and those are not the same decision — the same reasoning that puts
+   * single-case deletion behind the administrator role.
+   */
+  @Post('imports/:id/undo')
+  @Requires('cases.administer')
+  undo(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { reason?: string },
+    @Ip() ip: string,
+  ) {
+    return this.undoService.undo(req.zoneCtx, id, {
+      reason: body?.reason ?? '',
+      actorId: req.user.id,
+      actorName: req.user.name,
+      ip,
+    });
   }
 }

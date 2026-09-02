@@ -375,11 +375,33 @@ export interface ImportRecord {
   status: string
   total_rows: number
   imported: number
+  /** Cases already held that this upload overwrote. Not reversible. */
+  updated: number
   skipped: number
   failed: number
   created_at: string
   committed_at: string | null
   uploaded_by_name: string | null
+  /**
+   * False for uploads committed before the portal recorded which cases came
+   * from which file. Their cases cannot be found, so undo is refused.
+   */
+  undoable: boolean
+  undone_at: string | null
+  undone_by_name: string | null
+}
+
+/** What undoing an import actually removed. */
+export interface ImportUndoSummary {
+  filename: string
+  casesDeleted: number
+  removed: Record<string, number>
+  /** Cases the upload overwrote rather than created; left as the file left them. */
+  updatedNotReverted: number
+  filesRemoved: number
+  filesMissing: number
+  /** Files still on disk after the rows naming them were destroyed. */
+  filesFailed: number
 }
 
 export interface CommitResult {

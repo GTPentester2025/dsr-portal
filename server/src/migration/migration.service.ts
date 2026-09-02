@@ -445,9 +445,9 @@ export class MigrationService {
             auto_extended, report_published_at, report_accessed_at,
             can_be_appealed, can_appeal_until, is_appeal, appeal_status,
             source, external_id, external_request_id, imported_at,
-            unassigned_escalated_at, source_status)
+            unassigned_escalated_at, source_status, import_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13,$14,$15,$16,$17,$18,$19,
-                 $20,$21,$22,$23,'import',$24,$25,now(),now(),$26)
+                 $20,$21,$22,$23,'import',$24,$25,now(),now(),$26,$27)
          RETURNING id`,
         [
           caseRef,
@@ -477,6 +477,11 @@ export class MigrationService {
           externalId,
           props.externalRequestId ?? null,
           row.sourceStatus,
+          // Which upload created this case, so it can be undone as a set. Set
+          // only here: a later upload that updates this case corrects it, it
+          // does not adopt it, and undoing the later upload must not delete a
+          // case the earlier one brought in.
+          record.id,
         ],
       );
       const caseId = inserted.rows[0].id as string;
@@ -706,7 +711,8 @@ export class MigrationService {
     return this.db.withContext(ctx, async (_db, client) => {
       const r = await client.query(
         `SELECT i.id, i.filename, i.zone_id, i.form_key, i.status, i.total_rows,
-                i.imported, i.skipped, i.failed, i.created_at, i.committed_at,
+                i.imported, i.updated, i.skipped, i.failed, i.created_at, i.committed_at,
+                i.undoable, i.undone_at, i.undone_by_name,
                 COALESCE(i.uploaded_by_name, u.name) AS uploaded_by_name
            FROM case_imports i
       LEFT JOIN users u ON u.id = i.uploaded_by

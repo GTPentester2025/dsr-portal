@@ -29,7 +29,7 @@ import { StorageService } from './storage.service';
  */
 
 /** Every table that holds rows belonging to a case, in foreign-key-safe order. */
-const CASE_OWNED_TABLES = [
+export const CASE_OWNED_TABLES = [
   'case_fields',
   'case_status_history',
   'case_comments',

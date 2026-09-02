@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  ApiError, ZONES, api,
+  ApiError, ZONES, api, atLeast,
   type ColumnProposal, type CommitResult, type ImportAnalysis, type ImportRecord,
-  type Me, type RowIssue,
+  type ImportUndoSummary, type Me, type RowIssue,
 } from '../lib/api'
 import {
-  Alert, Button, Card, Chip, EmptyState, Field, PageHeader, Select, Skeleton,
-  Table, Td, Th, Tr,
+  Alert, Button, Card, Chip, EmptyState, Field, Modal, PageHeader, Select, Skeleton,
+  Table, Td, Textarea, TextInput, Th, Tr,
 } from '../components/ui'
 import { Icon } from '../components/Icon'
 import { useToast } from '../components/Toast'
@@ -255,7 +255,7 @@ export function MigrationPage({ me }: { me: Me }) {
             </div>
           </Card>
 
-          <ImportHistory rows={history} />
+          <ImportHistory rows={history} me={me} onChange={loadHistory} />
         </div>
       )}
 
@@ -425,7 +425,7 @@ export function MigrationPage({ me }: { me: Me }) {
             </Card>
           )}
 
-          <ImportHistory rows={history} />
+          <ImportHistory rows={history} me={me} onChange={loadHistory} />
         </div>
       )}
     </>
@@ -499,7 +499,21 @@ function ColumnRow({
   )
 }
 
-function ImportHistory({ rows }: { rows: ImportRecord[] | null }) {
+function ImportHistory({
+  rows,
+  me,
+  onChange,
+}: {
+  rows: ImportRecord[] | null
+  me: Me
+  onChange: () => void
+}) {
+  const [undoing, setUndoing] = useState<ImportRecord | null>(null)
+  // Undoing an upload deletes cases in bulk, which is an administrator's
+  // decision rather than an importer's — the same line single-case deletion
+  // draws. A zone manager may run an import; reversing one is not theirs.
+  const mayUndo = atLeast(me.role, 'admin')
+
   if (!rows) {
     return (
       <Card bleed>
@@ -522,27 +536,209 @@ function ImportHistory({ rows }: { rows: ImportRecord[] | null }) {
     <Card title="Previous imports" bleed>
       <Table
         caption="Files previously uploaded and what each imported"
-        head={<><Th>File</Th><Th>Zone</Th><Th>Status</Th><Th>Rows</Th><Th>By</Th><Th>When</Th></>}
+        head={
+          <>
+            <Th>File</Th><Th>Zone</Th><Th>Status</Th><Th>Rows</Th><Th>By</Th><Th>When</Th>
+            {mayUndo ? <Th className="text-right">Undo</Th> : null}
+          </>
+        }
       >
         {rows.map((r) => (
           <Tr key={r.id}>
             <Td><span className="font-medium text-ink">{r.filename}</span></Td>
             <Td>{r.zone_id}</Td>
             <Td>
-              <Chip tone={r.status === 'committed' ? 'positive' : r.status === 'discarded' ? 'neutral' : 'brand'}>
+              <Chip
+                tone={
+                  r.status === 'committed'
+                    ? 'positive'
+                    : r.status === 'undone'
+                      ? 'warning'
+                      : r.status === 'discarded'
+                        ? 'neutral'
+                        : 'brand'
+                }
+              >
                 {r.status}
               </Chip>
             </Td>
             <Td className="text-muted">
-              {r.status === 'committed'
-                ? `${r.imported} in · ${r.skipped} skipped · ${r.failed} failed`
-                : `${r.total_rows} read`}
+              {r.status === 'undone'
+                ? `${r.imported} removed`
+                : r.status === 'committed'
+                  ? `${r.imported} in · ${r.skipped} skipped · ${r.failed} failed`
+                  : `${r.total_rows} read`}
             </Td>
-            <Td className="text-muted">{r.uploaded_by_name ?? '—'}</Td>
+            <Td className="text-muted">
+              {r.status === 'undone' && r.undone_by_name
+                ? `${r.uploaded_by_name ?? '—'} · undone by ${r.undone_by_name}`
+                : (r.uploaded_by_name ?? '—')}
+            </Td>
             <Td className="text-faint">{String(r.created_at).slice(0, 16).replace('T', ' ')}</Td>
+            {mayUndo ? (
+              <Td className="text-right">
+                {r.status !== 'committed' ? (
+                  <span className="text-[12px] text-faint">—</span>
+                ) : !r.undoable ? (
+                  // Said rather than hidden. An operator who expects an undo
+                  // button and finds nothing assumes a bug; this upload
+                  // predates provenance, so its cases cannot be identified.
+                  <span
+                    className="text-[12px] text-faint"
+                    title="Imported before the portal recorded which cases came from which file, so they cannot be identified"
+                  >
+                    not tracked
+                  </span>
+                ) : (
+                  <Button variant="danger" onClick={() => setUndoing(r)}>Undo</Button>
+                )}
+              </Td>
+            ) : null}
           </Tr>
         ))}
       </Table>
+      {undoing && (
+        <UndoImportModal
+          record={undoing}
+          onClose={() => setUndoing(null)}
+          onDone={() => {
+            setUndoing(null)
+            onChange()
+          }}
+        />
+      )}
     </Card>
+  )
+}
+
+/**
+ * Reversing an upload, behind a typed confirmation and a stated reason.
+ *
+ * Two numbers have to be on screen before the button is pressed: how many
+ * cases this destroys, and how many it cannot put back. The second is the one
+ * that surprises people — where this upload corrected a case an earlier upload
+ * had created, the values it replaced were never kept, so the case stays, and
+ * stays corrected.
+ */
+function UndoImportModal({
+  record,
+  onClose,
+  onDone,
+}: {
+  record: ImportRecord
+  onClose: () => void
+  onDone: () => void
+}) {
+  const toast = useToast()
+  const [reason, setReason] = useState('')
+  const [typed, setTyped] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const confirmed = typed.trim() === record.filename.trim()
+
+  const run = async () => {
+    setBusy(true)
+    setErr('')
+    try {
+      const s = await api.post<ImportUndoSummary>(
+        `/internal/migration/imports/${record.id}/undo`,
+        { reason },
+      )
+      toast.success(
+        `${s.filename} undone`,
+        `${s.casesDeleted} case${s.casesDeleted === 1 ? '' : 's'} deleted` +
+          (s.filesRemoved
+            ? ` · ${s.filesRemoved} file${s.filesRemoved === 1 ? '' : 's'} removed`
+            : '') +
+          (s.updatedNotReverted
+            ? ` · ${s.updatedNotReverted} overwritten case${s.updatedNotReverted === 1 ? '' : 's'} left as they are`
+            : ''),
+      )
+      // Loud and separate. A stored file that outlived the rows naming it is
+      // the one outcome here that must not scroll past in a success message.
+      if (s.filesFailed > 0) {
+        toast.error(
+          'Files left on disk',
+          `${s.filesFailed} stored file${s.filesFailed === 1 ? '' : 's'} could not be deleted, and ` +
+            'the records naming them are gone. Check the server log.',
+        )
+      }
+      onDone()
+    } catch (e) {
+      setErr((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal title={`Undo ${record.filename}?`} description="This cannot be undone." onClose={onClose}>
+      <div className="space-y-4">
+        <Alert
+          tone="error"
+          title={`${record.imported} case${record.imported === 1 ? '' : 's'} will be deleted`}
+        >
+          Every case this file created, and everything belonging to them — the answers, the
+          timelines, correspondence, SLA clocks, and any stored files, deleted from storage rather
+          than merely unlinked.
+        </Alert>
+
+        {record.updated > 0 && (
+          <Alert
+            tone="warning"
+            title={`${record.updated} case${record.updated === 1 ? '' : 's'} cannot be put back`}
+          >
+            This upload overwrote {record.updated} case{record.updated === 1 ? '' : 's'} an earlier
+            import had created. The values it replaced were not kept, so those cases stay, still
+            carrying what this file wrote.
+          </Alert>
+        )}
+
+        <Alert tone="info" title="What survives">
+          The audit log. The entry for this undo lists every case reference removed, so what was
+          deleted can still be answered for afterwards. Nothing in the console can remove it.
+        </Alert>
+
+        <Field
+          label="Why is this import being undone?"
+          hint="Recorded permanently. Write what somebody reading it in a year would need."
+          htmlFor="undo-reason"
+        >
+          <Textarea
+            id="undo-reason"
+            rows={3}
+            value={reason}
+            placeholder="Uploaded against the wrong zone — the same export has been re-imported into MAZ."
+            onChange={(e) => setReason(e.target.value)}
+          />
+        </Field>
+
+        <Field
+          label={`Type ${record.filename} to confirm`}
+          error={err || undefined}
+          htmlFor="undo-confirm"
+        >
+          <TextInput
+            id="undo-confirm"
+            value={typed}
+            autoComplete="off"
+            placeholder={record.filename}
+            onChange={(e) => setTyped(e.target.value)}
+          />
+        </Field>
+
+        <div className="flex justify-end gap-2">
+          <Button onClick={onClose}>Cancel</Button>
+          <Button
+            variant="danger"
+            loading={busy}
+            disabled={!confirmed || reason.trim().length < 10}
+            onClick={run}
+          >
+            Delete {record.imported} case{record.imported === 1 ? '' : 's'}
+          </Button>
+        </div>
+      </div>
+    </Modal>
   )
 }
