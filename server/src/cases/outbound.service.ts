@@ -15,6 +15,7 @@ import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { SOURCE_IMPORT } from './case-source.guard';
 import { EMAIL_PROVIDER, type EmailProvider } from '../email/email-provider.interface';
+import { CollaborationService } from './collaboration.service';
 
 /** Case response templates + outbound send (spec §10). */
 /**
@@ -39,6 +40,7 @@ export class OutboundService {
     private readonly crypto: CryptoService,
     private readonly config: SettingsService,
     @Inject(EMAIL_PROVIDER) private readonly email: EmailProvider,
+    private readonly collab: CollaborationService,
   ) {}
 
   // ---- template CRUD ------------------------------------------------------
@@ -377,6 +379,13 @@ export class OutboundService {
     if (toRequester) {
       await this.markAwaitingRequester(ctx, args.caseId, args.actorId, args.ip);
     }
+
+    await this.collab.notifyWatchers(
+      args.caseId,
+      args.actorId,
+      'Reply sent',
+      `"${args.subject}" to ${args.to.join(', ')}`,
+    );
 
     return { ok: true, providerMessageId };
   }

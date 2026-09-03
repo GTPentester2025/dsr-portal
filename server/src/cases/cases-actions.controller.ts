@@ -18,6 +18,7 @@ import { SlaService } from './sla.service';
 import { OutboundService } from './outbound.service';
 import { DashboardService } from './dashboard.service';
 import { CaseSourceGuard } from './case-source.guard';
+import { CollaborationService } from './collaboration.service';
 
 @Controller('internal')
 @UseGuards(AuthGuard)
@@ -29,7 +30,18 @@ export class CasesActionsController {
     private readonly outbound: OutboundService,
     private readonly dashboard: DashboardService,
     private readonly source: CaseSourceGuard,
+    private readonly collab: CollaborationService,
   ) {}
+
+  /**
+   * The transition table and status list, so the console can offer only the
+   * moves the server would accept. Read-only and role-free on purpose: it
+   * describes the workflow, not any case.
+   */
+  @Get('workflow/transitions')
+  transitions() {
+    return this.workflow.transitionTable();
+  }
 
   @Post('cases/:id/status')
   @Requires('cases.work')
@@ -39,6 +51,7 @@ export class CasesActionsController {
     @Body() body: {
       toStatus: string; note?: string; justification?: string;
       newDueDate?: string; outcomeCode?: string; closureNote?: string;
+      expectedUpdatedAt?: string;
     },
     @Ip() ip: string,
   ) {
@@ -51,9 +64,111 @@ export class CasesActionsController {
       newDueDate: body?.newDueDate,
       outcomeCode: body?.outcomeCode,
       closureNote: body?.closureNote,
+      expectedUpdatedAt: body?.expectedUpdatedAt,
       actorId: req.user.id,
       ip,
     });
+  }
+
+  // ---- collaboration ------------------------------------------------------
+
+  /** Append an internal comment. Append-only; the record is the point. */
+  @Post('cases/:id/comments')
+  @Requires('cases.work')
+  async comment(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { body?: string },
+    @Ip() ip: string,
+  ) {
+    return this.collab.addComment(req.zoneCtx, id, req.user.id, body?.body ?? '', ip);
+  }
+
+  @Post('cases/:id/watch')
+  @Requires('cases.work')
+  watch(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
+    return this.collab.watch(req.zoneCtx, id, req.user.id);
+  }
+
+  @Post('cases/:id/unwatch')
+  @Requires('cases.work')
+  unwatch(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
+    return this.collab.unwatch(req.zoneCtx, id, req.user.id);
+  }
+
+  @Post('cases/:id/priority')
+  @Requires('cases.work')
+  async setPriority(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { priority?: string },
+    @Ip() ip: string,
+  ) {
+    await this.source.assertLive(req.zoneCtx, id, 'prioritised');
+    return this.collab.setPriority(req.zoneCtx, id, body?.priority ?? '', req.user.id, ip);
+  }
+
+  @Post('cases/:id/tags')
+  @Requires('cases.work')
+  setTags(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { tags?: unknown },
+    @Ip() ip: string,
+  ) {
+    return this.collab.setTags(req.zoneCtx, id, body?.tags ?? [], req.user.id, ip);
+  }
+
+  @Post('cases/:id/snooze')
+  @Requires('cases.work')
+  async snooze(
+    @Req() req: AuthedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { until?: string | null },
+    @Ip() ip: string,
+  ) {
+    await this.source.assertLive(req.zoneCtx, id, 'snoozed');
+    return this.collab.setSnooze(req.zoneCtx, id, body?.until ?? null, req.user.id, ip);
+  }
+
+  /**
+   * Assign several cases in one action. Each case goes through exactly the
+   * same path as a single assignment — source guard, zone check, audit row —
+   * and a failure on one does not abort the rest: the caller gets a verdict
+   * per case rather than a transaction that hides which one was the problem.
+   */
+  @Post('cases/bulk-assign')
+  @Requires('cases.work')
+  async bulkAssign(
+    @Req() req: AuthedRequest,
+    @Body() body: { ids?: string[]; assigneeId?: string; reason?: string },
+    @Ip() ip: string,
+  ) {
+    const ids = [...new Set(body?.ids ?? [])].slice(0, 100);
+    if (ids.length === 0 || !body?.assigneeId) {
+      return { ok: false, results: [], error: 'ids and assigneeId are required' };
+    }
+    const results: { id: string; ok: boolean; error?: string }[] = [];
+    for (const id of ids) {
+      try {
+        await this.source.assertLive(req.zoneCtx, id, 'assigned to somebody');
+        await this.assignment.assign(req.zoneCtx, {
+          caseId: id,
+          assigneeId: body.assigneeId,
+          reason: body.reason?.trim() || 'Bulk assignment from the case list',
+          actorId: req.user.id,
+          ip,
+        });
+        results.push({ id, ok: true });
+      } catch (err) {
+        results.push({ id, ok: false, error: (err as Error).message });
+      }
+    }
+    return {
+      ok: results.every((r) => r.ok),
+      assigned: results.filter((r) => r.ok).length,
+      results,
+    };
   }
 
   /**
@@ -119,7 +234,7 @@ export class CasesActionsController {
   async assign(
     @Req() req: AuthedRequest,
     @Param('id', ParseUUIDPipe) id: string,
-    @Body() body: { assigneeId: string; reason?: string },
+    @Body() body: { assigneeId: string; reason?: string; expectedUpdatedAt?: string },
     @Ip() ip: string,
   ) {
     await this.source.assertLive(req.zoneCtx, id, 'assigned to somebody');
@@ -127,6 +242,7 @@ export class CasesActionsController {
       caseId: id,
       assigneeId: body?.assigneeId ?? '',
       reason: body?.reason,
+      expectedUpdatedAt: body?.expectedUpdatedAt,
       actorId: req.user.id,
       ip,
     });
@@ -214,13 +330,15 @@ export class CasesActionsController {
     @Body() body: {
       to: string[]; cc?: string[]; bcc?: string[];
       subject: string; body: string; templateId?: string;
+      /** Hand the case to this user as part of the send (e.g. mailing another team). */
+      assignToId?: string;
     },
     @Ip() ip: string,
   ) {
     // The one that matters most: writing to somebody about a request they made
     // years ago, already answered by a system that no longer runs.
     await this.source.assertLive(req.zoneCtx, id, 'written to');
-    return this.outbound.send(req.zoneCtx, {
+    const sent = await this.outbound.send(req.zoneCtx, {
       caseId: id,
       to: body?.to ?? [],
       cc: body?.cc,
@@ -231,6 +349,25 @@ export class CasesActionsController {
       actorId: req.user.id,
       ip,
     });
+
+    // Ownership transfer rides along with the send: writing to another team
+    // often means the case is now theirs. After the send on purpose — the
+    // message going out must not depend on the reassignment being legal, and
+    // a failed transfer is reported on a sent mail rather than blocking it.
+    if (body?.assignToId) {
+      try {
+        await this.assignment.assign(req.zoneCtx, {
+          caseId: id,
+          assigneeId: body.assignToId,
+          reason: `Ownership transferred while sending "${body?.subject ?? ''}"`,
+          actorId: req.user.id,
+          ip,
+        });
+      } catch (err) {
+        return { ...sent, assignWarning: (err as Error).message };
+      }
+    }
+    return sent;
   }
 
   /**

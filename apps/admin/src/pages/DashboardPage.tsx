@@ -169,12 +169,34 @@ function MonthlyByZone({
   )
 }
 
-function BarRow({ label, value, max, color }: { label: string; value: number; max: number; color?: string }) {
+function BarRow({
+  label,
+  value,
+  max,
+  color,
+  href,
+  detail,
+}: {
+  label: string
+  value: number
+  max: number
+  color?: string
+  /** When set the whole row drills through to the matching case list. */
+  href?: string
+  /** Small annotation after the count, e.g. "2 overdue". */
+  detail?: string
+}) {
   const pct = max > 0 ? Math.max(2, (value / max) * 100) : 0
+  const Wrapper = href ? 'a' : 'div'
   return (
-    <div className="group grid grid-cols-[minmax(0,max-content)_1fr_2.25rem] items-center gap-3">
+    <Wrapper
+      {...(href ? { href, 'aria-label': `${label}: ${value} cases. Open the list.` } : {})}
+      className={`group grid grid-cols-[minmax(0,max-content)_1fr_auto] items-center gap-3 ${
+        href ? 'cursor-pointer rounded-md px-1 py-0.5 -mx-1 hover:bg-sunken/60' : ''
+      }`}
+    >
       <span
-        className="max-w-[11rem] truncate text-[12px] text-muted"
+        className="max-w-[11rem] truncate text-[12px] text-muted group-hover:text-ink"
         title={label}
       >
         {label}
@@ -185,8 +207,11 @@ function BarRow({ label, value, max, color }: { label: string; value: number; ma
           style={{ width: `${pct}%`, background: color ?? 'var(--t-gold-1)', transitionTimingFunction: 'var(--ease-out-expo)' }}
         />
       </div>
-      <span className="mono text-right text-[12px] font-medium text-ink">{value}</span>
-    </div>
+      <span className="mono text-right text-[12px] font-medium text-ink">
+        {value}
+        {detail && <span className="ml-1.5 text-[10.5px] font-normal text-danger">{detail}</span>}
+      </span>
+    </Wrapper>
   )
 }
 
@@ -403,12 +428,108 @@ export function DashboardPage({ me }: { me: Me }) {
           ) : (
             <div className="space-y-3 py-1">
               {data.byRequestType.map((s) => (
-                <BarRow key={s.request_type} label={s.request_type} value={s.n} max={typeMax} />
+                <BarRow
+                  key={s.request_type}
+                  label={s.request_type}
+                  value={s.n}
+                  max={typeMax}
+                  href={`#/cases?type=${encodeURIComponent(s.request_type)}`}
+                />
               ))}
             </div>
           )}
         </Card>
       </div>
+
+      <div className="mt-4 grid items-start gap-4 lg:grid-cols-3">
+        <Card title="Open cases by assignee" subtitle="Who is carrying what, with the overdue split">
+          {data.byAssignee.length === 0 ? (
+            <EmptyState icon="users" title="Nothing assigned" hint="Open cases with an owner appear here." />
+          ) : (
+            <div className="space-y-3 py-1">
+              {data.byAssignee.map((a) => (
+                <BarRow
+                  key={a.id ?? a.name}
+                  label={a.name}
+                  value={a.n}
+                  max={Math.max(...data.byAssignee.map((x) => x.n), 1)}
+                  href={a.id ? `#/cases?assignee=${a.id}` : undefined}
+                  detail={a.overdue ? `${a.overdue} overdue` : undefined}
+                  color={a.overdue ? 'var(--t-danger)' : undefined}
+                />
+              ))}
+            </div>
+          )}
+        </Card>
+
+        <Card title="Closure quality" subtitle="How closing has actually gone">
+          {!data.closure || data.closure.total === 0 ? (
+            <EmptyState icon="checkCircle" title="Nothing closed yet" />
+          ) : (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <Stat label="Median time to close" value={`${data.closure.median_days}d`} />
+                <Stat
+                  label="Closed late"
+                  value={`${Math.round((data.closure.late / data.closure.total) * 100)}%`}
+                  tone={data.closure.late > 0 ? 'danger' : 'positive'}
+                  note={`${data.closure.late} of ${data.closure.total}`}
+                />
+              </div>
+              {(data.byOutcome ?? []).length > 0 && (
+                <div className="space-y-2 border-t border-line pt-3">
+                  {(data.byOutcome ?? []).map((o) => (
+                    <BarRow
+                      key={o.outcome_code}
+                      label={o.outcome_code.replace(/_/g, ' ')}
+                      value={o.n}
+                      max={Math.max(...(data.byOutcome ?? []).map((x) => x.n), 1)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </Card>
+
+        <Card title="Appeals" subtitle="Second looks at closed decisions">
+          {!data.appeals || (data.appeals.open + data.appeals.upheld + data.appeals.rejected === 0) ? (
+            <EmptyState icon="refresh" title="No appeals" hint="Raised appeals and their outcomes appear here." />
+          ) : (
+            <div className="grid grid-cols-3 gap-3">
+              <Stat label="Open" value={String(data.appeals.open)} tone={data.appeals.open > 0 ? 'warning' : undefined} />
+              <Stat label="Upheld" value={String(data.appeals.upheld)} note="decision changed" />
+              <Stat label="Rejected" value={String(data.appeals.rejected)} note="decision stood" />
+            </div>
+          )}
+        </Card>
+      </div>
     </>
+  )
+}
+
+/** One number with its meaning under it. */
+function Stat({
+  label,
+  value,
+  note,
+  tone,
+}: {
+  label: string
+  value: string
+  note?: string
+  tone?: 'danger' | 'warning' | 'positive'
+}) {
+  const color =
+    tone === 'danger' ? 'var(--t-danger)'
+    : tone === 'warning' ? 'var(--t-warning)'
+    : tone === 'positive' ? 'var(--t-positive)'
+    : 'var(--t-ink)'
+  return (
+    <div>
+      <p className="text-[11px] font-medium uppercase tracking-wide text-faint">{label}</p>
+      <p className="mono mt-0.5 text-[20px] font-semibold tracking-tight" style={{ color }}>{value}</p>
+      {note && <p className="text-[11px] text-faint">{note}</p>}
+    </div>
   )
 }

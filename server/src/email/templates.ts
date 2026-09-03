@@ -41,6 +41,7 @@ export const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'case_ref', 'zone', 'request_type', 'waiting', 'submission_date', 'due_date', 'case_url',
   ],
   'delegation-invite': ['case_ref', 'zone', 'request_type', 'due_date', 'note', 'link', 'from_name'],
+  'case-watched': ['case_ref', 'zone', 'event', 'detail', 'actor', 'case_url'],
   'test-email': ['provider', 'sent_at'],
 };
 
@@ -101,6 +102,10 @@ export const TEMPLATE_LABELS: Record<string, { label: string; description: strin
   'case-unassigned': {
     label: 'Unassigned case escalation',
     description: 'Goes to the escalation contact when nobody has picked a case up in time.',
+  },
+  'case-watched': {
+    label: 'Watched case update',
+    description: 'Tells a watcher that a case they follow moved — a status change, a reply, a comment.',
   },
   'test-email': {
     label: 'Test message',
@@ -189,6 +194,17 @@ const DEFAULTS: Record<string, EmailTemplate> = {
 <p><a href="{{link}}">Open the request</a> to accept it and send documents back.</p>
 <p>This link does not show the requester's personal details. If you need them,
 reply to this email and ask.</p>`,
+  },
+  'case-watched': {
+    subject: '[{{zone}}] {{case_ref}}: {{event}}',
+    html: `<p>Case <strong>{{case_ref}}</strong>, which you are watching, has moved.</p>
+<ul>
+<li>What happened: {{event}}</li>
+<li>Detail: {{detail}}</li>
+<li>By: {{actor}}</li>
+</ul>
+<p><a href="{{case_url}}">Open the case</a>. You receive this because you chose to watch
+this case; unwatch it from the case screen to stop.</p>`,
   },
 };
 

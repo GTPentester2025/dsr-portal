@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -14,6 +15,7 @@ import {
   statuses,
 } from '../db/schema';
 import { AuditService } from '../audit/audit.service';
+import { CollaborationService } from './collaboration.service';
 
 export interface StatusChangeArgs {
   caseId: string;
@@ -25,6 +27,13 @@ export interface StatusChangeArgs {
   /** Required when toStatus = closed. */
   outcomeCode?: string;
   closureNote?: string;
+  /**
+   * Optimistic-locking guard: the case's updatedAt as the caller last saw it.
+   * When supplied and stale, the change is refused with a 409 instead of
+   * silently overwriting a colleague's concurrent edit. Optional so older
+   * clients and scripts keep working.
+   */
+  expectedUpdatedAt?: string;
   actorId: string;
   ip?: string;
 }
@@ -41,7 +50,28 @@ export class WorkflowService {
   constructor(
     private readonly db: DbService,
     private readonly audit: AuditService,
+    private readonly collab: CollaborationService,
   ) {}
+
+  /**
+   * The workflow as data: every active status and every legal transition.
+   *
+   * The console reads this to offer only moves the server would accept, so
+   * "Illegal transition" stops being something an operator discovers after
+   * filling in a closure note. 'overdue' remains listed as a target where the
+   * table allows it, but is flagged system-only, mirroring changeStatus.
+   */
+  async transitionTable() {
+    return this.db.system(async (db) => {
+      const all = await db.select().from(statusTransitions);
+      const active = await db.select().from(statuses).where(eq(statuses.active, true));
+      return {
+        statuses: active.map((s) => ({ key: s.key, label: s.label ?? s.key })),
+        transitions: all.map((t) => ({ from: t.fromStatus, to: t.toStatus })),
+        systemOnly: ['overdue'],
+      };
+    });
+  }
 
   async changeStatus(ctx: ZoneContext, args: StatusChangeArgs) {
     const to = args.toStatus;
@@ -72,6 +102,19 @@ export class WorkflowService {
     const result = await this.db.withContext(ctx, async (db) => {
       const row = await db.query.cases.findFirst({ where: eq(cases.id, args.caseId) });
       if (!row) throw new NotFoundException();
+
+      // Two operators with the same case open: the second save must not
+      // silently overwrite the first. Millisecond precision is enough — the
+      // value round-trips through JSON as an ISO string.
+      if (
+        args.expectedUpdatedAt &&
+        !Number.isNaN(Date.parse(args.expectedUpdatedAt)) &&
+        row.updatedAt.getTime() !== new Date(args.expectedUpdatedAt).getTime()
+      ) {
+        throw new ConflictException(
+          'This case changed since you loaded it. Review the latest state and try again.',
+        );
+      }
 
       const target = await db.query.statuses.findFirst({ where: eq(statuses.key, to) });
       if (!target || !target.active) throw new BadRequestException('Unknown or retired status');
@@ -141,6 +184,13 @@ export class WorkflowService {
       after: { status: to, outcomeCode: args.outcomeCode, newDueDate: args.newDueDate },
       sourceIp: args.ip,
     });
+
+    await this.collab.notifyWatchers(
+      args.caseId,
+      args.actorId,
+      `Status changed to ${to}`,
+      `${result.from} → ${to}${args.note ? ` — ${args.note}` : ''}`,
+    );
 
     return {
       ok: true,

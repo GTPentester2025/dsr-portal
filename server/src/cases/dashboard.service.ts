@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { DbService, ZoneContext } from '../db/db.module';
+import { slaBucketSql } from './sla-buckets';
 
 /** Aggregations for the zone dashboards (spec §11). RLS scopes everything. */
 @Injectable()
@@ -15,12 +16,15 @@ export class DashboardService {
         `SELECT c.status, count(*)::int AS n FROM cases c WHERE true ${zoneFilter} GROUP BY c.status`,
         params,
       );
+      // The same predicates the case list's drill-down uses (sla-buckets.ts),
+      // so a card's count always equals the list it links to.
+      const b = slaBucketSql('c');
       const slaHealth = await client.query(
         `SELECT
-           count(*) FILTER (WHERE c.status = 'closed')::int AS closed,
-           count(*) FILTER (WHERE c.status != 'closed' AND c.due_at > now() + interval '3 days')::int AS on_track,
-           count(*) FILTER (WHERE c.status != 'closed' AND c.due_at BETWEEN now() AND now() + interval '3 days')::int AS at_risk,
-           count(*) FILTER (WHERE c.status != 'closed' AND c.due_at < now())::int AS overdue
+           count(*) FILTER (WHERE ${b.closed})::int AS closed,
+           count(*) FILTER (WHERE ${b.on_track})::int AS on_track,
+           count(*) FILTER (WHERE ${b.at_risk})::int AS at_risk,
+           count(*) FILTER (WHERE ${b.overdue})::int AS overdue
          FROM cases c WHERE true ${zoneFilter}`,
         params,
       );
@@ -77,11 +81,42 @@ export class DashboardService {
           GROUP BY rt.value ORDER BY n DESC`,
         params,
       );
+      // The id rides along so the console can link a row straight into the
+      // case list filtered to that person; the overdue split turns "busy"
+      // into "busy and drowning", which are different problems.
       const byAssignee = await client.query(
-        `SELECT u.name, count(*)::int AS n
+        `SELECT u.id, u.name, count(*)::int AS n,
+                count(*) FILTER (WHERE ${b.overdue})::int AS overdue
            FROM cases c JOIN users u ON u.id = c.assignee_id
           WHERE c.status != 'closed' ${zoneFilter}
-          GROUP BY u.name ORDER BY n DESC LIMIT 20`,
+          GROUP BY u.id, u.name ORDER BY n DESC LIMIT 20`,
+        params,
+      );
+
+      // How closing actually went: the questions a quarterly review asks.
+      const closure = await client.query(
+        `SELECT count(*)::int AS total,
+                COALESCE(ROUND((EXTRACT(EPOCH FROM percentile_cont(0.5) WITHIN GROUP (
+                  ORDER BY (c.closed_at - c.created_at))) / 86400)::numeric, 1), 0)::float AS median_days,
+                count(*) FILTER (WHERE c.completed_after_deadline)::int AS late
+           FROM cases c
+          WHERE c.status = 'closed' AND c.closed_at IS NOT NULL ${zoneFilter}`,
+        params,
+      );
+      const byOutcome = await client.query(
+        `SELECT c.outcome_code, count(*)::int AS n
+           FROM cases c
+          WHERE c.status = 'closed' AND c.outcome_code IS NOT NULL ${zoneFilter}
+          GROUP BY c.outcome_code ORDER BY n DESC`,
+        params,
+      );
+      // Counted on the appeal cases only: appeal_status is mirrored onto the
+      // original, and counting both would double every decision.
+      const appeals = await client.query(
+        `SELECT count(*) FILTER (WHERE c.is_appeal AND c.status <> 'closed')::int AS open,
+                count(*) FILTER (WHERE c.is_appeal AND c.appeal_status = 'upheld')::int AS upheld,
+                count(*) FILTER (WHERE c.is_appeal AND c.appeal_status = 'rejected')::int AS rejected
+           FROM cases c WHERE true ${zoneFilter}`,
         params,
       );
       const upcoming = await client.query(
@@ -105,6 +140,9 @@ export class DashboardService {
         byRequestType: byRequestType.rows,
         byAssignee: byAssignee.rows,
         upcomingDue: upcoming.rows,
+        closure: closure.rows[0],
+        byOutcome: byOutcome.rows,
+        appeals: appeals.rows[0],
       };
     });
   }

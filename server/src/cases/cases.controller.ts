@@ -68,6 +68,12 @@ export class CasesController {
     @Query('requestType') requestType?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
+    @Query('search') search?: string,
+    @Query('priority') priority?: string,
+    @Query('tag') tag?: string,
+    @Query('snoozed') snoozed?: string,
+    @Query('sort') sort?: string,
+    @Query('dir') dir?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
   ) {
@@ -79,9 +85,27 @@ export class CasesController {
       requestType,
       from,
       to,
+      search,
+      priority,
+      tag,
+      snoozed,
+      // The service whitelists these against its sort map; anything else
+      // falls back to newest-first rather than erroring.
+      sort: sort as 'created' | 'due' | 'status' | undefined,
+      dir: dir as 'asc' | 'desc' | undefined,
       page: page ? Number(page) : undefined,
       pageSize: pageSize ? Number(pageSize) : undefined,
     });
+  }
+
+  /**
+   * Every request type present in the visible cases, for the list's filter.
+   * Driven by the data rather than a hard-coded list because each zone's
+   * forms name their own types.
+   */
+  @Get('request-types')
+  requestTypes(@Req() req: AuthedRequest) {
+    return this.cases.requestTypes(req.zoneCtx);
   }
 
   /**
@@ -100,12 +124,21 @@ export class CasesController {
     @Res() res: Response,
     @Query('status') status?: string,
     @Query('zone') zone?: string,
+    @Query('assigneeId') assigneeId?: string,
     @Query('slaState') slaState?: string,
     @Query('requestType') requestType?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
+    @Query('search') search?: string,
+    @Query('priority') priority?: string,
+    @Query('tag') tag?: string,
+    @Query('snoozed') snoozed?: string,
   ) {
-    const filters = { status, zone, slaState, requestType, from, to };
+    // Same filter set as the list, so the file matches the screen it was
+    // exported from — including the search box and assignee filter.
+    const filters = {
+      status, zone, assigneeId, slaState, requestType, from, to, search, priority, tag, snoozed,
+    };
 
     // Which answer columns the file needs, settled before the header goes out
     // — once the first byte is written the header cannot be revised. Both
@@ -136,6 +169,8 @@ export class CasesController {
       { header: 'Requester email', value: (r) => r.requesterEmail },
       { header: 'Request types', value: (r) => r.requestTypes },
       { header: 'Status', value: (r) => r.status },
+      { header: 'Priority', value: (r) => r.priority },
+      { header: 'Tags', value: (r) => r.tags },
       { header: 'Progress', value: (r) => r.progress },
       { header: 'Source status', value: (r) => r.sourceStatus },
       { header: 'Created', value: (r) => r.createdAt },
@@ -254,7 +289,7 @@ export class CasesController {
     @Param('id', ParseUUIDPipe) id: string,
     @Ip() ip: string,
   ) {
-    const result = await this.cases.detail(req.zoneCtx, id);
+    const result = await this.cases.detail(req.zoneCtx, id, req.user.id);
     // Every case view lands in the audit trail (spec §9).
     await this.audit.record({
       actorId: req.user.id,

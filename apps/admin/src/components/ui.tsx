@@ -311,7 +311,15 @@ export const Th = ({ children, className = '' }: { children?: React.ReactNode; c
   <th className={`whitespace-nowrap px-4 py-2.5 font-medium ${className}`}>{children}</th>
 )
 
-export function Tr({ children, onClick }: { children: React.ReactNode; onClick?: () => void }) {
+export function Tr({
+  children,
+  onClick,
+  className = '',
+}: {
+  children: React.ReactNode
+  onClick?: () => void
+  className?: string
+}) {
   return (
     <tr
       onClick={onClick}
@@ -319,7 +327,7 @@ export function Tr({ children, onClick }: { children: React.ReactNode; onClick?:
       onKeyDown={onClick ? (e) => { if (e.key === 'Enter') onClick() } : undefined}
       className={`border-b border-line/70 transition-colors duration-100 last:border-0 ${
         onClick ? 'cursor-pointer hover:bg-brand-soft' : 'hover:bg-sunken/60'
-      }`}
+      } ${className}`}
     >
       {children}
     </tr>

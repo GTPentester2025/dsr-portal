@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Inject,
   Injectable,
   Logger,
@@ -12,6 +13,7 @@ import { DbService, ZoneContext, type Db } from '../db/db.module';
 import { assignmentConfig, cases, emailLog, users } from '../db/schema';
 import { AuditService } from '../audit/audit.service';
 import { EMAIL_PROVIDER, type EmailProvider } from '../email/email-provider.interface';
+import { CollaborationService } from './collaboration.service';
 
 interface Candidate {
   id: string;
@@ -31,6 +33,7 @@ export class AssignmentService {
     private readonly config: SettingsService,
     @Inject(EMAIL_PROVIDER) private readonly email: EmailProvider,
     private readonly crypto: CryptoService,
+    private readonly collab: CollaborationService,
   ) {}
 
   /** Auto-assign a new case per the zone's strategy. Safe to call from intake. */
@@ -142,10 +145,30 @@ export class AssignmentService {
   }
 
   /** Manual (re)assignment; reason mandatory when replacing an assignee. */
-  async assign(ctx: ZoneContext, args: { caseId: string; assigneeId: string; reason?: string; actorId: string; ip?: string }) {
+  async assign(
+    ctx: ZoneContext,
+    args: {
+      caseId: string;
+      assigneeId: string;
+      reason?: string;
+      /** Optimistic-locking guard; see StatusChangeArgs.expectedUpdatedAt. */
+      expectedUpdatedAt?: string;
+      actorId: string;
+      ip?: string;
+    },
+  ) {
     const result = await this.db.withContext(ctx, async (db, client) => {
       const row = await db.query.cases.findFirst({ where: eq(cases.id, args.caseId) });
       if (!row) throw new NotFoundException();
+      if (
+        args.expectedUpdatedAt &&
+        !Number.isNaN(Date.parse(args.expectedUpdatedAt)) &&
+        row.updatedAt.getTime() !== new Date(args.expectedUpdatedAt).getTime()
+      ) {
+        throw new ConflictException(
+          'This case changed since you loaded it. Review the latest state and try again.',
+        );
+      }
       if (row.assigneeId && !args.reason?.trim()) {
         throw new BadRequestException('Reassignment requires a reason');
       }
@@ -175,7 +198,7 @@ export class AssignmentService {
         capacityWeight: target.capacityWeight, openCases: 0,
       };
       await this.notifyAssignee(cand, row.caseRef, row.zoneId, row.requestTypes as string[], row.createdAt, row.dueAt, row.id);
-      return { previous: row.assigneeId, zoneId: row.zoneId, caseRef: row.caseRef };
+      return { previous: row.assigneeId, zoneId: row.zoneId, caseRef: row.caseRef, targetName: target.name };
     });
 
     await this.audit.record({
@@ -189,6 +212,16 @@ export class AssignmentService {
       after: { assigneeId: args.assigneeId, reason: args.reason },
       sourceIp: args.ip,
     });
+
+    // The new owner already got the richer case-assigned mail; watchers get
+    // the one-line version.
+    await this.collab.notifyWatchers(
+      args.caseId,
+      args.actorId,
+      `Reassigned to ${result.targetName}`,
+      args.reason ?? '',
+      [args.assigneeId],
+    );
     return { ok: true };
   }
 

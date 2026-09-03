@@ -22,6 +22,7 @@ import { SchemaService } from '../admin/schema.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { CaseSourceGuard } from './case-source.guard';
 import { CaseDeletionService } from './case-deletion.service';
+import { CollaborationService } from './collaboration.service';
 
 @Module({
   imports: [AuthModule, EmailModule],
@@ -38,6 +39,7 @@ import { CaseDeletionService } from './case-deletion.service';
     CaseSourceGuard,
     SchemaService,
     CaseDeletionService,
+    CollaborationService,
   ],
   exports: [CasesService, AssignmentService, SlaService, CaseSourceGuard],
 })

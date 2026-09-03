@@ -12,10 +12,12 @@ import {
 import { CryptoService } from '../crypto/crypto.service';
 import { cursorClause, nextCursor, type Cursor } from './keyset';
 import { collectInputs, type Component } from '../public/form-validation';
+import { slaBucketSql } from './sla-buckets';
 
 export interface CaseListQuery {
   status?: string;
   zone?: string;
+  /** A user id, or the literal 'none' for unassigned cases. */
   assigneeId?: string;
   /** Drill-down from the dashboard: 'overdue' | 'at_risk' | 'on_track' | 'closed'. */
   slaState?: string;
@@ -23,8 +25,40 @@ export interface CaseListQuery {
   /** ISO dates, inclusive, on created_at. */
   from?: string;
   to?: string;
+  /** 'normal' | 'high'. */
+  priority?: string;
+  /** One tag; a case matches when its tags contain it. */
+  tag?: string;
+  /** 'hide' removes actively snoozed cases from the view. */
+  snoozed?: string;
+  /**
+   * Free text: matched against the case reference and external id (contains),
+   * and — when it looks like an address — the requester's email, which is
+   * held encrypted and therefore matched by HMAC, exactly.
+   */
+  search?: string;
+  /** Precomputed by the service from `search`; never accepted from a client. */
+  searchEmailHmac?: string;
+  sort?: 'created' | 'due' | 'status';
+  dir?: 'asc' | 'desc';
   page?: number;
   pageSize?: number;
+}
+
+/** Sort keys the list accepts, mapped to SQL. Whitelist — never interpolate input. */
+const SORTS: Record<string, string> = {
+  // NULLS LAST on due: a case with no clock belongs at the end whichever way
+  // the deadline column is sorted.
+  due_asc: 'c.due_at ASC NULLS LAST, c.created_at DESC, c.id DESC',
+  due_desc: 'c.due_at DESC NULLS LAST, c.created_at DESC, c.id DESC',
+  created_asc: 'c.created_at ASC, c.id ASC',
+  created_desc: 'c.created_at DESC, c.id DESC',
+  status_asc: 'c.status ASC, c.created_at DESC, c.id DESC',
+  status_desc: 'c.status DESC, c.created_at DESC, c.id DESC',
+};
+
+function orderBy(q: CaseListQuery): string {
+  return SORTS[`${q.sort ?? 'created'}_${q.dir ?? 'desc'}`] ?? SORTS.created_desc;
 }
 
 /**
@@ -41,29 +75,46 @@ function listFilters(q: CaseListQuery): { sql: string; params: unknown[] } {
 
   if (q.status) add(`c.status = $${params.length + 1}`, q.status);
   if (q.zone) add(`c.zone_id = $${params.length + 1}`, q.zone);
-  if (q.assigneeId) add(`c.assignee_id = $${params.length + 1}`, q.assigneeId);
+  if (q.assigneeId === 'none') {
+    clauses.push('c.assignee_id IS NULL');
+  } else if (q.assigneeId) {
+    add(`c.assignee_id = $${params.length + 1}`, q.assigneeId);
+  }
   if (q.requestType) add(`c.request_types ? $${params.length + 1}`, q.requestType);
+  if (q.priority) add(`c.priority = $${params.length + 1}`, q.priority);
+  if (q.tag) add(`c.tags ? $${params.length + 1}`, q.tag);
+  // A snooze that has lapsed is over; only a future one hides the case.
+  if (q.snoozed === 'hide') {
+    clauses.push(`(c.snoozed_until IS NULL OR c.snoozed_until <= now())`);
+  }
   if (q.from) add(`c.created_at >= $${params.length + 1}`, q.from);
   // Inclusive of the whole end day rather than midnight on it.
   if (q.to) add(`c.created_at < ($${params.length + 1}::date + interval '1 day')`, q.to);
 
+  // Server-side search. The requester's address is stored encrypted, so free
+  // text cannot match it — the service precomputes an HMAC when the term looks
+  // like an address, and that matches the whole address exactly, the same way
+  // intake dedup does.
+  const term = q.search?.trim();
+  if (term) {
+    const like = `(c.case_ref ILIKE $${params.length + 1}
+       OR c.external_id ILIKE $${params.length + 1}
+       OR c.external_request_id ILIKE $${params.length + 1})`;
+    if (q.searchEmailHmac) {
+      params.push(`%${term}%`, q.searchEmailHmac);
+      clauses.push(`(${like} OR c.requester_email_hmac = $${params.length})`);
+    } else {
+      params.push(`%${term}%`);
+      clauses.push(like);
+    }
+  }
+
   // Mirrors the dashboard's SLA buckets exactly; a drill-down that disagreed
-  // with the card it came from would be worse than no drill-down.
-  switch (q.slaState) {
-    case 'closed':
-      clauses.push(`c.status = 'closed'`);
-      break;
-    case 'overdue':
-      clauses.push(`c.status <> 'closed' AND c.due_at < now()`);
-      break;
-    case 'at_risk':
-      clauses.push(`c.status <> 'closed' AND c.due_at BETWEEN now() AND now() + interval '3 days'`);
-      break;
-    case 'on_track':
-      clauses.push(`c.status <> 'closed' AND c.due_at > now() + interval '3 days'`);
-      break;
-    default:
-      break;
+  // with the card it came from would be worse than no drill-down. One shared
+  // definition (sla-buckets.ts) is what makes that a guarantee, not a hope.
+  const buckets = slaBucketSql('c');
+  if (q.slaState && q.slaState in buckets) {
+    clauses.push(buckets[q.slaState as keyof typeof buckets]);
   }
 
   return { sql: clauses.length ? `AND ${clauses.join(' AND ')}` : '', params };
@@ -108,6 +159,7 @@ const LIST_SELECT = `
          c.skip_completion_notification, c.completed_after_deadline, c.auto_extended,
          c.report_published_at, c.report_accessed_at,
          c.can_be_appealed, c.can_appeal_until, c.is_appeal, c.appeal_status,
+         c.priority, c.tags, c.snoozed_until,
          c.source, c.source_status, c.external_id, c.external_request_id,
          asg.name AS assignee_name, asg.email AS assignee_email,
          -- The export's keyset cursor, and only that: it is not shaped into a
@@ -136,15 +188,29 @@ export class CasesService {
     private readonly crypto: CryptoService,
   ) {}
 
+  /**
+   * The email HMAC for a search term, when the term is one whole address.
+   *
+   * Substring search over an encrypted column is not possible, and decrypting
+   * every row to grep it would defeat the point of the encryption. Whole-value
+   * HMAC equality is the same trade intake dedup already makes.
+   */
+  private withSearchHmac(q: CaseListQuery): CaseListQuery {
+    const term = q.search?.trim();
+    if (!term || !term.includes('@')) return { ...q, searchEmailHmac: undefined };
+    return { ...q, searchEmailHmac: this.crypto.lookupHmac(term) };
+  }
+
   /** Zone visibility comes from RLS via ctx — no zone filter in app code. */
-  async list(ctx: ZoneContext, q: CaseListQuery) {
+  async list(ctx: ZoneContext, rawQ: CaseListQuery) {
+    const q = this.withSearchHmac(rawQ);
     const page = Math.max(1, q.page ?? 1);
     const pageSize = Math.min(100, Math.max(1, q.pageSize ?? 25));
     return this.db.withContext(ctx, async (_db, client) => {
       const { sql: filterSql, params } = listFilters(q);
       const rows = await client.query(
         `${LIST_SELECT} ${filterSql}
-          ORDER BY c.created_at DESC, c.id DESC
+          ORDER BY ${orderBy(q)}
           LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, pageSize, (page - 1) * pageSize],
       );
@@ -203,6 +269,9 @@ export class CasesService {
       reportAccessedAt: (r.report_accessed_at ?? null) as string | null,
       canBeAppealed: Boolean(r.can_be_appealed),
       canAppealUntil: (r.can_appeal_until ?? null) as string | null,
+      priority: (r.priority ?? 'normal') as string,
+      tags: (r.tags ?? []) as string[],
+      snoozedUntil: (r.snoozed_until ?? null) as string | null,
       isAppeal: Boolean(r.is_appeal),
       appealStatus: (r.appeal_status ?? null) as string | null,
       source: (r.source ?? 'portal') as string,
@@ -230,7 +299,8 @@ export class CasesService {
    * operational CSV that is the right trade against holding one transaction
    * open for the length of a large download.
    */
-  async *streamExportRows(ctx: ZoneContext, q: CaseListQuery, batchSize = 1000) {
+  async *streamExportRows(ctx: ZoneContext, rawQ: CaseListQuery, batchSize = 1000) {
+    const q = this.withSearchHmac(rawQ);
     // Interpolated into the SQL, so it is bounded and made whole here rather
     // than bound as a parameter: a parameterised LIMIT costs the planner the
     // row estimate that makes it walk the index instead of sorting the table.
@@ -319,8 +389,9 @@ export class CasesService {
    */
   async exportFieldKeys(
     ctx: ZoneContext,
-    q: CaseListQuery,
+    rawQ: CaseListQuery,
   ): Promise<{ keys: string[]; formKeys: string[] }> {
+    const q = this.withSearchHmac(rawQ);
     return this.db.withContext(ctx, async (_db, client) => {
       const { sql: filterSql, params } = listFilters(q);
       const keys = await client.query(
@@ -388,7 +459,19 @@ export class CasesService {
     return labels;
   }
 
-  async detail(ctx: ZoneContext, id: string) {
+  /** Distinct request types across the caller's visible cases, for filters. */
+  async requestTypes(ctx: ZoneContext): Promise<string[]> {
+    return this.db.withContext(ctx, async (_db, client) => {
+      const r = await client.query(
+        `SELECT DISTINCT rt.value AS t
+           FROM cases c, jsonb_array_elements_text(c.request_types) rt(value)
+          ORDER BY t`,
+      );
+      return r.rows.map((x: { t: string }) => x.t);
+    });
+  }
+
+  async detail(ctx: ZoneContext, id: string, viewerId?: string) {
     return this.db.withContext(ctx, async (db, client) => {
       const row = await db.query.cases.findFirst({ where: eq(cases.id, id) });
       if (!row) throw new NotFoundException();
@@ -455,6 +538,49 @@ export class CasesService {
         [row.zoneId],
       );
 
+      // Other cases from the same person, and the appeal pair if there is
+      // one. The linkage existed only as prose in a timeline note ("Appealed —
+      // see DSR-…"); these give the screen something to actually link, and the
+      // requester match is what lets an operator spot a duplicate before
+      // working — or deleting — the wrong one. Matched by HMAC because the
+      // address itself is encrypted. RLS still applies: a related case in a
+      // zone the caller cannot see simply does not come back.
+      const related = await client.query(
+        `SELECT id, case_ref, status, created_at, is_appeal, source
+           FROM cases
+          WHERE requester_email_hmac = $1 AND id <> $2
+          ORDER BY created_at DESC
+          LIMIT 10`,
+        [row.requesterEmailHmac, id],
+      );
+      const appealLinks = await client.query(
+        `SELECT id, case_ref, 'appeal_of' AS rel FROM cases WHERE id = $2
+          UNION ALL
+         SELECT id, case_ref, 'appealed_by' AS rel FROM cases WHERE appeal_of_case_id = $1`,
+        [id, row.appealOfCaseId],
+      );
+
+      // The internal discussion. The stored author name wins over the live
+      // one — it survives the account being deleted, same as status history.
+      const comments = await client.query(
+        `SELECT cm.id, cm.body, cm.created_at,
+                COALESCE(cm.author_name, u.name) AS author_name,
+                u.email AS author_email
+           FROM case_comments cm
+      LEFT JOIN users u ON u.id = cm.author_id
+          WHERE cm.case_id = $1
+          ORDER BY cm.created_at ASC`,
+        [id],
+      );
+
+      const watcherRows = await client.query(
+        `SELECT w.user_id, u.name FROM case_watchers w
+           JOIN users u ON u.id = w.user_id
+          WHERE w.case_id = $1
+          ORDER BY u.name`,
+        [id],
+      );
+
       // What the case has been sent out to, and where that got to.
       const delegations = await client.query(
         `SELECT d.id, d.stage, d.note, d.created_at, d.accepted_at, d.closed_at,
@@ -493,6 +619,17 @@ export class CasesService {
         slaClock: clock ?? null,
         emails,
         delegations: delegations.rows,
+        relatedCases: related.rows,
+        appealOf: appealLinks.rows.find((r: { rel: string }) => r.rel === 'appeal_of') ?? null,
+        appeals: appealLinks.rows.filter((r: { rel: string }) => r.rel === 'appealed_by'),
+        comments: comments.rows,
+        watchers: watcherRows.rows.map((w: { user_id: string; name: string }) => ({
+          userId: w.user_id,
+          name: w.name,
+        })),
+        amWatching: viewerId
+          ? watcherRows.rows.some((w: { user_id: string }) => w.user_id === viewerId)
+          : false,
       };
     });
   }

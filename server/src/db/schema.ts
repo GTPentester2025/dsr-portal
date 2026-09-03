@@ -237,6 +237,12 @@ export const cases = pgTable(
     externalId: text('external_id'),
     externalRequestId: text('external_request_id'),
     importedAt: timestamp('imported_at', { withTimezone: true }),
+    /** 'normal' | 'high'. Two levels on purpose: more collapses into noise. */
+    priority: text('priority').notNull().default('normal'),
+    /** Cross-cutting labels; not statuses. */
+    tags: jsonb('tags').notNull().default([]),
+    /** Operator's own follow-up date. Never touches the SLA clock. */
+    snoozedUntil: timestamp('snoozed_until', { withTimezone: true }),
   },
   (t) => [
     uniqueIndex('cases_ref_ux').on(t.caseRef),
@@ -404,6 +410,17 @@ export const caseComments = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index('case_comments_case_ix').on(t.caseId)],
+);
+
+/** People told when a case they do not own moves. Row per (case, user). */
+export const caseWatchers = pgTable(
+  'case_watchers',
+  {
+    caseId: uuid('case_id').notNull().references(() => cases.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.caseId, t.userId] })],
 );
 
 export const caseAttachments = pgTable(

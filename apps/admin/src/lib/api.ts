@@ -78,6 +78,8 @@ export interface CaseListItem {
   // -- lifecycle beyond the status ------------------------------------------
   /** One label spanning status, report delivery and appeal state. */
   progress?: string
+  /** Version of the form schema the submission was made under. */
+  formVersion?: number | null
   closedAt?: string | null
   residency?: string | null
   /** Null while the case is open: it has no answer yet. */
@@ -90,6 +92,11 @@ export interface CaseListItem {
   canAppealUntil?: string | null
   isAppeal?: boolean
   appealStatus?: string | null
+  /** 'normal' | 'high'. */
+  priority?: string
+  tags?: string[]
+  /** Operator follow-up date; never affects the SLA clock. */
+  snoozedUntil?: string | null
   /** 'portal' | 'import' */
   source?: string
   /** Imported cases: the progress value exactly as the source export wrote it. */
@@ -129,6 +136,32 @@ export interface CaseDetail extends CaseListItem {
     fromAddr?: string | null; bodyHtml?: string | null; error?: string | null
   }[]
   delegations?: CaseDelegation[]
+  /** Other cases sharing this requester's email, newest first (max 10). */
+  relatedCases?: {
+    id: string; case_ref: string; status: string
+    created_at: string; is_appeal: boolean; source: string
+  }[]
+  /** The case this one appeals, when it is an appeal. */
+  appealOf?: { id: string; case_ref: string } | null
+  /** Appeals raised against this case. */
+  appeals?: { id: string; case_ref: string }[]
+  /** Internal discussion, oldest first. Append-only. */
+  comments?: {
+    id: string; body: string; created_at: string
+    author_name: string | null; author_email: string | null
+  }[]
+  watchers?: { userId: string; name: string }[]
+  amWatching?: boolean
+  /** For the optimistic-locking guard on status/assign. */
+  updatedAt?: string
+}
+
+/** The workflow as data: which status moves the server will accept. */
+export interface WorkflowTransitions {
+  statuses: { key: string; label: string }[]
+  transitions: { from: string; to: string }[]
+  /** Targets only the SLA engine may set (shown, never offered). */
+  systemOnly: string[]
 }
 
 export interface GroupMember {
@@ -209,8 +242,12 @@ export interface Dashboard {
   monthlyByZone?: { month: string; zone_id: string; n: number }[]
   months?: string[]
   byRequestType: { request_type: string; n: number }[]
-  byAssignee: { name: string; n: number }[]
+  byAssignee: { id?: string; name: string; n: number; overdue?: number }[]
   upcomingDue: { id: string; case_ref: string; zone_id: string; status: string; due_at: string }[]
+  /** Closed-case quality: how closing actually went. */
+  closure?: { total: number; median_days: number; late: number }
+  byOutcome?: { outcome_code: string; n: number }[]
+  appeals?: { open: number; upheld: number; rejected: number }
 }
 
 /**

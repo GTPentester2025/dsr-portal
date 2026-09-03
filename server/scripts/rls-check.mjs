@@ -6,7 +6,7 @@ const admin = new pg.Client(process.env.DATABASE_URL ?? 'postgres://dsr:dsr@127.
 await admin.connect();
 
 // seed two cases directly as the owner role (bypasses RLS by design)
-await admin.query(`DELETE FROM email_log; DELETE FROM case_fields; DELETE FROM sla_clocks; DELETE FROM case_status_history; DELETE FROM cases;`);
+await admin.query(`DELETE FROM email_log; DELETE FROM case_fields; DELETE FROM sla_clocks; DELETE FROM case_status_history; DELETE FROM case_comments; DELETE FROM case_attachments; DELETE FROM case_delegations; DELETE FROM cases;`);
 await admin.query(`
   INSERT INTO cases (case_ref, zone_id, form_key, form_version, requester_email_enc, requester_email_hmac, status)
   VALUES ('DSR-EUR-2026-00001','EUR','eur-1',27,'enc','h1','new'),
@@ -198,7 +198,7 @@ if (process.argv.includes('--roles')) {
 // 0013 exists to protect; it has no password so it cannot sign in, but leaving
 // one lying around in every database this script has ever run against is not
 // something to do by omission.
-await admin.query(`DELETE FROM email_log; DELETE FROM case_fields; DELETE FROM sla_clocks; DELETE FROM case_status_history; DELETE FROM cases;`);
+await admin.query(`DELETE FROM email_log; DELETE FROM case_fields; DELETE FROM sla_clocks; DELETE FROM case_status_history; DELETE FROM case_comments; DELETE FROM case_attachments; DELETE FROM case_delegations; DELETE FROM cases;`);
 await admin.query(
   `DELETE FROM users WHERE email IN ('rls-probe@example.com','rls-probe-global@example.com')`,
 );
